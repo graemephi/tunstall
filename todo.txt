@@ -1,0 +1,23 @@
+
+func add(a: int, b: int): int
+{
+    c := a : f32;
+    d := a + b: f32; // error
+    e := a: f32 + b; // error
+    f := (a + b): f32;
+    g := a: f32 + b: f32;
+    h := (a : f32) + (b : f32);
+    i: int = a: f32: int;
+
+    m := a: int & b;       // a & b
+    n: ptr int = &a: int; // &a
+    o: int = (&a): int;   // (int)(&a);
+    p: ptr (ptr int) = &&a;
+
+    q := add(a, b): f32;
+
+    add: func (int, int) int (1,2)          // funcs always have a return type
+    add2: proc (int, int) (1, 2)            // procs never have a return type ?
+                                            // but both will fail to type check (func takes 2 args)
+    r := add: (func (int, int) int)(1, 2)   // cast and call ?
+}
