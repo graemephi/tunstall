@@ -3,13 +3,18 @@ use std::collections::hash_map::HashMap;
 
 mod parse;
 mod ast;
+mod sym;
+mod types;
 mod smallvec;
 
 use ast::*;
 use smallvec::*;
+use sym::*;
+use types::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[macro_export]
 macro_rules! error {
     ($ctx: expr, $pos: expr, $($fmt: expr),*) => {{
         $ctx.error($pos, format!($($fmt),*))
@@ -159,65 +164,7 @@ fn keywords() {
     }
 }
 
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug, Hash)]
-pub struct Type(u32);
-
-#[allow(non_upper_case_globals)]
-impl Type {
-    const None: Type = Type(TypeKind::None as u32);
-    const Int:  Type = Type(TypeKind::Int as u32);
-    const I8:   Type = Type(TypeKind::I8 as u32);
-    const I16:  Type = Type(TypeKind::I16 as u32);
-    const I32:  Type = Type(TypeKind::I32 as u32);
-    const I64:  Type = Type(TypeKind::I64 as u32);
-    const U8:   Type = Type(TypeKind::U8 as u32);
-    const U16:  Type = Type(TypeKind::U16 as u32);
-    const U32:  Type = Type(TypeKind::U32 as u32);
-    const U64:  Type = Type(TypeKind::U64 as u32);
-    const F32:  Type = Type(TypeKind::F32 as u32);
-    const F64:  Type = Type(TypeKind::F64 as u32);
-    const Bool: Type = Type(TypeKind::Bool as u32);
-
-    fn is_integer(self) -> bool {
-        matches!(self, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64|Type::Int)
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum TypeKind {
-    None,
-    Int,
-    I8,
-    I16,
-    I32,
-    I64,
-    U8,
-    U16,
-    U32,
-    U64,
-    F32,
-    F64,
-    Bool,
-    Func,
-}
-
-#[derive(Clone, Debug)]
-pub struct TypeInfo {
-    kind: TypeKind,
-    name: Intern,
-    items: Vec<Type>
-}
-
-fn eval_type(ctx: &Compiler, expr: TypeExpr) -> std::result::Result<Type, IncompleteError> {
-    match expr {
-        TypeExpr::Infer => todo!("error"),
-        TypeExpr::Name(intern) => ctx.lookup_type(intern).ok_or_else(|| {
-            IncompleteError { source_position: 0, msg: format!("unknown type '{}'", ctx.str(intern)) }
-        })
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Op {
     Halt = 255,
@@ -274,6 +221,14 @@ pub enum Op {
     MoveAndSignExtendLower8,
     MoveAndSignExtendLower16,
     MoveAndSignExtendLower32,
+    // StackRelativeStore is equivalent to Move
+    StackRelativeStore8,
+    StackRelativeStore16,
+    StackRelativeStore32,
+    // StackRelativeLoad is equivalent to Move
+    StackRelativeLoad8,
+    StackRelativeLoad16,
+    StackRelativeLoad32,
     IntToFloat32,
     IntToFloat64,
     Float32ToInt,
@@ -296,7 +251,7 @@ struct Instr {
     right: u8,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct FatInstr {
     op: Op,
     dest: u32,
@@ -412,7 +367,7 @@ impl From<Intern> for RegValue {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Value {
+pub enum Value {
     Int(isize),
     UInt(usize),
     F32(f32),
@@ -456,13 +411,6 @@ impl From<Value> for RegValue {
             Value::Bool(v) => v.into(),
             Value::Ident(v) => v.into(),
         }
-    }
-}
-
-fn integer_promote(ty: Type) -> Type {
-    match ty {
-        Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64 => Type::Int,
-        ty => ty
     }
 }
 
@@ -569,6 +517,26 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
     Some(op)
 }
 
+fn store_op(ty: Type) -> Option<Op> {
+    match ty {
+        Type::I8|Type::U8|Type::Bool            => Some(Op::StackRelativeStore8),
+        Type::I16|Type::U16                     => Some(Op::StackRelativeStore16),
+        Type::I32|Type::U32|Type::F32           => Some(Op::StackRelativeStore32),
+        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Move),
+        _ => None
+    }
+}
+
+fn load_op(ty: Type) -> Option<Op> {
+    match ty {
+        Type::I8|Type::U8|Type::Bool            => Some(Op::StackRelativeLoad8),
+        Type::I16|Type::U16                     => Some(Op::StackRelativeLoad16),
+        Type::I32|Type::U32|Type::F32           => Some(Op::StackRelativeLoad32),
+        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Move),
+        _ => None
+    }
+}
+
 fn apply_unary_op(op: Op, value: RegValue) -> RegValue {
     unsafe {
         match op {
@@ -646,7 +614,14 @@ fn apply_binary_op(op: Op, left: RegValue, right: RegValue) -> RegValue {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone, Copy)]
+pub struct Global {
+    pub decl: Decl,
+    pub value: Value,
+    pub ty: Type
+}
+
+#[derive(Clone, Copy)]
 struct Local {
     reg: u32,
     ty: Type,
@@ -656,12 +631,6 @@ impl Local {
     fn new(reg: u32, ty: Type) -> Local {
         Local { reg: reg, ty: ty }
     }
-}
-
-#[derive(Clone, Copy)]
-struct Global {
-    value: Value,
-    ty: Type
 }
 
 #[derive(Default)]
@@ -720,10 +689,13 @@ fn value_fits(value: Option<RegValue>, ty: Type) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 struct ExprGen {
     reg: u32,
     ty: Type,
     value: Option<RegValue>,
+    // Todo: might not make sense once pointers are in
+    is_field_access: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -732,13 +704,25 @@ struct Label(usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Location(usize);
 
+#[derive(Clone, Copy, Default, Debug)]
+struct StmtContext {
+    break_to: Option<Label>,
+    continue_to: Option<Label>,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+struct CompoundContext {
+    ty: Option<Type>,
+    dest: Option<u32>,
+}
+
 struct FatGen<'a> {
     ast: &'a Ast,
     code: Vec<FatInstr>,
     locals: Locals,
     reg_counter: i32,
-    break_stack: Vec<Label>,
-    continue_stack: Vec<Label>,
+    context: StmtContext,
+    compound: CompoundContext,
     labels: Vec<Location>,
     patches: Vec<(Label, Location)>,
     return_type: Type,
@@ -746,28 +730,22 @@ struct FatGen<'a> {
 }
 
 impl FatGen<'_> {
-    const BAD_REGISTER: u32 = 0x70000000;
+    const BAD_REGISTER: u32 = i32::MAX as u32;
+    const REGISTER_SIZE: usize = 8;
 
     fn new(ast: &Ast) -> FatGen {
         FatGen {
             ast,
             code: Vec::new(),
-            locals: Default::default(),
+            locals: Locals::default(),
             reg_counter: 0,
-            break_stack: Vec::new(),
-            continue_stack: Vec::new(),
+            context: StmtContext::default(),
+            compound: CompoundContext::default(),
             labels: Vec::new(),
             patches: Vec::new(),
-            return_type: Type(0),
+            return_type: Type::None,
             error: None,
         }
-    }
-
-    fn eval_type(&mut self, ctx: &Compiler, expr: TypeExpr) -> Type {
-        eval_type(ctx, expr).unwrap_or_else(|err| {
-            self.error(err.source_position, err.msg);
-            Type(0)
-        })
     }
 
     fn error(&mut self, source_position: usize, msg: String) {
@@ -776,10 +754,15 @@ impl FatGen<'_> {
         }
     }
 
-    fn inc_reg(&mut self) -> u32 {
-        let result = self.reg_counter;
-        self.reg_counter += 1;
+    fn inc_bytes(&mut self, size: usize, align: usize) -> u32 {
+        assert!(align.is_power_of_two());
+        let result = (self.reg_counter as usize + (align - 1)) & !(align - 1);
+        self.reg_counter += size as i32;
         result as u32
+    }
+
+    fn inc_reg(&mut self) -> u32 {
+        self.inc_bytes(Self::REGISTER_SIZE, Self::REGISTER_SIZE)
     }
 
     fn put_inc(&mut self, op: Op, data: RegValue) -> u32 {
@@ -793,10 +776,25 @@ impl FatGen<'_> {
         self.code.push(FatInstr { op, dest, .. data.unpack() });
     }
 
+    fn put_zero(&mut self) -> u32 {
+        // todo: keep track of constants..........
+        self.put_inc(Op::Immediate, 0.into())
+    }
+
     fn put_immediate(&mut self, expr: &ExprGen) -> u32 {
         match expr.value {
             Some(v) => self.put_inc(Op::Immediate, v),
-            None => expr.reg
+            None => {
+                if expr.is_field_access {
+                    if let Some(op) = load_op(expr.ty) {
+                        self.put_inc(op, expr.reg.into())
+                    } else {
+                        expr.reg
+                    }
+                } else {
+                    expr.reg
+                }
+            }
         }
     }
 
@@ -827,34 +825,37 @@ impl FatGen<'_> {
         result
     }
 
-    fn push_break_label(&mut self) -> Label {
-        let result = self.label();
-        self.break_stack.push(result);
-        result
-    }
-
-    fn pop_break_label(&mut self, label: Label) {
-        let popped = self.break_stack.pop();
-        assert_eq!(Some(label), popped);
-    }
-
     fn break_label(&self) -> Option<Label> {
-        self.break_stack.last().copied()
-    }
-
-    fn push_continue_label(&mut self) -> Label {
-        let result = self.label();
-        self.continue_stack.push(result);
-        result
-    }
-
-    fn pop_continue_label(&mut self, label: Label) {
-        let popped = self.continue_stack.pop();
-        assert_eq!(Some(label), popped);
+        self.context.break_to
     }
 
     fn continue_label(&self) -> Option<Label> {
-        self.continue_stack.last().copied()
+        self.context.continue_to
+    }
+
+    fn push_loop_context(&mut self) -> (Label, Label, StmtContext) {
+        let result = self.context;
+        let break_to = self.label();
+        let continue_to = self.label();
+        self.context = StmtContext {
+            break_to: Some(break_to),
+            continue_to: Some(continue_to),
+        };
+        (break_to, continue_to, result)
+    }
+
+    fn push_break_context(&mut self) -> (Label, StmtContext) {
+        let result = self.context;
+        let break_to = self.label();
+        self.context = StmtContext {
+            break_to: Some(break_to),
+            continue_to: result.continue_to,
+        };
+        (break_to, result)
+    }
+
+    fn restore_gen_context(&mut self, mark: StmtContext) {
+        self.context = mark;
     }
 
     fn patch(&mut self, label: Label) {
@@ -868,10 +869,26 @@ impl FatGen<'_> {
             assert!(to != !0);
             assert!(self.code[from].is_jump() && self.code[from].left == label as u32);
             let offset = (to as isize) - (from as isize) - 1;
-            let offset = i32::try_from(offset).expect("Function too large") as u32;
+            let offset = i32::try_from(offset).expect("function too large") as u32;
             self.code[from].left = offset;
         }
         self.patches.clear();
+    }
+
+    fn path<'c>(&mut self, ctx: &'c Compiler, ty: Type, path: Expr) -> Option<&'c types::Item> {
+        if let ExprData::Name(name) = self.ast.expr(path) {
+            let result = ctx.types.item_info(ty, name);
+            if let None = result {
+                error!(self, self.ast.expr_source_position(path), "{} does not have a '{}' field", ctx.type_str(ty), ctx.str(name));
+            }
+            result
+        } else {
+            todo!();
+        }
+    }
+
+    fn type_expr(&self, ctx: &Compiler, expr: TypeExpr) -> Type {
+        ctx.types.get_resolved(expr)
     }
 
     fn expr_in_register(&mut self, ctx: &Compiler, expr: Expr) -> ExprGen {
@@ -880,9 +897,29 @@ impl FatGen<'_> {
         result
     }
 
+    fn expr_in_register_with_predicted_compound_type(&mut self, ctx: &Compiler, expr: Expr, compound_type: Type) -> ExprGen {
+        self.compound.ty = Some(compound_type);
+        self.expr_in_register(ctx, expr)
+    }
+
+    fn expr_with_predicted_compound_type(&mut self, ctx: &Compiler, expr: Expr, compound_type: Type) -> ExprGen {
+        self.compound.ty = Some(compound_type);
+        self.expr(ctx, expr)
+    }
+
+    fn expr_with_predicted_compound_type_and_destination(&mut self, ctx: &Compiler, expr: Expr, compound_type: Type, dest: u32) -> ExprGen {
+        self.compound.ty = Some(compound_type);
+        self.compound.dest = Some(dest);
+        let result = self.expr(ctx, expr);
+        self.compound.dest = None;
+        result
+    }
+
+
     fn expr(&mut self, ctx: &Compiler, expr: Expr) -> ExprGen {
-        let mut result = ExprGen { reg: Self::BAD_REGISTER, ty: Type::None, value: None };
-        match self.ast.expr_data(expr) {
+        let mut result = ExprGen { reg: Self::BAD_REGISTER, ty: Type::None, value: None, is_field_access: false };
+        let compound_type = self.compound.ty.take();
+        match self.ast.expr(expr) {
             ExprData::Int(value) => {
                 result.value = Some(value.into());
                 result.ty = Type::Int;
@@ -903,7 +940,60 @@ impl FatGen<'_> {
                     result.value = Some(global.value.into());
                     result.ty = global.ty;
                 } else {
-                    error!(self, self.ast.expr_source_position(expr), "Unknown identifier '{}'", ctx.str(name));
+                    error!(self, self.ast.expr_source_position(expr), "unknown identifier '{}'", ctx.str(name));
+                }
+            }
+            ExprData::Compound(fields) => {
+                if let Some(ty) = compound_type {
+                    // Todo: check for duplicate fields. need to consider unions and fancy paths
+                    let info = ctx.types.info(ty);
+                    let base = self.compound.dest.unwrap_or_else(|| self.inc_bytes(info.size, info.alignment));
+                    if info.kind == TypeKind::Struct {
+                        let mut values = SmallVec::new();
+                        for field in fields {
+                            let field = self.ast.compound_field(field);
+                            if let Some(item) = self.path(ctx, ty, field.path) {
+                                let expr = self.expr_with_predicted_compound_type_and_destination(ctx, field.value, item.ty, base + item.offset as u32);
+                                if item.ty == expr.ty || (expr.ty == Type::Int && value_fits(expr.value, item.ty)) {
+                                    values.push((item.offset, expr))
+                                } else {
+                                    error!(self, self.ast.expr_source_position(field.value), "field '{}' is of type {}, found {}", ctx.str(item.name), ctx.type_str(item.ty), ctx.type_str(expr.ty))
+                                }
+                            }
+                        }
+                        let mut value_index = 0;
+                        for item in info.items.iter() {
+                            let reg;
+                            match values.get(value_index) {
+                                Some((offset, expr)) if *offset == item.offset => {
+                                    reg = self.put_immediate(expr);
+                                    value_index += 1;
+                                }
+                                _ => reg = self.put_zero(),
+                            }
+                            // This cannot overflow u32, otherwise inc_bytes will have paniced.
+                            let dest = base + (item.offset as u32);
+                            if let Some(op) = store_op(item.ty) {
+                                self.put(op, dest, reg.into());
+                            } else {
+                                // Already emitted when evaluating the exprs. Seems weird?
+                            }
+                        }
+                        result.ty = ty;
+                        result.reg = base;
+                    } else {
+                        error!(self, self.ast.expr_source_position(expr), "compound initializer used for non-aggregate type");
+                    }
+                } else {
+                    error!(self, self.ast.expr_source_position(expr), "untyped compound initializer");
+                }
+            }
+            ExprData::Field(left_expr, field) => {
+                let left = self.expr(ctx, left_expr);
+                if let Some(item) = ctx.types.item_info(left.ty, field) {
+                    result.reg = left.reg + u32::try_from(item.offset).expect("todo");
+                    result.ty = item.ty;
+                    result.is_field_access = true;
                 }
             }
             ExprData::Unary(op_token, right_expr) => {
@@ -1002,13 +1092,13 @@ impl FatGen<'_> {
             }
             ExprData::Call(callable, args) => {
                 let addr = self.expr(ctx, callable);
-                let info = &ctx.type_info(addr.ty).unwrap();
+                let info = ctx.types.info(addr.ty);
                 if info.kind == TypeKind::Func {
                     let mut arg_gens = SmallVec::new();
                     for (i, expr) in args.enumerate() {
                         let gen = self.expr(ctx, expr);
-                        if gen.ty != info.items[i] {
-                            error!(self, self.ast.expr_source_position(expr), "argument {} is of type {}, found {}", i, ctx.type_str(info.items[i]), ctx.type_str(gen.ty));
+                        if gen.ty != info.items[i].ty {
+                            error!(self, self.ast.expr_source_position(expr), "argument {} is of type {}, found {}", i, ctx.type_str(info.items[i].ty), ctx.type_str(gen.ty));
                             break;
                         }
                         arg_gens.push((gen.value, gen.reg));
@@ -1023,15 +1113,16 @@ impl FatGen<'_> {
                         Some(func) => self.put_inc(Op::Call, func.into()),
                         _ => self.put_inc(Op::CallIndirect, addr.reg.into())
                     };
-                    result.ty = *info.items.last().expect("tried to generate code for func without return type");
+                    let ret = info.items.last().expect("tried to generate code for func without return type");
+                    result.ty = ret.ty;
                 } else {
                     // TODO: get a string representation of the whole `callable` expr for nicer error message
                     error!(self, self.ast.expr_source_position(callable), "cannot call a {:?}", info.kind);
                 }
             }
             ExprData::Cast(expr, type_expr) => {
-                let left = self.expr(ctx, expr);
-                let to_ty = self.eval_type(ctx, type_expr);
+                let to_ty = self.type_expr(ctx, type_expr);
+                let left = self.expr_with_predicted_compound_type(ctx, expr, to_ty);
                 if let Some(op) = convert_op(left.ty, to_ty) {
                     match left.value {
                         Some(lv) => result.value = Some(apply_unary_op(op, lv)),
@@ -1048,7 +1139,7 @@ impl FatGen<'_> {
 
     fn stmt(&mut self, ctx: &Compiler, stmt: Stmt) -> Option<Type> {
         let mut return_type = None;
-        match self.ast.stmt_data(stmt) {
+        match self.ast.stmt(stmt) {
             StmtData::Block(body) => {
                 return_type = self.stmts(ctx, body)
             }
@@ -1062,7 +1153,7 @@ impl FatGen<'_> {
                 }
             }
             StmtData::Return(None) => {
-                if self.return_type == Type(0) {
+                if self.return_type == Type::None {
                     self.put(Op::Return, 0, 0.into());
                 } else {
                     // TODO: stmt source position
@@ -1106,34 +1197,41 @@ impl FatGen<'_> {
                 }
             }
             StmtData::For(pre_stmt, cond_expr, post_stmt, body) => {
-                let break_label = self.push_break_label();
-                let continue_label = self.push_continue_label();
+                let (break_label, continue_label, gen_ctx) = self.push_loop_context();
                 let mark = self.locals.push_scope();
                 if let Some(stmt) = pre_stmt {
                     self.stmt(ctx, stmt);
                 }
-                let pre_cond = self.expr_in_register(ctx, cond_expr);
-                if pre_cond.ty == Type::Bool {
-                    self.put_jump_zero(pre_cond.reg, break_label);
+                if let Some(expr) = cond_expr {
+                    let pre_cond = self.expr_in_register(ctx, expr);
+                    if pre_cond.ty == Type::Bool {
+                        self.put_jump_zero(pre_cond.reg, break_label);
+                        let loop_entry = self.label_here();
+                        return_type = self.stmts(ctx, body);
+                        self.patch(continue_label);
+                        if let Some(stmt) = post_stmt {
+                            self.stmt(ctx, stmt);
+                        }
+                        let post_cond = self.expr_in_register(ctx, expr);
+                        self.put_jump_nonzero(post_cond.reg, loop_entry);
+                    } else {
+                        error!(self, self.ast.expr_source_position(expr), "for statement requires a boolean condition");
+                    }
+                } else {
                     let loop_entry = self.label_here();
                     return_type = self.stmts(ctx, body);
                     self.patch(continue_label);
                     if let Some(stmt) = post_stmt {
                         self.stmt(ctx, stmt);
                     }
-                    let post_cond = self.expr_in_register(ctx, cond_expr);
-                    self.put_jump_nonzero(post_cond.reg, loop_entry);
-                } else {
-                    error!(self, self.ast.expr_source_position(cond_expr), "for statement requires a boolean condition");
+                    self.put_jump(loop_entry);
                 }
                 self.locals.restore_scope(mark);
                 self.patch(break_label);
-                self.pop_break_label(break_label);
-                self.pop_continue_label(continue_label);
+                self.restore_gen_context(gen_ctx);
             }
             StmtData::While(cond_expr, body) => {
-                let break_label = self.push_break_label();
-                let continue_label = self.push_continue_label();
+                let (break_label, continue_label, gen_ctx) = self.push_loop_context();
                 let pre_cond = self.expr_in_register(ctx, cond_expr);
                 if pre_cond.ty == Type::Bool {
                     self.put_jump_zero(pre_cond.reg, break_label);
@@ -1146,19 +1244,19 @@ impl FatGen<'_> {
                     error!(self, self.ast.expr_source_position(cond_expr), "while statement requires a boolean condition");
                 }
                 self.patch(break_label);
-                self.pop_break_label(break_label);
-                self.pop_continue_label(continue_label);
+                self.restore_gen_context(gen_ctx);
             }
             StmtData::Switch(control_expr, cases) => {
                 // Totally naive switch implementation. Break by default,
                 // fall-through unimplemented.
-                let end = self.push_break_label();
+                let (end, gen_ctx) = self.push_break_context();
                 let mut labels = SmallVec::new();
+                let mut else_label = None;
                 let control = self.expr_in_register(ctx, control_expr);
                 for case in cases {
                     let block_label = self.label();
                     labels.push(block_label);
-                    if let SwitchCaseData::Cases(exprs, _) = self.ast.switch_case_data(case) {
+                    if let SwitchCaseData::Cases(exprs, _) = self.ast.switch_case(case) {
                         for case_expr in exprs {
                             let expr = self.expr_in_register(ctx, case_expr);
                             if let Some(_ev) = expr.value {
@@ -1173,11 +1271,16 @@ impl FatGen<'_> {
                                 error!(self, self.ast.expr_source_position(case_expr), "non-constant switch case");
                             }
                         }
+                    } else {
+                        else_label = Some(block_label);
                     }
+                }
+                if let Some(label) = else_label {
+                    self.put_jump(label);
                 }
                 let mut first_block = true;
                 for (i, case) in cases.enumerate() {
-                    let block = match self.ast.switch_case_data(case) {
+                    let block = match self.ast.switch_case(case) {
                         SwitchCaseData::Cases(_, block) => block,
                         SwitchCaseData::Else(block) => block
                     };
@@ -1193,11 +1296,10 @@ impl FatGen<'_> {
                     self.put_jump(end);
                 }
                 self.patch(end);
-                self.pop_break_label(end);
+                self.restore_gen_context(gen_ctx);
             }
             StmtData::Do(cond_expr, body) => {
-                let break_label = self.push_break_label();
-                let continue_label = self.push_continue_label();
+                let (break_label, continue_label, gen) = self.push_loop_context();
                 let loop_entry = self.label_here();
                 return_type = self.stmts(ctx, body);
                 self.patch(continue_label);
@@ -1207,12 +1309,11 @@ impl FatGen<'_> {
                 }
                 self.put_jump_nonzero(post_cond.reg, loop_entry);
                 self.patch(break_label);
-                self.pop_break_label(break_label);
-                self.pop_continue_label(continue_label);
+                self.restore_gen_context(gen);
             }
             StmtData::Expr(expr) => {
-                if let ExprData::Cast(inner, _ty) = self.ast.expr_data(expr) {
-                    if let ExprData::Name(_name) = self.ast.expr_data(inner) {
+                if let ExprData::Cast(inner, _ty) = self.ast.expr(expr) {
+                    if let ExprData::Name(_name) = self.ast.expr(inner) {
                         // This looks like an attempt to declare an uninitialised value,
                         //      name: ty;
                         // which will fail with a confusing error message if `name` is not declared,
@@ -1224,13 +1325,20 @@ impl FatGen<'_> {
                 self.expr(ctx, expr);
             }
             StmtData::VarDecl(ty_expr, left, right) => {
-                if let ExprData::Name(var) = self.ast.expr_data(left) {
-                    let expr = self.expr_in_register(ctx, right);
-                    let ty = match ty_expr {
-                        TypeExpr::Infer => expr.ty,
-                        _ => self.eval_type(ctx, ty_expr)
+                if let ExprData::Name(var) = self.ast.expr(left) {
+                    let expr;
+                    let ty;
+                    match ctx.ast.type_expr(ty_expr) {
+                        TypeExprData::Infer => {
+                            expr = self.expr_in_register(ctx, right);
+                            ty = expr.ty;
+                        }
+                        _ => {
+                            ty = self.type_expr(ctx, ty_expr);
+                            expr = self.expr_in_register_with_predicted_compound_type(ctx, right, ty);
+                        }
                     };
-                    if integer_promote(ty) == expr.ty {
+                    if integer_promote(ty) == integer_promote(expr.ty) {
                         if value_fits(expr.value, ty) {
                             self.locals.insert(var, Local::new(expr.reg, ty));
                         } else {
@@ -1240,11 +1348,11 @@ impl FatGen<'_> {
                         error!(self, self.ast.expr_source_position(left), "type mismatch between declaration ({}) and value ({})", ctx.type_str(ty), ctx.type_str(expr.ty))
                     }
                 } else {
-                    error!(self, self.ast.expr_source_position(left), "cannot declare '{}' as a variable", self.ast.expr_data(left));
+                    error!(self, self.ast.expr_source_position(left), "cannot declare '{}' as a variable", self.ast.expr(left));
                 }
             }
             StmtData::Assign(left, right) => {
-                if let ExprData::Name(var) = self.ast.expr_data(left) {
+                if let ExprData::Name(var) = self.ast.expr(left) {
                     let expr = self.expr_in_register(ctx, right);
                     if let Some(local) = self.locals.get(var) {
                         let reg = local.reg;
@@ -1274,14 +1382,15 @@ impl FatGen<'_> {
     }
 
     fn func(&mut self, ctx: &Compiler, signature: Type, decl: &CallableDecl) -> Func {
-        let sig = ctx.type_info(signature).expect("tried to generate code for function without a signature");
+        let sig = ctx.types.info(signature);
         assert!(self.code.len() == 0);
         assert!(sig.kind == TypeKind::Func);
         assert!(decl.params.len() == sig.items.len() - 1, "the last element of a func's type signature's items must be the return type. it is not optional");
-        self.return_type = *sig.items.last().unwrap();
+        self.return_type = sig.items.last().map(|i| i.ty).unwrap();
         self.reg_counter = 1 - i32::try_from(sig.items.len()).expect("tried to generate code for a function with an excessive number of arguments");
-        let param_names = self.ast.items(decl.params).iter().map(|item| item.name);
-        let param_types = sig.items.iter().copied();
+        self.reg_counter *= Self::REGISTER_SIZE as i32;
+        let param_names = decl.params.map(|item| ctx.ast.item(item).name);
+        let param_types = sig.items.iter().map(|i| i.ty);
         for (name, ty) in Iterator::zip(param_names, param_types) {
             let reg = self.inc_reg();
             self.locals.insert(name, Local::new(reg, ty));
@@ -1298,8 +1407,8 @@ impl FatGen<'_> {
             self.patches.clear();
         }
         assert!(self.patches.len() == 0);
-        assert!(self.break_stack.len() == 0);
-        assert!(self.continue_stack.len() == 0);
+        assert!(self.context.break_to.is_none());
+        assert!(self.context.continue_to.is_none());
         Func { _signature: signature, code: std::mem::take(&mut self.code) }
     }
 }
@@ -1340,55 +1449,37 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[derive(Default)]
+pub struct Func {
+    _signature: Type,
+    code: Vec<FatInstr>
+}
+
 pub struct Compiler {
     interns: Interns,
-    types: Vec<TypeInfo>,
-    type_by_name: HashMap<Intern, Type>,
-    type_by_hash: HashMap<u64, SmallVecN<Type, 5>>,
+    types: Types,
+    symbols: HashMap<Intern, Symbol>,
     globals: HashMap<Intern, Global>,
     funcs: HashMap<Intern, Func>,
     error: Option<IncompleteError>,
+    ast: Ast,
     entry_stub: [FatInstr; 2]
 }
 
 impl Compiler {
     fn new() -> Compiler {
-        let mut compiler = Compiler {
+        let mut result = Compiler {
             interns: new_interns_with_keywords(),
-            types: Vec::new(),
-            type_by_name: HashMap::new(),
-            type_by_hash: HashMap::new(),
+            types: Types::new(),
+            symbols: HashMap::new(),
             globals: HashMap::new(),
             funcs: HashMap::new(),
             error: None,
+            ast: Ast::new(),
             entry_stub: [FatInstr::HALT; 2]
         };
-
-        let builtins = [
-            ("",     TypeKind::None),
-            ("int",  TypeKind::Int),
-            ("i8",   TypeKind::I8),
-            ("i16",  TypeKind::I16),
-            ("i32",  TypeKind::I32),
-            ("i64",  TypeKind::I64),
-            ("u8",   TypeKind::U8),
-            ("u16",  TypeKind::U16),
-            ("u32",  TypeKind::U32),
-            ("u64",  TypeKind::U64),
-            ("f32",  TypeKind::F32),
-            ("f64",  TypeKind::F64),
-            ("bool", TypeKind::Bool),
-        ];
-
-        for (i, &(str, kind)) in builtins.iter().enumerate() {
-            assert!(i == kind as usize);
-            let name = compiler.interns.put(str);
-            let items = Vec::new();
-            compiler.types.push(TypeInfo { kind, name, items });
-            compiler.type_by_name.insert(name, Type(i as u32));
-        }
-
-        compiler
+        types::builtins(&mut result);
+        result
     }
 
     fn intern(&mut self, str: &str) -> Intern {
@@ -1400,21 +1491,7 @@ impl Compiler {
     }
 
     fn type_str(&self, ty: Type) -> &str {
-        self.str(self.types[ty.0 as usize].name)
-    }
-
-    fn lookup_type(&self, intern: Intern) -> Option<Type> {
-        self.type_by_name.get(&intern).copied()
-    }
-
-    fn type_info(&self, ty: Type) -> Option<&TypeInfo> {
-        self.types.get(ty.0 as usize)
-    }
-
-    fn push_anonymous_type(&mut self, kind: TypeKind, items: &[Type]) -> Type {
-        let idx = u32::try_from(self.types.len()).expect("Program too big!!");
-        self.types.push(TypeInfo { kind: kind, name: Intern(0), items: items.into() });
-        Type(idx)
+        self.str(self.types.info(ty).name)
     }
 
     fn error(&mut self, source_position: usize, msg: String) {
@@ -1434,102 +1511,114 @@ impl Compiler {
         }
     }
 
-    fn eval_type(&mut self, expr: TypeExpr) -> Type {
-        eval_type(self, expr).unwrap_or_else(|err| {
-            self.error(err.source_position, err.msg);
-            Type(0)
-        })
-    }
-
     fn run(&self) -> Value {
         let mut code = &self.entry_stub[..];
         let mut sp: usize = 0;
         let mut ip: usize = 0;
-        let mut stack = [RegValue { int64: 0 }; 1024];
+        let mut stack = [0u8; 8192];
         let mut call_stack = vec![(code, ip, sp, 0)];
+
+        macro_rules! stack {
+            ($addr:expr) => {
+                *std::mem::transmute::<&mut u8, &mut RegValue>(&mut stack[$addr])
+            }
+        }
+
         loop {
             let instr = &code[ip];
             let dest = sp.wrapping_add(sign_extend(instr.dest));
             let left = sp.wrapping_add(sign_extend(instr.left));
             let right = sp.wrapping_add(sign_extend(instr.right));
 
+            if false == matches!(instr.op, Op::StackRelativeStore8|Op::StackRelativeStore16|Op::StackRelativeStore32|Op::StackRelativeLoad8|Op::StackRelativeLoad16|Op::StackRelativeLoad32) {
+                debug_assert!((dest  & (FatGen::REGISTER_SIZE - 1)) == 0);
+            }
+
             unsafe {
                 match instr.op {
                     Op::Halt       => { break; }
                     Op::Noop       => {}
-                    Op::Immediate  => { stack[dest] = RegValue::from((instr.left, instr.right)); }
-                    Op::IntNeg     => { stack[dest].sint = -stack[left].sint; }
-                    Op::IntAdd     => { stack[dest].wint = stack[left].wint + stack[right].wint; }
-                    Op::IntSub     => { stack[dest].wint = stack[left].wint - stack[right].wint; }
-                    Op::IntMul     => { stack[dest].wint = stack[left].wint * stack[right].wint; }
-                    Op::IntDiv     => { stack[dest].wint = stack[left].wint / stack[right].wint; }
-                    Op::IntMod     => { stack[dest].wint = stack[left].wint % stack[right].wint; }
-                    Op::IntLt      => { stack[dest].int = (stack[left].int < stack[right].int) as usize; }
-                    Op::IntGt      => { stack[dest].int = (stack[left].int > stack[right].int) as usize; }
-                    Op::IntEq      => { stack[dest].int = (stack[left].int == stack[right].int) as usize; }
-                    Op::IntNEq     => { stack[dest].int = (stack[left].int != stack[right].int) as usize; }
-                    Op::IntLtEq    => { stack[dest].int = (stack[left].int <= stack[right].int) as usize; }
-                    Op::IntGtEq    => { stack[dest].int = (stack[left].int >= stack[right].int) as usize; }
-                    Op::BitNeg     => { stack[dest].int = !stack[left].int }
-                    Op::BitAnd     => { stack[dest].int = stack[left].int & stack[right].int; }
-                    Op::BitOr      => { stack[dest].int = stack[left].int | stack[right].int; }
-                    Op::BitXor     => { stack[dest].int = stack[left].int ^ stack[right].int; }
+                    Op::Immediate  => { stack![dest] = RegValue::from((instr.left, instr.right)); }
+                    Op::IntNeg     => { stack![dest].sint = -stack![left].sint; }
+                    Op::IntAdd     => { stack![dest].wint = stack![left].wint + stack![right].wint; }
+                    Op::IntSub     => { stack![dest].wint = stack![left].wint - stack![right].wint; }
+                    Op::IntMul     => { stack![dest].wint = stack![left].wint * stack![right].wint; }
+                    Op::IntDiv     => { stack![dest].wint = stack![left].wint / stack![right].wint; }
+                    Op::IntMod     => { stack![dest].wint = stack![left].wint % stack![right].wint; }
+                    Op::IntLt      => { stack![dest].int = (stack![left].int < stack![right].int) as usize; }
+                    Op::IntGt      => { stack![dest].int = (stack![left].int > stack![right].int) as usize; }
+                    Op::IntEq      => { stack![dest].int = (stack![left].int == stack![right].int) as usize; }
+                    Op::IntNEq     => { stack![dest].int = (stack![left].int != stack![right].int) as usize; }
+                    Op::IntLtEq    => { stack![dest].int = (stack![left].int <= stack![right].int) as usize; }
+                    Op::IntGtEq    => { stack![dest].int = (stack![left].int >= stack![right].int) as usize; }
+                    Op::BitNeg     => { stack![dest].int = !stack![left].int }
+                    Op::BitAnd     => { stack![dest].int = stack![left].int & stack![right].int; }
+                    Op::BitOr      => { stack![dest].int = stack![left].int | stack![right].int; }
+                    Op::BitXor     => { stack![dest].int = stack![left].int ^ stack![right].int; }
 
-                    Op::LShift     => { stack[dest].int = stack[left].int << stack[right].int; }
-                    Op::RShift     => { stack[dest].int = stack[left].int >> stack[right].int; }
+                    Op::LShift     => { stack![dest].int = stack![left].int << stack![right].int; }
+                    Op::RShift     => { stack![dest].int = stack![left].int >> stack![right].int; }
 
-                    Op::Not        => { stack[dest].int = (stack[left].int == 0) as usize; }
-                    Op::CmpZero    => { stack[dest].int = (stack[left].int != 0) as usize; }
-                    Op::LogicOr    => { stack[dest].int = (stack[left].b8.0 || stack[right].b8.0) as usize; }
-                    Op::LogicAnd   => { stack[dest].int = (stack[left].b8.0 && stack[right].b8.0) as usize; }
+                    Op::Not        => { stack![dest].int = (stack![left].int == 0) as usize; }
+                    Op::CmpZero    => { stack![dest].int = (stack![left].int != 0) as usize; }
+                    Op::LogicOr    => { stack![dest].int = (stack![left].b8.0 || stack![right].b8.0) as usize; }
+                    Op::LogicAnd   => { stack![dest].int = (stack![left].b8.0 && stack![right].b8.0) as usize; }
 
-                    Op::F32Neg     => { stack[dest].float32.0 = -stack[left].float32.0; }
-                    Op::F32Add     => { stack[dest].float32.0 = stack[left].float32.0 + stack[right].float32.0; }
-                    Op::F32Sub     => { stack[dest].float32.0 = stack[left].float32.0 - stack[right].float32.0; }
-                    Op::F32Mul     => { stack[dest].float32.0 = stack[left].float32.0 * stack[right].float32.0; }
-                    Op::F32Div     => { stack[dest].float32.0 = stack[left].float32.0 / stack[right].float32.0; }
-                    Op::F32Lt      => { stack[dest].int = (stack[left].float32.0 < stack[right].float32.0) as usize; }
-                    Op::F32Gt      => { stack[dest].int = (stack[left].float32.0 > stack[right].float32.0) as usize; }
-                    Op::F32Eq      => { stack[dest].int = (stack[left].float32.0 == stack[right].float32.0) as usize; }
-                    Op::F32NEq     => { stack[dest].int = (stack[left].float32.0 != stack[right].float32.0) as usize; }
-                    Op::F32LtEq    => { stack[dest].int = (stack[left].float32.0 <= stack[right].float32.0) as usize; }
-                    Op::F32GtEq    => { stack[dest].int = (stack[left].float32.0 >= stack[right].float32.0) as usize; }
+                    Op::F32Neg     => { stack![dest].float32.0 = -stack![left].float32.0; }
+                    Op::F32Add     => { stack![dest].float32.0 = stack![left].float32.0 + stack![right].float32.0; }
+                    Op::F32Sub     => { stack![dest].float32.0 = stack![left].float32.0 - stack![right].float32.0; }
+                    Op::F32Mul     => { stack![dest].float32.0 = stack![left].float32.0 * stack![right].float32.0; }
+                    Op::F32Div     => { stack![dest].float32.0 = stack![left].float32.0 / stack![right].float32.0; }
+                    Op::F32Lt      => { stack![dest].int = (stack![left].float32.0 < stack![right].float32.0) as usize; }
+                    Op::F32Gt      => { stack![dest].int = (stack![left].float32.0 > stack![right].float32.0) as usize; }
+                    Op::F32Eq      => { stack![dest].int = (stack![left].float32.0 == stack![right].float32.0) as usize; }
+                    Op::F32NEq     => { stack![dest].int = (stack![left].float32.0 != stack![right].float32.0) as usize; }
+                    Op::F32LtEq    => { stack![dest].int = (stack![left].float32.0 <= stack![right].float32.0) as usize; }
+                    Op::F32GtEq    => { stack![dest].int = (stack![left].float32.0 >= stack![right].float32.0) as usize; }
 
-                    Op::F64Neg     => { stack[dest].float64 = -stack[left].float64; }
-                    Op::F64Add     => { stack[dest].float64 = stack[left].float64 + stack[right].float64; }
-                    Op::F64Sub     => { stack[dest].float64 = stack[left].float64 - stack[right].float64; }
-                    Op::F64Mul     => { stack[dest].float64 = stack[left].float64 * stack[right].float64; }
-                    Op::F64Div     => { stack[dest].float64 = stack[left].float64 / stack[right].float64; }
-                    Op::F64Lt      => { stack[dest].int = (stack[left].float64 < stack[right].float64) as usize; }
-                    Op::F64Gt      => { stack[dest].int = (stack[left].float64 > stack[right].float64) as usize; }
-                    Op::F64Eq      => { stack[dest].int = (stack[left].float64 == stack[right].float64) as usize; }
-                    Op::F64NEq     => { stack[dest].int = (stack[left].float64 != stack[right].float64) as usize; }
-                    Op::F64LtEq    => { stack[dest].int = (stack[left].float64 <= stack[right].float64) as usize; }
-                    Op::F64GtEq    => { stack[dest].int = (stack[left].float64 >= stack[right].float64) as usize; }
+                    Op::F64Neg     => { stack![dest].float64 = -stack![left].float64; }
+                    Op::F64Add     => { stack![dest].float64 = stack![left].float64 + stack![right].float64; }
+                    Op::F64Sub     => { stack![dest].float64 = stack![left].float64 - stack![right].float64; }
+                    Op::F64Mul     => { stack![dest].float64 = stack![left].float64 * stack![right].float64; }
+                    Op::F64Div     => { stack![dest].float64 = stack![left].float64 / stack![right].float64; }
+                    Op::F64Lt      => { stack![dest].int = (stack![left].float64 < stack![right].float64) as usize; }
+                    Op::F64Gt      => { stack![dest].int = (stack![left].float64 > stack![right].float64) as usize; }
+                    Op::F64Eq      => { stack![dest].int = (stack![left].float64 == stack![right].float64) as usize; }
+                    Op::F64NEq     => { stack![dest].int = (stack![left].float64 != stack![right].float64) as usize; }
+                    Op::F64LtEq    => { stack![dest].int = (stack![left].float64 <= stack![right].float64) as usize; }
+                    Op::F64GtEq    => { stack![dest].int = (stack![left].float64 >= stack![right].float64) as usize; }
 
-                    Op::MoveLower8               => { stack[dest].int       = stack[left].int8.0    as usize; }
-                    Op::MoveLower16              => { stack[dest].int       = stack[left].int16.0   as usize; }
-                    Op::MoveLower32              => { stack[dest].int       = stack[left].int32.0   as usize; }
-                    Op::MoveAndSignExtendLower8  => { stack[dest].int       = stack[left].sint8.0   as usize; }
-                    Op::MoveAndSignExtendLower16 => { stack[dest].int       = stack[left].sint16.0  as usize; }
-                    Op::MoveAndSignExtendLower32 => { stack[dest].int       = stack[left].sint32.0  as usize; }
-                    Op::IntToFloat32             => { stack[dest].float32.0 = stack[left].sint      as f32; }
-                    Op::IntToFloat64             => { stack[dest].float64   = stack[left].sint      as f64; }
-                    Op::Float32ToInt             => { stack[dest].int       = stack[left].float32.0 as usize; }
-                    Op::Float32To64              => { stack[dest].float64   = stack[left].float32.0 as f64; }
-                    Op::Float64ToInt             => { stack[dest].int       = stack[left].float64   as usize; }
-                    Op::Float64To32              => { stack[dest].float32.0 = stack[left].float64   as f32; }
+                    Op::MoveLower8               => { stack![dest].int       = stack![left].int8.0    as usize; }
+                    Op::MoveLower16              => { stack![dest].int       = stack![left].int16.0   as usize; }
+                    Op::MoveLower32              => { stack![dest].int       = stack![left].int32.0   as usize; }
+                    Op::MoveAndSignExtendLower8  => { stack![dest].int       = stack![left].sint8.0   as usize; }
+                    Op::MoveAndSignExtendLower16 => { stack![dest].int       = stack![left].sint16.0  as usize; }
+                    Op::MoveAndSignExtendLower32 => { stack![dest].int       = stack![left].sint32.0  as usize; }
+                    Op::IntToFloat32             => { stack![dest].float32.0 = stack![left].sint      as f32; }
+                    Op::IntToFloat64             => { stack![dest].float64   = stack![left].sint      as f64; }
+                    Op::Float32ToInt             => { stack![dest].int       = stack![left].float32.0 as usize; }
+                    Op::Float32To64              => { stack![dest].float64   = stack![left].float32.0 as f64; }
+                    Op::Float64ToInt             => { stack![dest].int       = stack![left].float64   as usize; }
+                    Op::Float64To32              => { stack![dest].float32.0 = stack![left].float64   as f32; }
 
-                    Op::Move          => { stack[dest] = stack[left]; }
+                    Op::StackRelativeStore8  => { stack[dest] = stack[left]; }
+                    Op::StackRelativeStore16 => { stack.copy_within(left..left+2, dest) }
+                    Op::StackRelativeStore32 => { stack.copy_within(left..left+4, dest) }
+
+                    Op::StackRelativeLoad8  => { stack![dest].int = stack[left] as usize; }
+                    Op::StackRelativeLoad16 => { stack.copy_within(left..left+2, dest); stack![dest+2].int16.0 = 0; stack![dest+4].int32.0 = 0; }
+                    Op::StackRelativeLoad32 => { stack.copy_within(left..left+4, dest); stack![dest+4].int32.0 = 0; }
+
+                    Op::Move          => { stack![dest] = stack![left]; }
                     Op::Jump          => { ip = ip.wrapping_add(sign_extend(instr.left)); }
-                    Op::JumpIfZero    => { if stack[dest].int == 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
-                    Op::JumpIfNotZero => { if stack[dest].int != 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
+                    Op::JumpIfZero    => { if stack![dest].int == 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
+                    Op::JumpIfNotZero => { if stack![dest].int != 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
                     Op::Return        => {
                         let ret = call_stack.pop().expect("Bad bytecode");
                         code = ret.0;
                         ip = ret.1;
                         sp = ret.2;
-                        stack[ret.3] = stack[left];
+                        stack![ret.3] = stack![left];
                     },
                     Op::Call          => {
                         call_stack.push((code, ip, sp, dest));
@@ -1543,70 +1632,32 @@ impl Compiler {
             }
             ip = ip.wrapping_add(1);
         }
-        Value::from(stack[0 as usize], Type::Int)
+        unsafe { Value::from(stack![0 as usize], Type::Int) }
     }
-}
-
-#[derive(Default)]
-struct Func {
-    _signature: Type,
-    code: Vec<FatInstr>
-}
-
-fn resolve_callable_type(ctx: &mut Compiler, ast: &Ast, decl: &CallableDecl) -> Type {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut decl_types = SmallVec::new();
-    for item in ast.items(decl.params) {
-        let ty = ctx.eval_type(item.expr);
-        decl_types.push(ty);
-    }
-    if let Some(returns) = decl.returns {
-        let return_type = ctx.eval_type(returns);
-        decl_types.push(return_type);
-    }
-    let hash = { let mut h = DefaultHasher::new(); Hash::hash_slice(&decl_types, &mut h); h.finish() };
-    if let Some(types) = ctx.type_by_hash.get(&hash) {
-        for &ty in types.iter() {
-            let info = ctx.type_info(ty).unwrap();
-            if info.items.iter().eq(decl_types.iter()) {
-                return ty;
-            }
-        }
-    }
-    let ty = ctx.push_anonymous_type(TypeKind::Func, &decl_types);
-    ctx.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
-    ty
 }
 
 fn compile(str: &str) -> Result<Compiler> {
     let mut c = Compiler::new();
-    let ast = parse::parse(&mut c, str);
+    c.ast = parse::parse(&mut c, str);
+
+    c.check_and_clear_error(str)?;
+    resolve_all(&mut c);
+
     let main = c.intern("main");
-    for decl in ast.decls() {
-        use std::collections::hash_map::Entry;
-        let sig = resolve_callable_type(&mut c, &ast, decl);
-        match c.globals.entry(decl.name) {
-            // TODO: location of other definition
-            Entry::Occupied(_) => { error!(c, decl.pos, "{} has already been defined", c.str(decl.name)); }
-            Entry::Vacant(entry) => { entry.insert(Global { value: Value::Ident(decl.name), ty: sig }); }
-        }
-        if decl.name == main {
-            match c.type_info(sig) {
-                Some(info) => if !matches!(info.items[..], [Type::Int]) {
-                    error!(c, decl.pos, "main must take zero arguments and return int");
-                }
-                _ => ()
-            }
+    if let Some(&main) = c.globals.get(&main) {
+        let info = c.types.info(main.ty);
+        if !matches!(info.arguments(), Some(&[])) || info.return_type() != Some(Type::Int) {
+            let pos = c.ast.decl(main.decl).pos();
+            error!(c, pos, "main must be a function that takes zero arguments and returns int");
         }
     }
 
     c.check_and_clear_error(str)?;
 
-    let mut gen = FatGen::new(&ast);
-    for decl in ast.decls() {
-        let sig = c.globals.get(&decl.name).unwrap().ty;
-        c.funcs.insert(decl.name, gen.func(&c, sig, &decl));
+    let mut gen = FatGen::new(&c.ast);
+    for func in c.ast.callables() {
+        let sig = c.globals.get(&func.name).unwrap().ty;
+        c.funcs.insert(func.name, gen.func(&c, sig, &func));
     }
 
     // :P
@@ -1649,6 +1700,27 @@ fn repl() {
 }
 
 fn main() {
+    let ok = [
+        (r#"
+        struct RGBA {
+            r: i8,
+            g: i8,
+            b: i8,
+            a: i8,
+        }
+
+        func main(): int {
+            a := { r = 1, g = 1, b = 1, a = 1 }:RGBA;
+            return (a.r << 24) + (a.g << 16) + (a.b << 8) + a.a;
+        }
+        "#, Value::Int(0x01010101))
+            ];
+            for test in ok.iter() {
+                let str = test.0;
+                let expect = test.1;
+                let ret = compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
+                assert_eq!(expect, ret);
+            }
     repl();
 }
 
@@ -1710,36 +1782,27 @@ fn expr() {
 
 #[test]
 fn stmt() {
-    fn compile(c: &mut Compiler, str: &str) -> Result<()> {
-        let (ast, stmt) = parse::parse_stmt(c, str);
-        c.check_and_clear_error(str)?;
-        let mut fg = FatGen::new(&ast);
-        fg.stmts(c, StmtList::from(stmt));
-        c.error = fg.error;
-        c.check_and_clear_error(str)
-    }
-    let c = &mut Compiler::new();
     let ok = [
-        "{ a := 1; do { if (a > 2) { a = (a & 1) == 1 ? a * 2 :: a + 1; } else { a = a + 1; } } while (a < 10); }",
-        "{ a := 1.0; a = a + 1.0d:f32; }",
-        "{ a := !165: int; }",
-        "{ (!!(2*3)) || !!(3-3); }",
-        "{ a := (0: bool); }",
-        "{ a := 0; a := 1; }",
-        "{ if (1:bool) {} }",
-        "{ while (1:bool) {} }",
-        "{ do {} while (1:bool); }",
+        "a := 1; do { if (a > 2) { a = (a & 1) == 1 ? a * 2 :: a + 1; } else { a = a + 1; } } while (a < 10);",
+        "a := 1.0; a = a + 1.0d:f32;",
+        "a := !165: int;",
+        "(!!(2*3)) || !!(3-3);",
+        "a := (0: bool);",
+        "a := 0; a := 1;",
+        "if (1:bool) {}",
+        "while (0:bool) {}",
+        "do {} while (0:bool);",
     ];
     let err = [
-        "{ a := -(0: bool); }",
-        "{ (); }"
+        "a := -(0: bool);",
+        "();"
     ];
     for str in ok.iter() {
-        compile(c, str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
+        compile_and_run(&format!("func main(): int {{ {{ {} }} return 0; }}", str)).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
     }
     for str in err.iter() {
         // Not checking it's the right error yet--maybe later
-        compile(c, str).map(|v| { println!("input: \"{}\"", str); v }).unwrap_err();
+        compile_and_run(&format!("func main(): int {{ {{ {} }} return 0; }}", str)).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
     }
 }
 
@@ -1748,10 +1811,18 @@ fn decls() {
     let ok = [
         "func add(a: int, b: int): int { return a + b; }",
         "func add'(a: int, b: int): int { return a + b; }",
+        "struct V2 { x: f32, y: f32 }",
+        "struct V1 { x: f32 } struct V2 { x: V1, y: V1 }"
     ];
     let err = [
         "func func(a: int, b: int): int { return a + b; }",
-        "func add(a: int, b: int): int { return a + b; } func add(a: int, b: int): int { return a + b; }",
+        "func dup_func(a: int, b: int): int { return a + b; } func dup_func(a: int, b: int): int { return a + b; }",
+        "func dup_param(a: int, a: int): int { return a + a; }",
+        "struct empty {}",
+        "struct dup_struct { x: f32 } struct dup_struct { x: f32 }",
+        "struct dup_field { x: f32, x: f32 }",
+        "struct circular { x: circular }",
+        "struct circular1 { x: circular2 } struct circular2 { x: circular1 }"
     ];
     for str in ok.iter() {
         compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
@@ -1791,6 +1862,9 @@ fn int_promotion() {
         "func pro(): int { a: u8 = 1; b: u8 = 2; return a + b; }",
         "func pro(): int { a: u8 = 1; b: u16 = 2; return a + b; }",
         "func pro(): int { a: u8 = 1; b: i16 = 2; return a + b; }",
+        "func pro(): int { a: u8 = 255:i16:u8; return a; }",
+        "func pro(): int { a: u8 = 256:i16:u8; return a; }",
+        "func pro(): int { a: u16 = 256:i16:u8; return a; }",
     ];
     let err = [
         "func pro(): u8 { a: u8 = 1; b: u8 = 2; return a + b; }",
@@ -1891,17 +1965,18 @@ func main(): int {
 (r#"
 func main(): int {
     a := 0;
-    while (1:bool) {
+    for (;;) {
         a = a + 1;
         if (a == 10) {
             break;
         }
-        continue;
+        // continue;
     }
     return a;
 }
 "#, Value::Int(10)),
 (r#"
+//
 func main(): int {
     a := 0;
     b := 0;
@@ -1931,23 +2006,48 @@ func main(): int {
 "#, Value::Int(100)),
 (r#"
 func main(): int {
-    a := 3;
+    a := 3.0;
     b := 0;
     switch (a) {
-        1 {
+        1.0 {
             b = 0;
         }
-        2, 3 {
+        else {
+            b = 4;
+        }
+        2.0, 3.0 {
             b = 1;
         }
-        10 {
+        10.0 {
             b = 100;
         }
     }
     return b;
 }
 "#, Value::Int(1)),
-(r#"func main(): int {
+(r#"
+func main(): int {
+    a := 3.0;
+    b := 0;
+    switch (a) {
+        1.0 {
+            b = 2;
+        }
+        else {
+            b = 4;
+        }
+        2.0 {
+            b = 1;
+        }
+        10.0 {
+            b = 100;
+        }
+    }
+    return b;
+}
+"#, Value::Int(4)),
+(r#"
+func main(): int {
     a := 1;
     do {
         if (a > 2) {
@@ -1964,5 +2064,75 @@ func main(): int {
         let expect = test.1;
         let ret = compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
         assert_eq!(expect, ret);
+    }
+}
+
+#[test]
+fn structs() {
+    let ok = [
+(r#"
+struct RGBA {
+    r: i8,
+    g: i8,
+    b: i8,
+    a: i8,
+}
+
+func main(): int {
+    c := { r = 1, g = 1, b = 1, a = 1 }:RGBA;
+    return (c.r << 24) + (c.g << 16) + (c.b << 8) + c.a;
+}
+"#, Value::Int(0x01010101)),
+(r#"
+struct Inner {
+    value: i64
+}
+
+struct Outer {
+    inner: Inner
+}
+
+func main(): int {
+    a: Outer = { inner = { value = 1234 }};
+    b: Outer = { inner = { value = 1234 }:Inner };
+    c := { inner = { value = 1234 }:Inner }:Outer;
+    d: Outer = { inner = { value = 1234 }:Inner }:Outer;
+    z: Outer = {};
+    if ((a.inner.value == b.inner.value) && (b.inner.value == c.inner.value) && (c.inner.value == d.inner.value) && (d.inner.value != z.inner.value)) {
+        return a.inner.value;
+    }
+    return 0;
+}
+"#, Value::Int(1234)),
+(r#"
+struct V2 {
+    x: f32,
+    y: f32
+}
+
+func main(): int {
+    {
+        a := { x = 2, y = 2 }:V2;
+    }
+    a := { x = 2 }:V2;
+    return a.y:int;
+}
+"#, Value::Int(0))
+];
+    let err = [
+r#"
+func main(): int {
+    v := {0}:int;
+    return v;
+}
+"#];
+    for test in ok.iter() {
+        let str = test.0;
+        let expect = test.1;
+        let ret = compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
+        assert_eq!(expect, ret);
+    }
+    for str in err.iter() {
+        let ret = compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
     }
 }

@@ -54,3 +54,14 @@ impl<T: Copy, const N: usize> std::ops::Deref for SmallVecN<T, N> {
         }
     }
 }
+
+impl<T: Copy, const N: usize> std::ops::DerefMut for SmallVecN<T, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            SmallVecN::Here { arr, len } => unsafe {
+                std::mem::transmute::<&mut [MaybeUninit<T>], &mut [T]>(&mut arr[..*len])
+            },
+            SmallVecN::Vec(vec) => &mut vec[..],
+        }
+    }
+}

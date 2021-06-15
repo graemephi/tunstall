@@ -46,6 +46,7 @@ pub enum TokenKind {
     LShift,
     RShift,
     Assign,
+    Dot,
     Comma,
     ColonAssign,
     Colon,
@@ -94,6 +95,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Lt => "<",
             TokenKind::Gt => ">",
             TokenKind::Assign => "=",
+            TokenKind::Dot => ".",
             TokenKind::Comma => ",",
             TokenKind::Colon => ":",
             TokenKind::ColonColon => "::",
@@ -160,7 +162,8 @@ pub enum Keyword {
     For,
     Do,
     Switch,
-    Func
+    Func,
+    Struct
 }
 
 impl Keyword {
@@ -176,6 +179,7 @@ impl Keyword {
             8  => Some(Keyword::Do),
             9  => Some(Keyword::Switch),
             10 => Some(Keyword::Func),
+            11 => Some(Keyword::Struct),
             _  => None,
         }
     }
@@ -191,7 +195,8 @@ impl Keyword {
             Keyword::For => "for",
             Keyword::Do => "do",
             Keyword::Switch => "switch",
-            Keyword::Func => "func"
+            Keyword::Func => "func",
+            Keyword::Struct => "struct"
         }
     }
 }
@@ -202,13 +207,12 @@ impl std::fmt::Display for Keyword {
     }
 }
 
-fn offset_from(str: &str, substr: &str) -> usize {
+/// The index of `substr` within `str`. `str` and `substr` must point to the same allocation.
+unsafe fn offset_from(str: &str, substr: &str) -> usize {
     let a = str.as_ptr();
     let b = substr.as_ptr();
-    unsafe {
-        assert!(b <= a.offset(str.len() as isize));
-        b.offset_from(a) as usize
-    }
+    assert!(b <= a.offset(str.len() as isize));
+    b.offset_from(a) as usize
 }
 
 struct Parser<'c, 'a> {
@@ -239,7 +243,7 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn pos(&self) -> usize {
-        offset_from(self.str, self.p)
+        unsafe { offset_from(self.str, self.p) }
     }
 
     fn fail(&mut self) {
@@ -283,6 +287,7 @@ impl<'c, 'a> Parser<'_, '_> {
             [b'<', ..] => { result.kind = TokenKind::Lt; 1 }
             [b'>', ..] => { result.kind = TokenKind::Gt; 1 }
             [b'=', ..] => { result.kind = TokenKind::Assign; 1 }
+            [b'.', ..] => { result.kind = TokenKind::Dot; 1 }
             [b',', ..] => { result.kind = TokenKind::Comma; 1 }
             [b':', ..] => { result.kind = TokenKind::Colon; 1 }
             [b';', ..] => { result.kind = TokenKind::Semicolon; 1 }
@@ -348,13 +353,17 @@ impl<'c, 'a> Parser<'_, '_> {
         self.token.kind == TokenKind::Eof
     }
 
+    fn not(&self, kind: TokenKind) -> bool {
+        !self.is_eof() && self.token.kind != kind
+    }
+
     fn comment(&mut self) {
         while self.token.kind == TokenKind::Comment {
             self.next_token();
         }
     }
 
-    fn try_consume(&mut self, kind: TokenKind) -> Option<Token> {
+    fn try_token(&mut self, kind: TokenKind) -> Option<Token> {
         self.comment();
         if self.token.kind == kind {
             let result = Some(self.token);
@@ -365,7 +374,7 @@ impl<'c, 'a> Parser<'_, '_> {
         None
     }
 
-    fn consume(&mut self, kind: TokenKind) -> Token {
+    fn token(&mut self, kind: TokenKind) -> Token {
         self.comment();
         if self.token.kind == kind {
             let result = self.token;
@@ -377,7 +386,7 @@ impl<'c, 'a> Parser<'_, '_> {
 
     }
 
-    fn try_consume_keyword(&mut self, keyword: Keyword) -> Option<Token> {
+    fn try_keyword(&mut self, keyword: Keyword) -> Option<Token> {
         self.comment();
         if self.token.kind == TokenKind::Keyword && self.token.keyword == Some(keyword) {
             let result = Some(self.token);
@@ -388,7 +397,7 @@ impl<'c, 'a> Parser<'_, '_> {
         None
     }
 
-    fn consume_keyword(&mut self, keyword: Keyword) -> Token {
+    fn keyword(&mut self, keyword: Keyword) -> Token {
         self.comment();
         if self.token.kind == TokenKind::Keyword && self.token.keyword == Some(keyword) {
             let result = self.token;
@@ -400,19 +409,20 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn type_expr(&mut self) -> TypeExpr {
-        TypeExpr::Name(self.name())
+        let name = self.name();
+        self.ast.push_type_expr(TypeExprData::Name(name))
     }
 
     fn paren_expr(&mut self) -> Expr {
-        self.consume(TokenKind::LParen);
+        self.token(TokenKind::LParen);
         let result = self.expr();
-        self.consume(TokenKind::RParen);
+        self.token(TokenKind::RParen);
         result
     }
 
     fn name(&mut self) -> Intern {
         let result = self.token.intern;
-        self.consume(TokenKind::Name);
+        self.token(TokenKind::Name);
         result
     }
 
@@ -420,7 +430,7 @@ impl<'c, 'a> Parser<'_, '_> {
         let mut list = SmallVec::new();
         let expr = self.expr();
         list.push(self.ast.pop_expr(expr));
-        while self.try_consume(TokenKind::Comma).is_some() {
+        while self.try_token(TokenKind::Comma).is_some() {
             let expr = self.expr();
             list.push(self.ast.pop_expr(expr));
         }
@@ -435,13 +445,13 @@ impl<'c, 'a> Parser<'_, '_> {
             },
             Int => {
                 let token = self.token;
-                self.consume(Int);
+                self.token(Int);
                 let value: usize = token.str.parse().unwrap_or_else(|err| { parse_error!(self, "{}", err) });
                 self.ast.push_expr_int(token.source_index, value)
             },
             Float => {
                 let token = self.token;
-                self.consume(Float);
+                self.token(Float);
                 if token.suffix == Some(b'd') {
                     let value: f64 = token.str.parse().unwrap_or_else(|err| { parse_error!(self, "{}", err) });
                     self.ast.push_expr_float64(token.source_index, value)
@@ -455,16 +465,42 @@ impl<'c, 'a> Parser<'_, '_> {
                 let name = self.name();
                 self.ast.push_expr_name(index, name)
             },
+            LBrace => {
+                let pos = self.pos();
+                self.token(LBrace);
+                let mut fields = SmallVec::new();
+                while self.not(RBrace) {
+                    let path = self.base_expr();
+                    self.token(Assign);
+                    let value = self.expr();
+                    fields.push(CompoundFieldData { path, value });
+                    if self.try_token(Comma).is_none() {
+                        break;
+                    }
+                }
+                self.token(RBrace);
+                self.ast.push_expr_compound(pos, &fields)
+            }
             _ => {
                 parse_error!(self, "Unexpected {}", self.token)
             }
         };
 
-        if self.try_consume(LParen).is_some() {
-            let token = self.token;
-            let args = self.expr_list();
-            self.consume(RParen);
-            result = self.ast.push_expr_call(token.source_index, result, args);
+        loop {
+            match self.token.kind {
+                LParen => {
+                    let pos = self.token(LParen).source_index;
+                    let args = self.expr_list();
+                    self.token(RParen);
+                    result = self.ast.push_expr_call(pos, result, args);
+                }
+                Dot => {
+                    let pos = self.token(Dot).source_index;
+                    let field = self.name();
+                    result = self.ast.push_expr_field(pos, result, field);
+                }
+                _ => break
+            }
         }
 
         result
@@ -475,31 +511,31 @@ impl<'c, 'a> Parser<'_, '_> {
         match self.token.kind {
             Sub => {
                 let token = self.token;
-                self.consume(Sub);
+                self.token(Sub);
                 let operand = self.unary_expr();
                 self.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             BitNeg => {
                 let token = self.token;
-                self.consume(BitNeg);
+                self.token(BitNeg);
                 let operand = self.unary_expr();
                 self.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             Not => {
                 let token = self.token;
-                self.consume(Not);
+                self.token(Not);
                 let operand = self.unary_expr();
                 self.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             BitAnd => {
                 let token = self.token;
-                self.consume(BitAnd);
+                self.token(BitAnd);
                 let operand = self.unary_expr();
                 self.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             Mul => {
                 let token = self.token;
-                self.consume(Mul);
+                self.token(Mul);
                 let operand = self.unary_expr();
                 self.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
@@ -512,7 +548,7 @@ impl<'c, 'a> Parser<'_, '_> {
     fn cast_expr(&mut self) -> Expr {
         let mut result = self.unary_expr();
 
-        while self.try_consume(TokenKind::Colon).is_some() {
+        while self.try_token(TokenKind::Colon).is_some() {
             let token = self.token;
             let ty = self.type_expr();
             result = self.ast.push_expr_cast(token.source_index, result, ty);
@@ -583,9 +619,9 @@ impl<'c, 'a> Parser<'_, '_> {
         let mut result = self.or_expr();
         if matches!(self.token.kind, TokenKind::Question) {
             let token = self.token;
-            self.consume(TokenKind::Question);
+            self.token(TokenKind::Question);
             let left = self.ternary_expr();
-            self.consume(TokenKind::ColonColon);
+            self.token(TokenKind::ColonColon);
             let right = self.ternary_expr();
             result = self.ast.push_expr_ternary(token.source_index, result, left, right);
         }
@@ -597,9 +633,9 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn stmt_block(&mut self) -> StmtList {
-        self.consume(TokenKind::LBrace);
+        self.token(TokenKind::LBrace);
         let mut list = SmallVec::new();
-        while !self.is_eof() && self.try_consume(TokenKind::RBrace).is_none() {
+        while !self.is_eof() && self.try_token(TokenKind::RBrace).is_none() {
             let stmt = self.stmt();
             list.push(self.ast.pop_stmt(stmt));
         }
@@ -621,7 +657,7 @@ impl<'c, 'a> Parser<'_, '_> {
                 // thing. Take `a: int = 0;`. Conceptually, we expect a `:` after the expr `a`,
                 // but `a: int` parses as Expr::Cast(a, int). We can immediately see this,
                 // and so rewrite it as a variable declaration.
-                match self.ast.expr_data(left) {
+                match self.ast.expr(left) {
                     ExprData::Cast(expr, ty) => {
                         self.ast.pop_expr(left);
                         let right = self.expr();
@@ -645,24 +681,24 @@ impl<'c, 'a> Parser<'_, '_> {
         use TokenKind::*;
         match (self.token.kind, self.token.keyword) {
             (Keyword, Some(Return)) => {
-                self.consume(Keyword);
-                let expr = if self.try_consume(Semicolon).is_some() {
+                self.token(Keyword);
+                let expr = if self.try_token(Semicolon).is_some() {
                     None
                 } else {
                     let expr = self.expr();
-                    self.consume(Semicolon);
+                    self.token(Semicolon);
                     Some(expr)
                 };
                 self.ast.push_stmt_return(expr)
             },
             (Keyword, Some(Break)) => {
-                self.consume(Keyword);
-                self.consume(Semicolon);
+                self.token(Keyword);
+                self.token(Semicolon);
                 self.ast.push_stmt_break()
             },
             (Keyword, Some(Continue)) => {
-                self.consume(Keyword);
-                self.consume(Semicolon);
+                self.token(Keyword);
+                self.token(Semicolon);
                 self.ast.push_stmt_continue()
             },
             (LBrace, _) => {
@@ -670,10 +706,10 @@ impl<'c, 'a> Parser<'_, '_> {
                 self.ast.push_stmt_block(list)
             },
             (Keyword, Some(If)) => {
-                self.consume(Keyword);
+                self.token(Keyword);
                 let expr = self.paren_expr();
                 let then_stmt = self.stmt_block();
-                let else_stmt = if self.try_consume_keyword(Else).is_some() {
+                let else_stmt = if self.try_keyword(Else).is_some() {
                     if matches!(self.token.keyword, Some(If)) {
                         let stmt = self.stmt();
                         StmtList::from(stmt)
@@ -686,58 +722,58 @@ impl<'c, 'a> Parser<'_, '_> {
                 self.ast.push_stmt_if(expr, then_stmt, else_stmt)
             },
             (Keyword, Some(While)) => {
-                self.consume(Keyword);
+                self.token(Keyword);
                 let cond = self.paren_expr();
                 let body = self.stmt_block();
                 self.ast.push_stmt_while(cond, body)
             },
             (Keyword, Some(For)) => {
-                self.consume(Keyword);
-                self.consume(LParen);
-                let pre = if matches!(self.token.kind, Semicolon) == false {
+                self.token(Keyword);
+                self.token(LParen);
+                let pre = if self.not(Semicolon) {
                     Some(self.simple_stmt())
                 } else {
                     None
                 };
-                self.consume(Semicolon);
-                let cond = if matches!(self.token.kind, Semicolon) == false {
-                    self.expr()
+                self.token(Semicolon);
+                let cond = if self.not(Semicolon) {
+                    Some(self.expr())
                 } else {
-                    self.ast.push_expr_int(self.pos(), 1)
+                    None
                 };
-                self.consume(Semicolon);
-                let post = if matches!(self.token.kind, RParen) == false {
+                self.token(Semicolon);
+                let post = if self.not(RParen) {
                     Some(self.simple_stmt())
                 } else {
                     None
                 };
-                self.consume(RParen);
+                self.token(RParen);
                 let block = self.stmt_block();
                 self.ast.push_stmt_for(pre, cond, post, block)
             },
             (Keyword, Some(Do)) => {
-                self.consume(Keyword);
+                self.token(Keyword);
                 let body = self.stmt_block();
-                self.consume_keyword(While);
+                self.keyword(While);
                 let cond = self.paren_expr();
-                self.consume(Semicolon);
+                self.token(Semicolon);
                 self.ast.push_stmt_do(cond, body)
             },
             (Keyword, Some(Switch)) => {
-                self.consume(Keyword);
-                self.consume(LParen);
+                self.token(Keyword);
+                self.token(LParen);
                 let control = self.expr();
-                self.consume(RParen);
-                self.consume(LBrace);
+                self.token(RParen);
+                self.token(LBrace);
                 let mut cases = SmallVec::new();
                 let mut seen_else = false;
-                while !self.is_eof() && !matches!(self.token.kind, RBrace) {
+                while self.not(RBrace) {
                     if matches!(self.token.keyword, Some(Else)) {
                         if seen_else {
                             parse_error!(self, "multiple else cases in switch")
                         } else {
                             seen_else = true;
-                            self.consume(Keyword);
+                            self.token(Keyword);
                             let block = self.stmt_block();
                             cases.push(SwitchCaseData::Else(block));
                         }
@@ -747,51 +783,70 @@ impl<'c, 'a> Parser<'_, '_> {
                         cases.push(SwitchCaseData::Cases(exprs, block));
                     }
                 }
-                self.consume(RBrace);
+                self.token(RBrace);
                 self.ast.push_stmt_switch(control, &cases)
             },
             _ => {
                 let stmt = self.simple_stmt();
-                self.consume(Semicolon);
+                self.token(Semicolon);
                 stmt
             }
         }
     }
 
+    fn items(&mut self) -> ItemList {
+        let mut items = SmallVec::new();
+        while self.token.kind == TokenKind::Name {
+            let name = self.name();
+            self.token(TokenKind::Colon);
+            let expr = self.type_expr();
+            items.push(ItemData { name, expr });
+            self.try_token(TokenKind::Comma);
+        }
+        self.ast.push_items(&items)
+    }
+
     fn func_decl(&mut self) {
         let kind = CallableKind::Function;
         let pos = self.pos();
+        self.keyword(Keyword::Func);
         let name = self.name();
-        let mut params = SmallVec::new();
-        self.consume(TokenKind::LParen);
-        while matches!(self.token.kind, TokenKind::Name) {
-            let param_name = self.name();
-            self.consume(TokenKind::Colon);
-            let param_type = self.type_expr();
-            params.push(ItemData { name: param_name, expr: param_type });
-            if self.try_consume(TokenKind::Comma).is_none() {
-                break;
-            }
+        self.token(TokenKind::LParen);
+        let params;
+        if let None = self.try_token(TokenKind::RParen) {
+            params = self.items();
+            self.token(TokenKind::RParen);
+        } else {
+            params = ItemList::empty();
         }
-        let params = self.ast.push_items(&params);
-        self.consume(TokenKind::RParen);
-        self.consume(TokenKind::Colon);
+        self.token(TokenKind::Colon);
         let returns = Some(self.type_expr());
         let body = self.stmt_block();
-        self.ast.push_callable_decl(CallableDecl { kind, pos, name, params, returns, body });
+        self.ast.push_callable_decl(CallableDecl { kind, pos, name, params, returns, body })
+            .unwrap_or_else(|| parse_error!(self, "{} has already been defined", self.ctx.str(name)));
+    }
+
+    fn struct_decl(&mut self) {
+        let pos = self.pos();
+        self.keyword(Keyword::Struct);
+        let name = self.name();
+        self.token(TokenKind::LBrace);
+        let fields = self.items();
+        self.token(TokenKind::RBrace);
+        self.ast.push_struct_decl(StructDecl { pos, name, fields })
+            .unwrap_or_else(|| parse_error!(self, "{} has already been defined", self.ctx.str(name)));
     }
 }
 
 pub fn parse(ctx: &mut Compiler, str: &str) -> Ast {
     let mut parser = Parser::new(ctx, str);
     while !parser.is_eof() {
-        if parser.token.kind == TokenKind::Comment {
-            continue;
-        }
+        parser.comment();
         match parser.token.keyword {
-            Some(Keyword::Func) => { parser.consume_keyword(Keyword::Func); parser.func_decl(); }
-            Some(keyword) => { parse_error!(parser, "Unexpected keyword '{}'", keyword) }
-            None => { parse_error!(parser, "Unexpected {}", parser.token) }
+            Some(Keyword::Func) => parser.func_decl(),
+            Some(Keyword::Struct) => parser.struct_decl(),
+            Some(keyword) => parse_error!(parser, "Unexpected keyword '{}'", keyword),
+            None => parse_error!(parser, "Unexpected {}", parser.token)
         }
     }
     parser.ast

@@ -1,4 +1,5 @@
 use std::convert::TryFrom;
+use std::collections::hash_map::HashMap;
 
 use crate::Intern;
 use crate::parse::TokenKind;
@@ -25,6 +26,10 @@ macro_rules! define_node_list {
                 self.begin != self.end
             }
 
+            pub fn is_empty(self) -> bool {
+                self.begin == self.end
+            }
+
             pub fn len(self) -> usize {
                 (self.end - self.begin) as usize
             }
@@ -49,6 +54,15 @@ macro_rules! define_node_list {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompoundField(u32);
+define_node_list!(CompoundField, CompoundFieldList, CompoundFieldListIter);
+
+#[derive(Clone, Copy, Debug)]
+pub struct CompoundFieldData {
+    pub path: Expr,
+    pub value: Expr
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Expr(u32);
@@ -61,38 +75,48 @@ pub enum ExprData {
     Float32(f32),
     Float64(f64),
     Name(Intern),
+    Compound(CompoundFieldList),
+    Field(Expr, Intern),
     Unary(TokenKind, Expr),
     Binary(TokenKind, Expr, Expr),
     Ternary(Expr, Expr, Expr),
     Call(Expr, ExprList),
-    Cast(Expr, TypeExpr)
+    Cast(Expr, TypeExpr),
 }
 
 impl std::fmt::Display for ExprData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             ExprData::Int(a) => write!(f, "integer ({})", a),
+            ExprData::Float32(a) => write!(f, "f32 ({})", a),
+            ExprData::Float64(a) => write!(f, "f64 ({})", a),
             ExprData::Name(_) => write!(f, "identifier"),
             _ => write!(f, "expression"),
         }
     }
 }
 
-struct ExprAux {
+#[derive(Clone, Copy, Debug)]
+pub struct ExprAux {
     pos: usize
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeExpr(pub u32);
+define_node_list!(TypeExpr, TypeExprList, TypeExprListIter);
+
+#[allow(non_upper_case_globals)]
+impl TypeExpr {
+    pub const Infer: TypeExpr = TypeExpr(0);
+}
+
 #[derive(Clone, Copy, Debug)]
-pub enum TypeExpr {
+pub enum TypeExprData {
     Infer,
     Name(Intern)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Stmt(u32);
-define_node_list!(Stmt, StmtList, StmtListIter);
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SwitchCase(u32);
 define_node_list!(SwitchCase, SwitchCaseList, SwitchCaseListIter);
 
@@ -102,6 +126,12 @@ pub enum SwitchCaseData {
     Else(StmtList),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stmt(u32);
+define_node_list!(Stmt, StmtList, StmtListIter);
+
+// Todo: The For variant doubles this enum's size in memory. A tighter packing
+// can be done without requiring an API change to the AST.
 #[derive(Clone, Copy, Debug)]
 pub enum StmtData {
     Block(StmtList),
@@ -110,7 +140,7 @@ pub enum StmtData {
     Continue,
     If(Expr, StmtList, StmtList),
     While(Expr, StmtList),
-    For(Option<Stmt>, Expr, Option<Stmt>, StmtList),
+    For(Option<Stmt>, Option<Expr>, Option<Stmt>, StmtList),
     Switch(Expr, SwitchCaseList),
     Do(Expr, StmtList),
     Expr(Expr),
@@ -118,15 +148,17 @@ pub enum StmtData {
     VarDecl(TypeExpr, Expr, Expr)
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum CallableKind {
     Function,
     // Procedure
 }
 
-// An Item is a named declaration of a type, as in function parameters and
-// struct fields.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+/// A named declaration of a type, as in function parameters and
+/// struct fields.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Item(u32);
+define_node_list!(Item, ItemList, ItemListIter);
 
 #[derive(Clone, Copy, Debug)]
 pub struct ItemData {
@@ -134,39 +166,90 @@ pub struct ItemData {
     pub expr: TypeExpr,
 }
 
-define_node_list!(Item, ItemList, ItemListIter);
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Decl(u32);
+define_node_list!(Decl, DeclList, DeclListIter);
 
+#[derive(Clone, Copy, Debug)]
 pub struct CallableDecl {
-    pub kind: CallableKind,
     pub pos: usize,
     pub name: Intern,
     pub params: ItemList,
+    pub kind: CallableKind,
     pub returns: Option<TypeExpr>,
     pub body: StmtList
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct StructDecl {
+    pub pos: usize,
+    pub name: Intern,
+    pub fields: ItemList,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DeclData {
+    Callable(CallableDecl),
+    Struct(StructDecl)
+}
+
+impl DeclData {
+    pub fn name(&self) -> Intern {
+        match &self {
+            DeclData::Callable(decl) => decl.name,
+            DeclData::Struct(decl) => decl.name,
+        }
+    }
+
+    pub fn pos(&self) -> usize {
+        match &self {
+            DeclData::Callable(decl) => decl.pos,
+            DeclData::Struct(decl) => decl.pos,
+        }
+    }
+
+    pub fn items(&self) -> ItemList {
+        match &self {
+            DeclData::Callable(decl) => decl.params,
+            DeclData::Struct(decl) => decl.fields,
+        }
+    }
+}
+
+fn push_data<T>(vec: &mut Vec<T>, data: T) -> u32 {
+    let result = u32::try_from(vec.len()).expect("Program too big!");
+    vec.push(data);
+    result
+}
+
+fn push_slice<T: Clone>(vec: &mut Vec<T>, data: &[T]) -> (u32, u32) {
+    let begin = u32::try_from(vec.len()).expect("Program too big!");
+    vec.extend_from_slice(data);
+    let end = u32::try_from(vec.len()).expect("Program too big!");
+    (begin, end)
+}
+
+#[derive(Default)]
 pub struct Ast {
     exprs: Vec<ExprData>,
     exprs_aux: Vec<ExprAux>,
+    fields: Vec<CompoundFieldData>,
     stmts: Vec<StmtData>,
     cases: Vec<SwitchCaseData>,
     items: Vec<ItemData>,
-    decls: Vec<CallableDecl>,
+    decls: Vec<DeclData>,
+    decl_by_name: HashMap<Intern, Decl>,
+    type_exprs: Vec<TypeExprData>,
 }
 
 impl Ast {
     pub fn new() -> Ast {
-        Ast {
-            exprs: vec![ExprData::Int(0)],
-            exprs_aux: vec![ExprAux { pos: 0}],
-            stmts: vec![StmtData::Return(None)],
-            cases: Vec::new(),
-            items: Vec::new(),
-            decls: Vec::new(),
-        }
+        let mut result: Ast = Default::default();
+        result.type_exprs.push(TypeExprData::Infer);
+        result
     }
 
-    pub fn expr_data(&self, expr: Expr) -> ExprData {
+    pub fn expr(&self, expr: Expr) -> ExprData {
         self.exprs[expr.0 as usize]
     }
 
@@ -174,16 +257,20 @@ impl Ast {
         self.exprs_aux[expr.0 as usize].pos
     }
 
+    pub fn compound_field(&self, field: CompoundField) -> CompoundFieldData {
+        self.fields[field.0 as usize]
+    }
+
     fn push_expr(&mut self, pos: usize, data: ExprData) -> Expr {
-        let result = u32::try_from(self.exprs.len()).expect("Program too big!");
-        self.exprs.push(data);
+        let result = push_data(&mut self.exprs, data);
         self.exprs_aux.push(ExprAux { pos });
         Expr(result)
     }
 
-    pub fn push_exprs(&mut self, data: &[ExprData]) -> ExprList {
+    pub fn push_exprs(&mut self, data: &[(ExprData, ExprAux)]) -> ExprList {
         let begin = u32::try_from(self.exprs.len()).expect("Program too big!");
-        self.exprs.extend_from_slice(data);
+        self.exprs.extend(data.iter().map(|e| e.0));
+        self.exprs_aux.extend(data.iter().map(|e| e.1));
         let end = u32::try_from(self.exprs.len()).expect("Program too big!");
         ExprList { begin, end }
     }
@@ -202,6 +289,15 @@ impl Ast {
 
     pub fn push_expr_name(&mut self, pos: usize, value: Intern) -> Expr {
         self.push_expr(pos, ExprData::Name(value))
+    }
+
+    pub fn push_expr_compound(&mut self, pos: usize, fields: &[CompoundFieldData]) -> Expr {
+        let (begin, end) = push_slice(&mut self.fields, fields);
+        self.push_expr(pos, ExprData::Compound(CompoundFieldList { begin, end }))
+    }
+
+    pub fn push_expr_field(&mut self, pos: usize, expr: Expr, field: Intern) -> Expr {
+        self.push_expr(pos, ExprData::Field(expr, field))
     }
 
     pub fn push_expr_unary(&mut self, pos: usize, op: TokenKind, right: Expr) -> Expr {
@@ -224,26 +320,23 @@ impl Ast {
         self.push_expr(pos, ExprData::Cast(expr, ty))
     }
 
-    pub fn pop_expr(&mut self, expr: Expr) -> ExprData {
+    pub fn pop_expr(&mut self, expr: Expr) -> (ExprData, ExprAux) {
         debug_assert!(expr.0 as usize == self.exprs.len() - 1);
-        self.exprs.remove(expr.0 as usize)
+        (self.exprs.remove(expr.0 as usize), self.exprs_aux.remove(expr.0 as usize))
     }
 
 
-    pub fn stmt_data(&self, stmt: Stmt) -> StmtData {
+    pub fn stmt(&self, stmt: Stmt) -> StmtData {
         self.stmts[stmt.0 as usize]
     }
 
     fn push_stmt(&mut self, data: StmtData) -> Stmt {
-        let index = u32::try_from(self.stmts.len()).expect("Program too big!");
-        self.stmts.push(data);
-        Stmt(index)
+        let result = push_data(&mut self.stmts, data);
+        Stmt(result)
     }
 
     pub fn push_stmts(&mut self, data: &[StmtData]) -> StmtList {
-        let begin = u32::try_from(self.stmts.len()).expect("Program too big!");
-        self.stmts.extend_from_slice(data);
-        let end = u32::try_from(self.stmts.len()).expect("Program too big!");
+        let (begin, end) = push_slice(&mut self.stmts, data);
         StmtList { begin, end }
     }
 
@@ -267,7 +360,7 @@ impl Ast {
         self.push_stmt(StmtData::If(cond, then_stmt, else_stmt))
     }
 
-    pub fn push_stmt_for(&mut self, pre: Option<Stmt>, cond: Expr, post: Option<Stmt>, body: StmtList) -> Stmt {
+    pub fn push_stmt_for(&mut self, pre: Option<Stmt>, cond: Option<Expr>, post: Option<Stmt>, body: StmtList) -> Stmt {
         self.push_stmt(StmtData::For(pre, cond, post, body))
     }
 
@@ -280,9 +373,7 @@ impl Ast {
     }
 
     pub fn push_stmt_switch(&mut self, control: Expr, cases: &[SwitchCaseData]) -> Stmt {
-        let begin = u32::try_from(self.cases.len()).expect("Program too big!");
-        self.cases.extend_from_slice(cases);
-        let end = u32::try_from(self.cases.len()).expect("Program too big!");
+        let (begin, end) = push_slice(&mut self.cases, cases);
         self.push_stmt(StmtData::Switch(control, SwitchCaseList { begin, end }))
     }
 
@@ -303,28 +394,75 @@ impl Ast {
         self.stmts.remove(stmt.0 as usize)
     }
 
-    pub fn switch_case_data(&self, case: SwitchCase) -> SwitchCaseData {
+    pub fn switch_case(&self, case: SwitchCase) -> SwitchCaseData {
         self.cases[case.0 as usize]
     }
 
 
     pub fn push_items(&mut self, data: &[ItemData]) -> ItemList {
-        let begin = u32::try_from(self.items.len()).expect("Program too big!");
-        self.items.extend_from_slice(data);
-        let end = u32::try_from(self.items.len()).expect("Program too big!");
+        let (begin, end) = push_slice(&mut self.items, data);
         ItemList { begin, end }
+    }
+
+    pub fn item(&self, item: Item) -> ItemData {
+        self.items[item.0 as usize]
     }
 
     pub fn items(&self, items: ItemList) -> &[ItemData] {
         &self.items[items.as_range()]
     }
 
-
-    pub fn push_callable_decl(&mut self, decl: CallableDecl) {
-        self.decls.push(decl);
+    fn push_decl(&mut self, data: DeclData) -> Option<Decl> {
+        use std::collections::hash_map::Entry;
+        match self.decl_by_name.entry(data.name()) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(entry) => {
+                let result = Decl(push_data(&mut self.decls, data));
+                entry.insert(result);
+                Some(result)
+            }
+        }
     }
 
-    pub fn decls(&self) -> &[CallableDecl] {
-        &self.decls
+    pub fn push_callable_decl(&mut self, decl: CallableDecl) -> Option<Decl> {
+        self.push_decl(DeclData::Callable(decl))
+    }
+
+    pub fn push_struct_decl(&mut self, decl: StructDecl) -> Option<Decl> {
+        self.push_decl(DeclData::Struct(decl))
+    }
+
+    pub fn lookup_decl(&self, name: Intern) -> Option<Decl> {
+        self.decl_by_name.get(&name).copied()
+    }
+
+    pub fn decl(&self, decl: Decl) -> &DeclData {
+        &self.decls[decl.0 as usize]
+    }
+
+    pub fn decl_list(&self) -> DeclList {
+        DeclList { begin: 0, end: self.decls.len() as u32 }
+    }
+
+    pub fn callables(&self) -> impl std::iter::Iterator<Item = &CallableDecl> {
+        self.decls.iter().filter_map(|decl| {
+            match decl {
+                DeclData::Callable(callable) => Some(callable),
+                _ => None
+            }
+        })
+    }
+
+    pub fn push_type_expr(&mut self, data: TypeExprData) -> TypeExpr {
+        let result = push_data(&mut self.type_exprs, data);
+        TypeExpr(result)
+    }
+
+    pub fn type_expr(&self, expr: TypeExpr) -> TypeExprData {
+        self.type_exprs[expr.0 as usize]
+    }
+
+    pub fn type_expr_list(&self) -> TypeExprList {
+        TypeExprList { begin: 0, end : self.type_exprs.len() as u32 }
     }
 }

@@ -1,23 +1,62 @@
+struct V2 { x: f32, y: f32 }
 
-func add(a: int, b: int): int
+func syntax(a: int, b: int): int
 {
     c := a : f32;
-    d := a + b: f32; // error
-    e := a: f32 + b; // error
+//  d := a + b: f32; // error
+//  e := a: f32 + b; // error
     f := (a + b): f32;
     g := a: f32 + b: f32;
     h := (a : f32) + (b : f32);
     i: int = a: f32: int;
 
-    m := a: int & b;       // a & b
-    n: ptr int = &a: int; // &a
+    m := a: int & b;      // a & b
+    n: ptr int = &a: int; //
     o: int = (&a): int;   // (int)(&a);
     p: ptr (ptr int) = &&a;
 
-    q := add(a, b): f32;
 
-    add: func (int, int) int (1,2)          // funcs always have a return type
-    add2: proc (int, int) (1, 2)            // procs never have a return type ?
-                                            // but both will fail to type check (func takes 2 args)
-    r := add: (func (int, int) int)(1, 2)   // cast and call ?
+    // add: func (int, int) int (1,2)          // funcs always have a return type
+    // add2: proc (int, int) () (1, 2)
+                                               // but both will fail to type check (they take 2 args, not 3)
+    r := add: (func (int, int) int)(1, 2)      // cast and call ?
+
+    v := { x = 0.0, y = 0.0 }:V2;
+    v: V2 = { x = 0.0, y = 0.0 };
+    v: V2 = { x = 0.0, y = 0.0 }:V2;
+
+    anon := { a = 0, b = 0 }:struct { a: i32, y: i32 };
+
+    return r;
+}
+
+struct Blah {
+    a: Map i32 (Map Agh i32)
+}
+
+struct Slice T {
+    buf: ptr T,
+    len: int
+    cap: int
+}
+
+struct Func V {
+    func: ptr _ -> V,
+    userdata: ptr _
+}
+
+struct Map K V {
+    values: ptr K,
+    keys: ptr V,
+    hashes: ptr u64,
+    // ...
+}
+
+// lean style ?
+proc map_put { K, V: Type } [Hashable K] (map: ptr (Map K V), key: K, value: V) {
+
+}
+
+struct Agh {
+    x, y: i32
 }
