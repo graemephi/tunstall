@@ -21,6 +21,10 @@ macro_rules! error {
     }}
 }
 
+macro_rules! assert_implies {
+    ($p:expr, $q:expr) => { assert!(!($p) || ($q)) }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Intern(u32);
 
@@ -229,6 +233,7 @@ pub enum Op {
     StackRelativeLoad8,
     StackRelativeLoad16,
     StackRelativeLoad32,
+    StackRelativeCopy,
     IntToFloat32,
     IntToFloat64,
     Float32ToInt,
@@ -695,7 +700,8 @@ struct ExprGen {
     ty: Type,
     value: Option<RegValue>,
     // Todo: might not make sense once pointers are in
-    is_field_access: bool,
+    is_field: bool,
+    is_local: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -773,6 +779,7 @@ impl FatGen<'_> {
 
     fn put(&mut self, op: Op, dest: u32, data: RegValue) {
         assert_ne!(dest, Self::BAD_REGISTER);
+        assert_implies!(op != Op::Immediate && op != Op::Call, unsafe { data.int32.0 != Self::BAD_REGISTER });
         self.code.push(FatInstr { op, dest, .. data.unpack() });
     }
 
@@ -785,7 +792,7 @@ impl FatGen<'_> {
         match expr.value {
             Some(v) => self.put_inc(Op::Immediate, v),
             None => {
-                if expr.is_field_access {
+                if expr.is_field {
                     if let Some(op) = load_op(expr.ty) {
                         self.put_inc(op, expr.reg.into())
                     } else {
@@ -910,14 +917,19 @@ impl FatGen<'_> {
     fn expr_with_predicted_compound_type_and_destination(&mut self, ctx: &Compiler, expr: Expr, compound_type: Type, dest: u32) -> ExprGen {
         self.compound.ty = Some(compound_type);
         self.compound.dest = Some(dest);
-        let result = self.expr(ctx, expr);
+        let mut result = self.expr(ctx, expr);
         self.compound.dest = None;
+        if result.ty == compound_type && result.reg != dest {
+            let size = u32::try_from(ctx.types.info(compound_type).size).expect("todo");
+            let reg = self.put_immediate(&result);
+            self.put(Op::StackRelativeCopy, dest, (reg, size).into());
+            result.reg = dest;
+        }
         result
     }
 
-
     fn expr(&mut self, ctx: &Compiler, expr: Expr) -> ExprGen {
-        let mut result = ExprGen { reg: Self::BAD_REGISTER, ty: Type::None, value: None, is_field_access: false };
+        let mut result = ExprGen { reg: Self::BAD_REGISTER, ty: Type::None, value: None, is_field: false, is_local: false };
         let compound_type = self.compound.ty.take();
         match self.ast.expr(expr) {
             ExprData::Int(value) => {
@@ -936,6 +948,7 @@ impl FatGen<'_> {
                 if let Some(local) = self.locals.get(name) {
                     result.reg = local.reg;
                     result.ty = local.ty;
+                    result.is_local = true;
                 } else if let Some(&global) = ctx.globals.get(&name) {
                     result.value = Some(global.value.into());
                     result.ty = global.ty;
@@ -954,10 +967,10 @@ impl FatGen<'_> {
                             let field = self.ast.compound_field(field);
                             if let Some(item) = self.path(ctx, ty, field.path) {
                                 let expr = self.expr_with_predicted_compound_type_and_destination(ctx, field.value, item.ty, base + item.offset as u32);
-                                if item.ty == expr.ty || (expr.ty == Type::Int && value_fits(expr.value, item.ty)) {
+                                if item.ty == expr.ty || (expr.ty == Type::Int && expr.value.is_some() && item.ty.is_integer() && value_fits(expr.value, item.ty)) {
                                     values.push((item.offset, expr))
                                 } else {
-                                    error!(self, self.ast.expr_source_position(field.value), "field '{}' is of type {}, found {}", ctx.str(item.name), ctx.type_str(item.ty), ctx.type_str(expr.ty))
+                                    error!(self, self.ast.expr_source_position(field.value), "incompatible types, field '{}' is of type {}, found {}", ctx.str(item.name), ctx.type_str(item.ty), ctx.type_str(expr.ty))
                                 }
                             }
                         }
@@ -973,10 +986,10 @@ impl FatGen<'_> {
                             }
                             // This cannot overflow u32, otherwise inc_bytes will have paniced.
                             let dest = base + (item.offset as u32);
-                            if let Some(op) = store_op(item.ty) {
-                                self.put(op, dest, reg.into());
-                            } else {
-                                // Already emitted when evaluating the exprs. Seems weird?
+                            if reg != dest {
+                                if let Some(op) = store_op(item.ty) {
+                                    self.put(op, dest, reg.into());
+                                }
                             }
                         }
                         result.ty = ty;
@@ -993,7 +1006,9 @@ impl FatGen<'_> {
                 if let Some(item) = ctx.types.item_info(left.ty, field) {
                     result.reg = left.reg + u32::try_from(item.offset).expect("todo");
                     result.ty = item.ty;
-                    result.is_field_access = true;
+                    result.is_field = true;
+                } else {
+                    error!(self, self.ast.expr_source_position(left_expr), "no field '{}' on type {}", ctx.str(field), ctx.type_str(left.ty));
                 }
             }
             ExprData::Unary(op_token, right_expr) => {
@@ -1327,41 +1342,53 @@ impl FatGen<'_> {
             StmtData::VarDecl(ty_expr, left, right) => {
                 if let ExprData::Name(var) = self.ast.expr(left) {
                     let expr;
-                    let ty;
-                    match ctx.ast.type_expr(ty_expr) {
-                        TypeExprData::Infer => {
-                            expr = self.expr_in_register(ctx, right);
-                            ty = expr.ty;
-                        }
-                        _ => {
-                            ty = self.type_expr(ctx, ty_expr);
-                            expr = self.expr_in_register_with_predicted_compound_type(ctx, right, ty);
-                        }
-                    };
-                    if integer_promote(ty) == integer_promote(expr.ty) {
-                        if value_fits(expr.value, ty) {
-                            self.locals.insert(var, Local::new(expr.reg, ty));
+                    let decl_type;
+                    if matches!(ctx.ast.type_expr(ty_expr), TypeExprData::Infer) {
+                        expr = self.expr_in_register(ctx, right);
+                        decl_type = expr.ty;
+                    } else {
+                        decl_type = self.type_expr(ctx, ty_expr);
+                        expr = self.expr_in_register_with_predicted_compound_type(ctx, right, decl_type);
+                    }
+                    let mut reg = expr.reg;
+                    if expr.is_local {
+                        if expr.ty.is_basic() {
+                            reg = self.put_inc(Op::Move, expr.reg.into());
                         } else {
-                            error!(self, self.ast.expr_source_position(left), "constant expression does not fit in {}", ctx.type_str(ty));
+                            let info = ctx.types.info(expr.ty);
+                            reg = self.inc_bytes(info.size, info.alignment);
+                            self.put(Op::StackRelativeCopy, reg, (expr.reg, info.size as u32).into());
+                        }
+                    }
+                    if decl_type == expr.ty || integer_promote(decl_type) == expr.ty {
+                        if value_fits(expr.value, decl_type) {
+                            self.locals.insert(var, Local::new(reg, decl_type));
+                        } else {
+                            error!(self, self.ast.expr_source_position(left), "constant expression does not fit in {}", ctx.type_str(decl_type));
                         }
                     } else {
-                        error!(self, self.ast.expr_source_position(left), "type mismatch between declaration ({}) and value ({})", ctx.type_str(ty), ctx.type_str(expr.ty))
+                        error!(self, self.ast.expr_source_position(left), "type mismatch between declaration ({}) and value ({})", ctx.type_str(decl_type), ctx.type_str(expr.ty))
                     }
                 } else {
                     error!(self, self.ast.expr_source_position(left), "cannot declare '{}' as a variable", self.ast.expr(left));
                 }
             }
             StmtData::Assign(left, right) => {
-                if let ExprData::Name(var) = self.ast.expr(left) {
-                    let expr = self.expr_in_register(ctx, right);
-                    if let Some(local) = self.locals.get(var) {
-                        let reg = local.reg;
-                        self.put(Op::Move, reg, expr.reg.into());
+                let lv = self.expr(ctx, left);
+                if lv.is_local || lv.is_field {
+                    let value = self.expr_in_register_with_predicted_compound_type(ctx, right, lv.ty);
+                    if lv.ty == value.ty {
+                        if value.ty.is_basic() {
+                            self.put(Op::Move, lv.reg, value.reg.into());
+                        } else {
+                            let size = u32::try_from(ctx.types.info(lv.ty).size).expect("todo");
+                            self.put(Op::StackRelativeCopy, lv.reg, (value.reg, size).into());
+                        }
                     } else {
-                        error!(self, self.ast.expr_source_position(left), "variable '{}' not found", ctx.str(var));
+                        error!(self, self.ast.expr_source_position(left), "type mismatch between assignee ({}) and value ({})", ctx.type_str(lv.ty), ctx.type_str(value.ty))
                     }
                 } else {
-                    todo!("resolve to memory address");
+                    error!(self, self.ast.expr_source_position(left), "cannot assign to {}", self.ast.expr(left));
                 }
             }
         }
@@ -1530,8 +1557,8 @@ impl Compiler {
             let left = sp.wrapping_add(sign_extend(instr.left));
             let right = sp.wrapping_add(sign_extend(instr.right));
 
-            if false == matches!(instr.op, Op::StackRelativeStore8|Op::StackRelativeStore16|Op::StackRelativeStore32|Op::StackRelativeLoad8|Op::StackRelativeLoad16|Op::StackRelativeLoad32) {
-                debug_assert!((dest  & (FatGen::REGISTER_SIZE - 1)) == 0);
+            if false == matches!(instr.op, Op::StackRelativeStore8|Op::StackRelativeStore16|Op::StackRelativeStore32|Op::StackRelativeCopy) {
+                debug_assert!((dest & (FatGen::REGISTER_SIZE - 1)) == 0);
             }
 
             unsafe {
@@ -1608,6 +1635,8 @@ impl Compiler {
                     Op::StackRelativeLoad8  => { stack![dest].int = stack[left] as usize; }
                     Op::StackRelativeLoad16 => { stack.copy_within(left..left+2, dest); stack![dest+2].int16.0 = 0; stack![dest+4].int32.0 = 0; }
                     Op::StackRelativeLoad32 => { stack.copy_within(left..left+4, dest); stack![dest+4].int32.0 = 0; }
+
+                    Op::StackRelativeCopy =>  { stack.copy_within(left..left+right, dest) }
 
                     Op::Move          => { stack![dest] = stack![left]; }
                     Op::Jump          => { ip = ip.wrapping_add(sign_extend(instr.left)); }
@@ -1700,27 +1729,6 @@ fn repl() {
 }
 
 fn main() {
-    let ok = [
-        (r#"
-        struct RGBA {
-            r: i8,
-            g: i8,
-            b: i8,
-            a: i8,
-        }
-
-        func main(): int {
-            a := { r = 1, g = 1, b = 1, a = 1 }:RGBA;
-            return (a.r << 24) + (a.g << 16) + (a.b << 8) + a.a;
-        }
-        "#, Value::Int(0x01010101))
-            ];
-            for test in ok.iter() {
-                let str = test.0;
-                let expect = test.1;
-                let ret = compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
-                assert_eq!(expect, ret);
-            }
     repl();
 }
 
@@ -1805,14 +1813,13 @@ fn stmt() {
         compile_and_run(&format!("func main(): int {{ {{ {} }} return 0; }}", str)).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
     }
 }
-
 #[test]
 fn decls() {
     let ok = [
         "func add(a: int, b: int): int { return a + b; }",
         "func add'(a: int, b: int): int { return a + b; }",
         "struct V2 { x: f32, y: f32 }",
-        "struct V1 { x: f32 } struct V2 { x: V1, y: V1 }"
+        "struct V1 { x: f32 } struct V2 { x: V1, y: V1 }",
     ];
     let err = [
         "func func(a: int, b: int): int { return a + b; }",
@@ -1864,10 +1871,10 @@ fn int_promotion() {
         "func pro(): int { a: u8 = 1; b: i16 = 2; return a + b; }",
         "func pro(): int { a: u8 = 255:i16:u8; return a; }",
         "func pro(): int { a: u8 = 256:i16:u8; return a; }",
-        "func pro(): int { a: u16 = 256:i16:u8; return a; }",
     ];
     let err = [
         "func pro(): u8 { a: u8 = 1; b: u8 = 2; return a + b; }",
+        "func pro(): int { a: u16 = 256:i16:u8; return a; }",
     ];
     for str in ok.iter() {
         compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
@@ -1938,8 +1945,10 @@ func main(): int {
     for test in ok.iter() {
         let str = test.0;
         let expect = test.1;
-        let ret = compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
-        assert_eq!(expect, ret);
+        compile_and_run(str)
+            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
+            .map_err(|e| { println!("input: \"{}\"", str); e })
+            .unwrap();
     }
 }
 
@@ -2062,8 +2071,10 @@ func main(): int {
     for test in ok.iter() {
         let str = test.0;
         let expect = test.1;
-        let ret = compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
-        assert_eq!(expect, ret);
+        compile_and_run(str)
+            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
+            .map_err(|e| { println!("input: \"{}\"", str); e })
+            .unwrap();
     }
 }
 
@@ -2095,10 +2106,25 @@ struct Outer {
 func main(): int {
     a: Outer = { inner = { value = 1234 }};
     b: Outer = { inner = { value = 1234 }:Inner };
-    c := { inner = { value = 1234 }:Inner }:Outer;
-    d: Outer = { inner = { value = 1234 }:Inner }:Outer;
+    c := { inner = { value = a.inner.value }:Inner }:Outer;
+    d: Outer = { inner = { value = b.inner.value }:Inner }:Outer;
+    e := { inner = d.inner }:Outer;
+    f := { inner = d.inner:Inner }:Outer;
+    g := {}:Outer;
+    g.inner = f.inner;
+    h: Outer = {};
+    h.inner.value = f.inner.value;
+    i: Outer = {}:Outer;
+    i.inner = { value = d.inner.value };
     z: Outer = {};
-    if ((a.inner.value == b.inner.value) && (b.inner.value == c.inner.value) && (c.inner.value == d.inner.value) && (d.inner.value != z.inner.value)) {
+    if ((a.inner.value == b.inner.value)
+     && (b.inner.value == c.inner.value)
+     && (c.inner.value == d.inner.value)
+     && (d.inner.value == e.inner.value)
+     && (e.inner.value == f.inner.value)
+     && (f.inner.value == g.inner.value)
+     && (g.inner.value == h.inner.value)
+     && (h.inner.value != z.inner.value)) {
         return a.inner.value;
     }
     return 0;
@@ -2112,12 +2138,25 @@ struct V2 {
 
 func main(): int {
     {
-        a := { x = 2, y = 2 }:V2;
+        a := { x = 2., y = 2. }:V2;
     }
-    a := { x = 2 }:V2;
+    a := { x = 2. }:V2;
     return a.y:int;
 }
-"#, Value::Int(0))
+"#, Value::Int(0)),
+(r#"struct V2 {
+    x: f32,
+    y: f32
+}
+
+func main(): int {
+    a := { x = 2. }:V2;
+    b := a;
+    c: V2 = {};
+    c = b;
+    return c.x:int;
+}
+"#, Value::Int(2))
 ];
     let err = [
 r#"
@@ -2129,10 +2168,12 @@ func main(): int {
     for test in ok.iter() {
         let str = test.0;
         let expect = test.1;
-        let ret = compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
-        assert_eq!(expect, ret);
+        compile_and_run(str)
+            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
+            .map_err(|e| { println!("input: \"{}\"", str); e })
+            .unwrap();
     }
     for str in err.iter() {
-        let ret = compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+        compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
     }
 }

@@ -61,6 +61,10 @@ impl Type {
     pub fn is_integer(self) -> bool {
         matches!(self, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64|Type::Int)
     }
+
+    pub fn is_basic(self) -> bool {
+        self.0 <= TypeKind::Bool as u32
+    }
 }
 
 pub fn integer_promote(ty: Type) -> Type {
