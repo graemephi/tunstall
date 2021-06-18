@@ -490,7 +490,11 @@ impl<'c, 'a> Parser<'_, '_> {
             match self.token.kind {
                 LParen => {
                     let pos = self.token(LParen).source_index;
-                    let args = self.expr_list();
+                    let args = if self.token.kind != RParen {
+                        self.expr_list()
+                    } else {
+                        ExprList::empty()
+                    };
                     self.token(RParen);
                     result = self.ast.push_expr_call(pos, result, args);
                 }

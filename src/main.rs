@@ -234,6 +234,7 @@ pub enum Op {
     StackRelativeLoad16,
     StackRelativeLoad32,
     StackRelativeCopy,
+    StackRelativeZero,
     IntToFloat32,
     IntToFloat64,
     Float32ToInt,
@@ -761,6 +762,7 @@ impl FatGen<'_> {
     }
 
     fn inc_bytes(&mut self, size: usize, align: usize) -> u32 {
+        // todo: error if size does not fit on the stack (currently panics)
         assert!(align.is_power_of_two());
         let result = (self.reg_counter as usize + (align - 1)) & !(align - 1);
         self.reg_counter += size as i32;
@@ -886,7 +888,7 @@ impl FatGen<'_> {
         if let ExprData::Name(name) = self.ast.expr(path) {
             let result = ctx.types.item_info(ty, name);
             if let None = result {
-                error!(self, self.ast.expr_source_position(path), "{} does not have a '{}' field", ctx.type_str(ty), ctx.str(name));
+                error!(self, self.ast.expr_source_position(path), "no field '{}' on type {}", ctx.str(name), ctx.type_str(ty));
             }
             result
         } else {
@@ -958,37 +960,27 @@ impl FatGen<'_> {
             }
             ExprData::Compound(fields) => {
                 if let Some(ty) = compound_type {
-                    // Todo: check for duplicate fields. need to consider unions and fancy paths
+                    // Todo: check for duplicate fields. need to consider unions and fancy paths (both unimplemented)
                     let info = ctx.types.info(ty);
                     let base = self.compound.dest.unwrap_or_else(|| self.inc_bytes(info.size, info.alignment));
                     if info.kind == TypeKind::Struct {
-                        let mut values = SmallVec::new();
+                        self.put(Op::StackRelativeZero, base, (info.size as u32).into());
                         for field in fields {
                             let field = self.ast.compound_field(field);
                             if let Some(item) = self.path(ctx, ty, field.path) {
-                                let expr = self.expr_with_predicted_compound_type_and_destination(ctx, field.value, item.ty, base + item.offset as u32);
+                                let dest = base + item.offset as u32;
+                                let expr = self.expr_with_predicted_compound_type_and_destination(ctx, field.value, item.ty, dest);
                                 if item.ty == expr.ty || (expr.ty == Type::Int && expr.value.is_some() && item.ty.is_integer() && value_fits(expr.value, item.ty)) {
-                                    values.push((item.offset, expr))
+                                    if expr.reg != dest {
+                                        let reg = self.put_immediate(&expr);
+                                        if let Some(op) = store_op(item.ty) {
+                                            self.put(op, dest, reg.into());
+                                        } else {
+                                            unreachable!();
+                                        }
+                                    }
                                 } else {
                                     error!(self, self.ast.expr_source_position(field.value), "incompatible types, field '{}' is of type {}, found {}", ctx.str(item.name), ctx.type_str(item.ty), ctx.type_str(expr.ty))
-                                }
-                            }
-                        }
-                        let mut value_index = 0;
-                        for item in info.items.iter() {
-                            let reg;
-                            match values.get(value_index) {
-                                Some((offset, expr)) if *offset == item.offset => {
-                                    reg = self.put_immediate(expr);
-                                    value_index += 1;
-                                }
-                                _ => reg = self.put_zero(),
-                            }
-                            // This cannot overflow u32, otherwise inc_bytes will have paniced.
-                            let dest = base + (item.offset as u32);
-                            if reg != dest {
-                                if let Some(op) = store_op(item.ty) {
-                                    self.put(op, dest, reg.into());
                                 }
                             }
                         }
@@ -1160,7 +1152,7 @@ impl FatGen<'_> {
             }
             StmtData::Return(Some(expr)) => {
                 let ret_expr = self.expr_in_register(ctx, expr);
-                if integer_promote(ret_expr.ty) == self.return_type {
+                if types_match_with_promotion(ret_expr.ty, self.return_type) {
                     self.put(Op::Return, 0, ret_expr.reg.into());
                     return_type = Some(ret_expr.ty);
                 } else {
@@ -1360,7 +1352,7 @@ impl FatGen<'_> {
                             self.put(Op::StackRelativeCopy, reg, (expr.reg, info.size as u32).into());
                         }
                     }
-                    if decl_type == expr.ty || integer_promote(decl_type) == expr.ty {
+                    if types_match_with_promotion(decl_type, expr.ty) {
                         if value_fits(expr.value, decl_type) {
                             self.locals.insert(var, Local::new(reg, decl_type));
                         } else {
@@ -1557,7 +1549,7 @@ impl Compiler {
             let left = sp.wrapping_add(sign_extend(instr.left));
             let right = sp.wrapping_add(sign_extend(instr.right));
 
-            if false == matches!(instr.op, Op::StackRelativeStore8|Op::StackRelativeStore16|Op::StackRelativeStore32|Op::StackRelativeCopy) {
+            if false == matches!(instr.op, Op::StackRelativeStore8|Op::StackRelativeStore16|Op::StackRelativeStore32|Op::StackRelativeCopy|Op::StackRelativeZero) {
                 debug_assert!((dest & (FatGen::REGISTER_SIZE - 1)) == 0);
             }
 
@@ -1615,6 +1607,7 @@ impl Compiler {
                     Op::F64LtEq    => { stack![dest].int = (stack![left].float64 <= stack![right].float64) as usize; }
                     Op::F64GtEq    => { stack![dest].int = (stack![left].float64 >= stack![right].float64) as usize; }
 
+                    // dest and left are aligned to register size
                     Op::MoveLower8               => { stack![dest].int       = stack![left].int8.0    as usize; }
                     Op::MoveLower16              => { stack![dest].int       = stack![left].int16.0   as usize; }
                     Op::MoveLower32              => { stack![dest].int       = stack![left].int32.0   as usize; }
@@ -1628,6 +1621,7 @@ impl Compiler {
                     Op::Float64ToInt             => { stack![dest].int       = stack![left].float64   as usize; }
                     Op::Float64To32              => { stack![dest].float32.0 = stack![left].float64   as f32; }
 
+                    // dest is aligned, left may not be. The stores are redundant with copy, but convenient; loads ensure high bits of registers are zeroed
                     Op::StackRelativeStore8  => { stack[dest] = stack[left]; }
                     Op::StackRelativeStore16 => { stack.copy_within(left..left+2, dest) }
                     Op::StackRelativeStore32 => { stack.copy_within(left..left+4, dest) }
@@ -1636,7 +1630,8 @@ impl Compiler {
                     Op::StackRelativeLoad16 => { stack.copy_within(left..left+2, dest); stack![dest+2].int16.0 = 0; stack![dest+4].int32.0 = 0; }
                     Op::StackRelativeLoad32 => { stack.copy_within(left..left+4, dest); stack![dest+4].int32.0 = 0; }
 
-                    Op::StackRelativeCopy =>  { stack.copy_within(left..left+right, dest) }
+                    Op::StackRelativeCopy =>  { stack.copy_within(left..left+(instr.right as usize), dest) }
+                    Op::StackRelativeZero =>  { for b in &mut stack[dest..dest+(instr.left as usize)] { *b = 0 }}
 
                     Op::Move          => { stack![dest] = stack![left]; }
                     Op::Jump          => { ip = ip.wrapping_add(sign_extend(instr.left)); }
@@ -1729,6 +1724,7 @@ fn repl() {
 }
 
 fn main() {
+    structs();
     repl();
 }
 
@@ -2090,17 +2086,32 @@ struct RGBA {
 }
 
 func main(): int {
-    c := { r = 1, g = 1, b = 1, a = 1 }:RGBA;
+    c := { r = 4, g = 3, b = 2, a = 1 }:RGBA;
     return (c.r << 24) + (c.g << 16) + (c.b << 8) + c.a;
 }
-"#, Value::Int(0x01010101)),
+"#, Value::Int(0x04030201)),
 (r#"
-struct Inner {
-    value: i64
+struct RGBA {
+    r: i8,
+    g: i8,
+    b: i8,
+    a: i8,
 }
 
+func main(): int {
+    c := { r = 4, g = 3, b = 2, a = 1 }:RGBA;
+    d := { g = 3, r = 4, a = 1, b = 2, }:RGBA;
+    return (c.r << 24) + (d.g << 16) + (c.b << 8) + d.a;
+}
+"#, Value::Int(0x04030201)),
+(r#"
 struct Outer {
     inner: Inner
+}
+
+struct Inner {
+    ignored: i32,
+    value: i64
 }
 
 func main(): int {
@@ -2132,37 +2143,41 @@ func main(): int {
 "#, Value::Int(1234)),
 (r#"
 struct V2 {
-    x: f32,
-    y: f32
+    x: i32,
+    y: i32
+}
+
+func fn(): i32 {
+    a := { x = 2 }:V2;
+    b := { x = 3 }:V2;
+    a = b;
+    return b.x;
 }
 
 func main(): int {
-    {
-        a := { x = 2., y = 2. }:V2;
-    }
-    a := { x = 2. }:V2;
-    return a.y:int;
+    a := 0;
+    b := 0;
+    return fn():int;
 }
-"#, Value::Int(0)),
-(r#"struct V2 {
-    x: f32,
-    y: f32
-}
-
-func main(): int {
-    a := { x = 2. }:V2;
-    b := a;
-    c: V2 = {};
-    c = b;
-    return c.x:int;
-}
-"#, Value::Int(2))
+"#, Value::Int(3)),
 ];
-    let err = [
-r#"
+    let err = [r#"
 func main(): int {
     v := {0}:int;
     return v;
+}
+"#, r#"
+struct V2 { x: int, y: int }
+func main(): int {
+    v := {}:V2;
+    v.a = 0;
+    return v.x:int;
+}
+"#, r#"
+struct V2 { x: int, y: int }
+func main(): int {
+    v := { a = 0 }:V2;
+    return v.a;
 }
 "#];
     for test in ok.iter() {

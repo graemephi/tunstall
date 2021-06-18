@@ -74,6 +74,10 @@ pub fn integer_promote(ty: Type) -> Type {
     }
 }
 
+pub fn types_match_with_promotion(promotable: Type, other: Type) -> bool {
+    promotable == other || integer_promote(promotable) == other
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     None,
