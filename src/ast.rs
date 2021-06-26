@@ -59,8 +59,15 @@ pub struct CompoundField(u32);
 define_node_list!(CompoundField, CompoundFieldList, CompoundFieldListIter);
 
 #[derive(Clone, Copy, Debug)]
+pub enum CompoundPath {
+    Implicit,
+    Path(Expr),
+    Index(Expr)
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct CompoundFieldData {
-    pub path: Expr,
+    pub path: CompoundPath,
     pub value: Expr
 }
 
@@ -77,6 +84,7 @@ pub enum ExprData {
     Name(Intern),
     Compound(CompoundFieldList),
     Field(Expr, Intern),
+    Index(Expr, Expr),
     Unary(TokenKind, Expr),
     Binary(TokenKind, Expr, Expr),
     Ternary(Expr, Expr, Expr),
@@ -113,7 +121,9 @@ impl TypeExpr {
 #[derive(Clone, Copy, Debug)]
 pub enum TypeExprData {
     Infer,
-    Name(Intern)
+    Name(Intern),
+    Expr(Expr),
+    List(Intern, TypeExprList),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -300,6 +310,10 @@ impl Ast {
         self.push_expr(pos, ExprData::Field(expr, field))
     }
 
+    pub fn push_expr_index(&mut self, pos: usize, expr: Expr, index: Expr) -> Expr {
+        self.push_expr(pos, ExprData::Index(expr, index))
+    }
+
     pub fn push_expr_unary(&mut self, pos: usize, op: TokenKind, right: Expr) -> Expr {
         self.push_expr(pos, ExprData::Unary(op, right))
     }
@@ -444,17 +458,28 @@ impl Ast {
         DeclList { begin: 0, end: self.decls.len() as u32 }
     }
 
-    pub fn callables(&self) -> impl std::iter::Iterator<Item = &CallableDecl> {
-        self.decls.iter().filter_map(|decl| {
-            match decl {
-                DeclData::Callable(callable) => Some(callable),
-                _ => None
-            }
-        })
+    pub fn callable(&self, decl: Decl) -> &CallableDecl {
+        match &self.decls[decl.0 as usize] {
+            DeclData::Callable(callable) => callable,
+            _ => panic!("decl is not a callable")
+        }
     }
 
-    pub fn push_type_expr(&mut self, data: TypeExprData) -> TypeExpr {
-        let result = push_data(&mut self.type_exprs, data);
+    pub fn is_callable(&self, decl: Decl) -> bool {
+        match &self.decls[decl.0 as usize] {
+            DeclData::Callable(_) => true,
+            _ => false
+        }
+    }
+
+    pub fn push_type_expr_name(&mut self, name: Intern) -> TypeExpr {
+        let result = push_data(&mut self.type_exprs, TypeExprData::Name(name));
+        TypeExpr(result)
+    }
+
+    pub fn push_type_expr_list(&mut self, name: Intern, list: &[TypeExprData]) -> TypeExpr {
+        let slice = push_slice(&mut self.type_exprs, list);
+        let result = push_data(&mut self.type_exprs, TypeExprData::List(name, TypeExprList { begin: slice.0, end: slice.1 }));
         TypeExpr(result)
     }
 
@@ -462,7 +487,8 @@ impl Ast {
         self.type_exprs[expr.0 as usize]
     }
 
-    pub fn type_expr_list(&self) -> TypeExprList {
-        TypeExprList { begin: 0, end : self.type_exprs.len() as u32 }
+    pub fn pop_type_expr(&mut self, expr: TypeExpr) -> TypeExprData {
+        debug_assert!(expr.0 as usize == self.type_exprs.len() - 1);
+        self.type_exprs.remove(expr.0 as usize)
     }
 }

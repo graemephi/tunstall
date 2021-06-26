@@ -1,14 +1,12 @@
 use std::collections::hash_map::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::convert::TryFrom;
 
 use crate::Compiler;
 use crate::Intern;
-use crate::sym;
-use crate::error;
+use crate::hash;
 
-use crate::ast::{TypeExpr, TypeExprData, ItemList};
+use crate::sym;
+
 use crate::smallvec::*;
 
 pub fn builtins(ctx: &mut Compiler) {
@@ -33,7 +31,7 @@ pub fn builtins(ctx: &mut Compiler) {
         let name = ctx.interns.put(str);
         let ty = Type(i as u32);
         let items = Vec::new();
-        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items });
+        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: Type::None, num_array_elements: 0 });
         assert!(size == 0 || size.is_power_of_two());
         sym::builtin(ctx, name, ty);
     }
@@ -95,9 +93,10 @@ pub enum TypeKind {
     Bool,
     Func,
     Struct,
+    Array,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Item {
     pub name: Intern,
     pub ty: Type,
@@ -111,6 +110,8 @@ pub struct TypeInfo {
     pub size: usize,
     pub alignment: usize,
     pub items: Vec<Item>,
+    pub base_type: Type,
+    pub num_array_elements: usize,
 }
 
 impl TypeInfo {
@@ -135,15 +136,13 @@ impl TypeInfo {
 pub struct Types {
     types: Vec<TypeInfo>,
     type_by_hash: HashMap<u64, SmallVecN<Type, 5>>,
-    type_by_expr: Vec<Type>,
 }
 
 impl Types {
     pub fn new() -> Types {
         Types {
             types: Vec::new(),
-            type_by_hash: HashMap::new(),
-            type_by_expr: Vec::new()
+            type_by_hash: HashMap::new()
         }
     }
 
@@ -155,8 +154,30 @@ impl Types {
         &mut self.types[ty.0 as usize]
     }
 
-    pub fn item_info(&self, ty: Type, name: Intern) -> Option<&Item> {
-        self.info(ty).items.iter().find(|it| it.name == name)
+    pub fn item_info(&self, ty: Type, name: Intern) -> Option<Item> {
+        self.info(ty).items.iter().find(|it| it.name == name).copied()
+    }
+
+    pub fn index_info(&self, ty: Type, index: usize) -> Option<Item> {
+        let info = self.info(ty);
+        match info.kind {
+            TypeKind::Struct => {
+                info.items.iter().nth(index).copied()
+            }
+            TypeKind::Array => {
+                if index < info.num_array_elements {
+                    let element_size = self.info(info.base_type).size;
+                    Some(Item {
+                        name: Intern(0),
+                        ty: info.base_type,
+                        offset: index * element_size
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None
+        }
     }
 
     pub fn make(&mut self, kind: TypeKind, name: Intern) -> Type {
@@ -166,18 +187,15 @@ impl Types {
             name: name,
             size: 0,
             alignment: 1,
-            items: Vec::new()
+            items: Vec::new(),
+            base_type: Type::None,
+            num_array_elements: 0,
         });
         Type(result)
     }
 
     pub fn make_anonymous(&mut self, kind: TypeKind, items: &[Type]) -> Type {
-        let hash = {
-            let mut h = DefaultHasher::new();
-            Hash::hash(&kind, &mut h);
-            Hash::hash_slice(&items, &mut h);
-            h.finish()
-        };
+        let hash = hash(&(kind, items));
         if let Some(types) = self.type_by_hash.get(&hash) {
             for &ty in types.iter() {
                 let info = self.info(ty);
@@ -194,16 +212,29 @@ impl Types {
         ty
     }
 
-    pub fn get_resolved(&self, expr: TypeExpr) -> Type {
-        let result = self.type_by_expr[expr.0 as usize];
-        assert!(result != Type::None);
-        result
-    }
-
-    fn reserve_expr_map(&mut self, count: usize) {
-        if self.type_by_expr.len() < count {
-            self.type_by_expr.extend(std::iter::repeat(Type::None).take(count - self.type_by_expr.len()))
+    pub fn make_array(&mut self, base_type: Type, num_array_elements: usize) -> Type {
+        assert!(num_array_elements > 0);
+        let hash = hash(&(TypeKind::Array, base_type, num_array_elements));
+        if let Some(types) = self.type_by_hash.get(&hash) {
+            for &ty in types.iter() {
+                let info = self.info(ty);
+                if info.kind == TypeKind::Array && info.base_type == base_type && info.num_array_elements == num_array_elements {
+                    return ty;
+                }
+            }
         }
+        let ty = self.make(TypeKind::Array, Intern(0));
+        let (base_size, alignment) = {
+            let base = self.info(base_type);
+            (base.size, base.alignment)
+        };
+        let arr = self.info_mut(ty);
+        arr.size = base_size * num_array_elements;
+        arr.alignment = alignment;
+        arr.base_type = base_type;
+        arr.num_array_elements = num_array_elements;
+        self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
+        ty
     }
 
     pub fn add_item_to_type(&mut self, ty: Type, name: Intern, item: Type) {
@@ -227,20 +258,6 @@ impl Types {
     }
 }
 
-pub fn eval_type(ctx: &mut Compiler, expr: TypeExpr) -> Type {
-    ctx.types.reserve_expr_map(ctx.ast.type_expr_list().len());
-    if expr == TypeExpr::Infer {
-        return Type::None;
-    }
-    let result = match ctx.ast.type_expr(expr) {
-        TypeExprData::Infer => unreachable!(),
-        TypeExprData::Name(intern) => sym::resolve_type(ctx, intern).ty
-    };
-    ctx.types.type_by_expr[expr.0 as usize] = result;
-    result
-}
-
-
 #[test]
 fn types() {
     let code = r#"
@@ -252,6 +269,16 @@ struct V2 {
 struct Rect {
     top_left: V2,
     bottom_right: V2
+}
+
+struct Rect2 {
+    verts: arr f32 [4],
+    value: f32
+}
+
+struct Arr {
+    arr1: arr (arr i32 [3]) [7],
+    arr2: arr (arr i32 [3]) [7]
 }
 
 struct Padding {
@@ -273,13 +300,18 @@ func main(): int { return 0; }
     let mut c = crate::compile(&code).unwrap();
     let v2 = c.intern("V2");
     let rect = c.intern("Rect");
+    let rect2 = c.intern("Rect2");
+    let arr = c.intern("Arr");
     let padding = c.intern("Padding");
     let padding2 = c.intern("Padding2");
 
-    let v2 = c.symbols.get(&v2).map(|sym| c.types.info(sym.ty)).unwrap();
-    let rect = c.symbols.get(&rect).map(|sym| c.types.info(sym.ty)).unwrap();
-    let padding = c.symbols.get(&padding).map(|sym| c.types.info(sym.ty)).unwrap();
-    let padding2 = c.symbols.get(&padding2).map(|sym| c.types.info(sym.ty)).unwrap();
+    let get = |name: Intern| c.symbols.get(&name).map(|sym| c.types.info(sym.ty)).unwrap();
+    let v2 = get(v2);
+    let rect = get(rect);
+    let rect2 = get(rect2);
+    let arr = get(arr);
+    let padding = get(padding);
+    let padding2 = get(padding2);
 
     assert_eq!(v2.size, 8);
     assert_eq!(v2.alignment, 4);
@@ -290,6 +322,37 @@ func main(): int { return 0; }
     assert_eq!(rect.alignment, 4);
     assert_eq!(rect.items[0].offset, 0);
     assert_eq!(rect.items[1].offset, 8);
+
+    assert_eq!(rect2.size, 20);
+    assert_eq!(rect2.alignment, 4);
+    assert_eq!(rect2.items[0].offset, 0);
+    assert_eq!(rect2.items[1].offset, 16);
+
+    let verts = c.types.info(rect2.items[0].ty);
+    assert_eq!(verts.kind, TypeKind::Array);
+    assert_eq!(verts.size, 16);
+    assert_eq!(verts.alignment, 4);
+    assert_eq!(verts.base_type, Type::F32);
+    assert_eq!(verts.num_array_elements, 4);
+
+    assert_eq!(arr.size, 3*7*4*2);
+    assert_eq!(arr.alignment, 4);
+    assert_eq!(arr.items[0].ty, arr.items[1].ty);
+    assert_eq!(c.types.info(arr.items[0].ty).base_type, c.types.info(arr.items[1].ty).base_type);
+
+    let aoa = c.types.info(arr.items[0].ty);
+    let aoi = c.types.info(aoa.base_type);
+
+    assert_eq!(aoa.kind, TypeKind::Array);
+    assert_eq!(aoa.size, aoi.size * aoa.num_array_elements);
+    assert_eq!(aoa.alignment, 4);
+    assert_eq!(aoa.num_array_elements, 7);
+
+    assert_eq!(aoi.kind, TypeKind::Array);
+    assert_eq!(aoi.size, 3*4);
+    assert_eq!(aoi.alignment, 4);
+    assert_eq!(aoi.base_type, Type::I32);
+    assert_eq!(aoi.num_array_elements, 3);
 
     assert_eq!(padding.size, 24);
     assert_eq!(padding.alignment, 8);

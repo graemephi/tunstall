@@ -60,3 +60,10 @@ proc map_put { K, V: Type } [Hashable K] (map: ptr (Map K V), key: K, value: V) 
 struct Agh {
     x, y: i32
 }
+
+
+const len := 3;
+a := { 0, 1, 2 } : int [len]
+b := { 0, 1, 2, 3 } : int [len + 1]
+d := &a : ptr (int [len]);
+c := &a[0] : ptr int [len];

@@ -9,6 +9,7 @@ use crate::TypeKind;
 use crate::Intern;
 
 use crate::eval_type;
+
 use crate::error;
 
 use crate::ast::*;
@@ -126,9 +127,6 @@ fn resolve(ctx: &mut Compiler, name: Intern) -> Symbol {
 }
 
 pub fn resolve_all(ctx: &mut Compiler) {
-    for expr in ctx.ast.type_expr_list() {
-        eval_type(ctx, expr);
-    }
     for decl in ctx.ast.decl_list() {
         let name = ctx.ast.decl(decl).name();
         if let Some(sym) = ctx.symbols.get(&name) {

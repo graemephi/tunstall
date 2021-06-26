@@ -408,21 +408,49 @@ impl<'c, 'a> Parser<'_, '_> {
         parse_error!(self, "expected {}, found {}", keyword, self.token)
     }
 
+    fn name(&mut self) -> Intern {
+        let result = self.token.intern;
+        self.token(TokenKind::Name);
+        result
+    }
+
     fn type_expr(&mut self) -> TypeExpr {
         let name = self.name();
-        self.ast.push_type_expr(TypeExprData::Name(name))
+
+        use TokenKind::*;
+        if matches!(self.token.kind, Name|LBracket|LParen) {
+            let mut list = SmallVecN::<_, 8>::new();
+            loop {
+                match self.token.kind {
+                    Name => {
+                        let name = self.name();
+                        list.push(TypeExprData::Name(name))
+                    }
+                    LBracket => {
+                        self.token(LBracket);
+                        let expr = self.expr();
+                        self.token(RBracket);
+                        list.push(TypeExprData::Expr(expr))
+                    }
+                    LParen => {
+                        self.token(LParen);
+                        let expr = self.type_expr();
+                        self.token(RParen);
+                        list.push(self.ast.pop_type_expr(expr))
+                    }
+                    _ => break
+                }
+            }
+            self.ast.push_type_expr_list(name, &list)
+        } else {
+            self.ast.push_type_expr_name(name)
+        }
     }
 
     fn paren_expr(&mut self) -> Expr {
         self.token(TokenKind::LParen);
         let result = self.expr();
         self.token(TokenKind::RParen);
-        result
-    }
-
-    fn name(&mut self) -> Intern {
-        let result = self.token.intern;
-        self.token(TokenKind::Name);
         result
     }
 
@@ -469,13 +497,35 @@ impl<'c, 'a> Parser<'_, '_> {
                 let pos = self.pos();
                 self.token(LBrace);
                 let mut fields = SmallVec::new();
-                while self.not(RBrace) {
-                    let path = self.base_expr();
-                    self.token(Assign);
-                    let value = self.expr();
-                    fields.push(CompoundFieldData { path, value });
-                    if self.try_token(Comma).is_none() {
-                        break;
+
+                if self.not(RBrace) {
+                    let path_or_value = self.expr();
+                    if self.not(Assign) {
+                        fields.push(CompoundFieldData { path: CompoundPath::Implicit, value: path_or_value });
+                        if self.try_token(Comma).is_some() {
+                            while self.not(RBrace) {
+                                let value = self.expr();
+                                fields.push(CompoundFieldData { path: CompoundPath::Implicit, value: value });
+                                if self.try_token(Comma).is_none() {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        self.token(Assign);
+                        let value = self.expr();
+                        fields.push(CompoundFieldData { path: CompoundPath::Path(path_or_value), value });
+                        if self.try_token(Comma).is_some() {
+                            while self.not(RBrace) {
+                                let path = CompoundPath::Path(self.expr());
+                                self.token(Assign);
+                                let value = self.expr();
+                                fields.push(CompoundFieldData { path, value });
+                                if self.try_token(Comma).is_none() {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 self.token(RBrace);
@@ -497,6 +547,12 @@ impl<'c, 'a> Parser<'_, '_> {
                     };
                     self.token(RParen);
                     result = self.ast.push_expr_call(pos, result, args);
+                }
+                LBracket => {
+                    let pos = self.token(LBracket).source_index;
+                    let index = self.expr();
+                    self.token(RBracket);
+                    result = self.ast.push_expr_index(pos, result, index);
                 }
                 Dot => {
                     let pos = self.token(Dot).source_index;
