@@ -383,7 +383,6 @@ impl<'c, 'a> Parser<'_, '_> {
         }
 
         parse_error!(self, "expected {}, found {}", kind, self.token)
-
     }
 
     fn try_keyword(&mut self, keyword: Keyword) -> Option<Token> {

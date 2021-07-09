@@ -62,7 +62,7 @@ fn resolve_callable(ctx: &mut Compiler, decl: Decl, data: &CallableDecl) -> Symb
         let return_type = eval_type(ctx, returns);
         decl_types.push(return_type);
     }
-    let ty = ctx.types.make_anonymous(TypeKind::Func, &decl_types);
+    let ty = ctx.types.anonymous(TypeKind::Func, &decl_types);
     let name = data.name;
     if let Some(dup) = check_duplicate_items(&ctx.ast, data.params) {
         error!(ctx, data.pos, "duplicate parameter name {} in func {}", ctx.str(dup), ctx.str(name));

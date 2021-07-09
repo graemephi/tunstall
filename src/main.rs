@@ -1,3 +1,7 @@
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("64 bit is assumed");
+
+
 use std::convert::TryFrom;
 use std::collections::hash_map::{HashMap, DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -28,8 +32,14 @@ macro_rules! error {
     }}
 }
 
+#[allow(unused_macros)]
 macro_rules! assert_implies {
     ($p:expr, $q:expr) => { assert!(!($p) || ($q)) }
+}
+
+#[allow(unused_macros)]
+macro_rules! debug_assert_implies {
+    ($p:expr, $q:expr) => { debug_assert!(!($p) || ($q)) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -232,11 +242,11 @@ pub enum Op {
     MoveAndSignExtendLower8,
     MoveAndSignExtendLower16,
     MoveAndSignExtendLower32,
-    // StackRelativeStore is equivalent to Move
+    // StackRelativeStore64 is equivalent to Move
     StackRelativeStore8,
     StackRelativeStore16,
     StackRelativeStore32,
-    // StackRelativeLoad is equivalent to Move
+    // StackRelativeLoad64 is equivalent to Move
     StackRelativeLoad8,
     StackRelativeLoad16,
     StackRelativeLoad32,
@@ -257,7 +267,30 @@ pub enum Op {
     JumpIfNotZero,
     Return,
     Call,
-    CallIndirect
+    CallIndirect,
+    Store8,
+    Store16,
+    Store32,
+    Store64,
+    Load8,
+    Load16,
+    Load32,
+    Load64,
+    LoadAndSignExtend8,
+    LoadAndSignExtend16,
+    LoadAndSignExtend32,
+    LoadBool,
+    Copy,
+    Zero,
+    LoadStackAddress
+}
+
+fn requires_register_destination(op: Op) -> bool {
+    match op {
+        Op::StackRelativeStore8|Op::StackRelativeStore16|Op::StackRelativeStore32|Op::StackRelativeCopy|Op::StackRelativeZero|
+        Op::Store8|Op::Store16|Op::Store32|Op::Copy|Op::Zero => false,
+        _ => true
+    }
 }
 
 #[derive(Debug)]
@@ -290,7 +323,6 @@ union RegValue {
     int: usize,
     sint: isize,
     wint: std::num::Wrapping<usize>,
-    int64: u64,
     int32: (u32, u32),
     int16: (u16, u16, u16, u16),
     int8: (u8, u8, u8, u8, u8, u8, u8, u8),
@@ -303,10 +335,6 @@ union RegValue {
 }
 
 impl RegValue {
-    fn unpack(&self) -> FatInstr {
-        unsafe { FatInstr { op: Op::Noop, dest: 0, left: self.int32.0, right: self.int32.1 } }
-    }
-
     fn is_true(&self) -> bool {
         unsafe {
             debug_assert!(self.b8.0 == (self.int != 0));
@@ -373,7 +401,7 @@ impl From<f32> for RegValue {
 
 impl From<bool> for RegValue {
     fn from(value: bool) -> Self {
-        RegValue { b8: (value, [false;7]) }
+        RegValue { b8: (value, [false; 7]) }
     }
 }
 
@@ -447,7 +475,8 @@ fn binary_op(op: parse::TokenKind, left: Type, right: Type) -> Option<(Op, Type)
     use parse::TokenKind;
     let left = integer_promote(left);
     let right = integer_promote(right);
-    if left != right {
+    // TODO: eh
+    if left != right && !(left.is_pointer() && right == Type::Int) {
         return None;
     }
     match (op, left) {
@@ -494,6 +523,17 @@ fn binary_op(op: parse::TokenKind, left: Type, right: Type) -> Option<(Op, Type)
         (TokenKind::LtEq,     Type::F64) => Some((Op::F64LtEq, Type::Bool)),
         (TokenKind::GtEq,     Type::F64) => Some((Op::F64GtEq, Type::Bool)),
 
+        (TokenKind::Add,      Type::VoidPtr)             => Some((Op::IntAdd,  Type::VoidPtr)),
+        (TokenKind::Sub,      Type::VoidPtr)             => Some((Op::IntSub,  Type::VoidPtr)),
+        (TokenKind::Add,      Type::U8Ptr)               => Some((Op::IntAdd,  Type::U8Ptr)),
+        (TokenKind::Sub,      Type::U8Ptr)               => Some((Op::IntSub,  Type::U8Ptr)),
+        (TokenKind::GtEq,     Type::U8Ptr|Type::VoidPtr) => Some((Op::IntGtEq, Type::Bool)),
+        (TokenKind::Lt,       Type::U8Ptr|Type::VoidPtr) => Some((Op::IntLt,   Type::Bool)),
+        (TokenKind::Gt,       Type::U8Ptr|Type::VoidPtr) => Some((Op::IntGt,   Type::Bool)),
+        (TokenKind::Eq,       Type::U8Ptr|Type::VoidPtr) => Some((Op::IntEq,   Type::Bool)),
+        (TokenKind::NEq,      Type::U8Ptr|Type::VoidPtr) => Some((Op::IntNEq,  Type::Bool)),
+        (TokenKind::LtEq,     Type::U8Ptr|Type::VoidPtr) => Some((Op::IntLtEq, Type::Bool)),
+
         _ => None
     }
 }
@@ -515,6 +555,12 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
             Type::I64  => Op::Move,
             Type::F32  => Op::IntToFloat32,
             Type::F64  => Op::IntToFloat64,
+            _ if to.is_pointer() => Op::Noop,
+            _ => return None
+        }
+    } else if from.is_pointer() {
+        match to {
+            Type::U64|Type::I64|Type::Int => Op::Noop,
             _ => return None
         }
     } else if to.is_integer() {
@@ -534,30 +580,62 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
     Some(op)
 }
 
-fn store_op(ty: Type) -> Option<Op> {
+fn store_op_stack(ty: Type) -> Option<Op> {
     match ty {
         Type::I8|Type::U8|Type::Bool            => Some(Op::StackRelativeStore8),
         Type::I16|Type::U16                     => Some(Op::StackRelativeStore16),
         Type::I32|Type::U32|Type::F32           => Some(Op::StackRelativeStore32),
         Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Move),
+        _ if ty.is_pointer()                    => Some(Op::Move),
         _ => None
     }
 }
 
-fn load_op(ty: Type) -> Option<Op> {
+fn load_op_stack(ty: Type) -> Option<Op> {
     match ty {
-        Type::Bool => Some(Op::StackRelativeLoadBool),
-        Type::I8 => Some(Op::StackRelativeLoadAndSignExtend8),
-        Type::I16 => Some(Op::StackRelativeLoadAndSignExtend16),
-        Type::I32 => Some(Op::StackRelativeLoadAndSignExtend32),
-        Type::U8 => Some(Op::StackRelativeLoad8),
-        Type::U16 => Some(Op::StackRelativeLoad16),
-        Type::U32 => Some(Op::StackRelativeLoad32),
+        Type::Bool                    => Some(Op::StackRelativeLoadBool),
+        Type::I8                      => Some(Op::StackRelativeLoadAndSignExtend8),
+        Type::I16                     => Some(Op::StackRelativeLoadAndSignExtend16),
+        Type::I32                     => Some(Op::StackRelativeLoadAndSignExtend32),
+        Type::U8                      => Some(Op::StackRelativeLoad8),
+        Type::U16                     => Some(Op::StackRelativeLoad16),
+        Type::U32                     => Some(Op::StackRelativeLoad32),
         Type::Int|Type::I64|Type::U64 => Some(Op::Move),
+        _ if ty.is_pointer()          => Some(Op::Move),
         _ => None
     }
 }
 
+fn store_op_pointer(ty: Type) -> Option<Op> {
+    match ty {
+        Type::I8|Type::U8|Type::Bool            => Some(Op::Store8),
+        Type::I16|Type::U16                     => Some(Op::Store16),
+        Type::I32|Type::U32|Type::F32           => Some(Op::Store32),
+        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Store64),
+        _ if ty.is_pointer()                    => Some(Op::Store64),
+        _ => None
+    }
+}
+
+fn load_op_pointer(ty: Type) -> Option<Op> {
+    match ty {
+        Type::Bool                    => Some(Op::LoadBool),
+        Type::I8                      => Some(Op::LoadAndSignExtend8),
+        Type::I16                     => Some(Op::LoadAndSignExtend16),
+        Type::I32                     => Some(Op::LoadAndSignExtend32),
+        Type::U8                      => Some(Op::Load8),
+        Type::U16                     => Some(Op::Load16),
+        Type::U32                     => Some(Op::Load32),
+        Type::Int|Type::I64|Type::U64 => Some(Op::Load64),
+        _ if ty.is_pointer()          => Some(Op::Load64),
+        _ => None
+    }
+}
+
+// TODO: right now, before calling either apply_unary_op or apply_binary_op, you
+// need to check the type of the value isn't pointer, as the representation of
+// constant pointers is not the same as their run time values (they are stack
+// offsets until then). This sucks a little
 fn apply_unary_op(op: Op, value: RegValue) -> RegValue {
     unsafe {
         match op {
@@ -644,13 +722,16 @@ pub struct Global {
 
 #[derive(Clone, Copy)]
 struct Local {
-    reg: u32,
+    loc: Location,
     ty: Type,
 }
 
 impl Local {
-    fn new(reg: u32, ty: Type) -> Local {
-        Local { reg: reg, ty: ty }
+    fn new(loc: Location, ty: Type) -> Local {
+        let mut loc = loc;
+        loc.can_assign = true;
+        loc.can_access = true;
+        Local { loc, ty }
     }
 }
 
@@ -710,21 +791,77 @@ fn value_fits(value: Option<RegValue>, ty: Type) -> bool {
     }
 }
 
+/// Given a constant of type `value_ty`, determine if it is acceptable to store
+/// it in a `want_ty`. This is distinct from the integer promotion rules. There
+/// is no automatic coercion on writes, except for values known at compile-time
+/// (through constant folding) to fit in the destination.
+fn value_fits_or_types_match(value: Option<RegValue>, value_ty: Type, want_ty: Type) -> bool {
+    value_ty == want_ty || (value_ty == Type::Int && value.is_some() && want_ty.is_integer() && value_fits(value, want_ty))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum LocationKind {
+    None,
+    Register,
+    Stack,
+    Pointer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Location {
+    base: isize,
+    offset: isize,
+    kind: LocationKind,
+    can_assign: bool,
+    can_access: bool
+}
+
+impl Location {
+    const BAD_LOCATION: isize = isize::MAX;
+
+    fn none() -> Location {
+        Location { base: Self::BAD_LOCATION, offset: Self::BAD_LOCATION, kind: LocationKind::None, can_assign: false, can_access: false }
+    }
+
+    fn register(value: isize) -> Location {
+        Location { base: Self::BAD_LOCATION, offset: value, kind: LocationKind::Register, can_assign: false, can_access: false }
+    }
+
+    fn stack(offset: isize) -> Location {
+        Location { base: Self::BAD_LOCATION, offset: offset, kind: LocationKind::Stack, can_assign: true, can_access: false }
+    }
+
+    fn pointer(base: isize, offset: isize, can_assign: bool) -> Location {
+        Location { base, offset, kind: LocationKind::Pointer, can_assign, can_access: false }
+    }
+
+    fn offset_by(&self, offset: isize) -> Location {
+        debug_assert_implies!(offset > 0, matches!(self.kind, LocationKind::Stack|LocationKind::Pointer));
+        let mut result = *self;
+        result.offset += offset;
+        result
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
-struct ExprGen {
-    reg: u32,
+struct ExprResult {
+    addr: Location,
     ty: Type,
     value: Option<RegValue>,
-    // Todo: might not make sense once pointers are in
-    is_field: bool,
-    is_local: bool,
+}
+
+impl ExprResult {
+    fn is_ok(&self) -> bool {
+        self.addr.kind != LocationKind::None || self.value.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Label(usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Location(usize);
+struct InstrLocation(usize);
 
 #[derive(Clone, Copy, Default, Debug)]
 struct StmtContext {
@@ -733,9 +870,9 @@ struct StmtContext {
 }
 
 #[derive(Clone, Copy, Default, Debug)]
-struct CompoundContext {
+struct DestinationContext {
     ty: Option<Type>,
-    dest: Option<u32>,
+    dest: Option<Location>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -755,18 +892,17 @@ struct PathContext {
 struct FatGen {
     code: Vec<FatInstr>,
     locals: Locals,
-    reg_counter: i32,
+    reg_counter: isize,
     context: StmtContext,
-    compound: CompoundContext,
-    labels: Vec<Location>,
-    patches: Vec<(Label, Location)>,
+    destination: DestinationContext,
+    labels: Vec<InstrLocation>,
+    patches: Vec<(Label, InstrLocation)>,
     return_type: Type,
     constant: bool,
     error: Option<IncompleteError>,
 }
 
 impl FatGen {
-    const BAD_REGISTER: u32 = i32::MAX as u32;
     const REGISTER_SIZE: usize = 8;
 
     fn new() -> FatGen {
@@ -775,7 +911,7 @@ impl FatGen {
             locals: Locals::default(),
             reg_counter: 0,
             context: StmtContext::default(),
-            compound: CompoundContext::default(),
+            destination: DestinationContext::default(),
             labels: Vec::new(),
             patches: Vec::new(),
             return_type: Type::None,
@@ -790,71 +926,207 @@ impl FatGen {
         }
     }
 
-    fn inc_bytes(&mut self, size: usize, align: usize) -> u32 {
-        // todo: error if size does not fit on the stack (currently panics)
-        assert!(align.is_power_of_two());
+    fn inc_bytes(&mut self, size: usize, align: usize) -> isize {
+        debug_assert!(align.is_power_of_two());
         let result = (self.reg_counter as usize + (align - 1)) & !(align - 1);
-        self.reg_counter += size as i32;
-        result as u32
+        self.reg_counter += size as isize;
+        // todo: error if size does not fit on the stack
+        assert!(self.reg_counter < i32::MAX as isize);
+        result as isize
     }
 
-    fn inc_reg(&mut self) -> u32 {
+    fn inc_reg(&mut self) -> isize {
         self.inc_bytes(Self::REGISTER_SIZE, Self::REGISTER_SIZE)
     }
 
-    fn put(&mut self, op: Op, dest: u32, data: RegValue) {
-        assert_ne!(dest, Self::BAD_REGISTER);
-        assert_implies!(op != Op::Immediate && op != Op::Call, unsafe { data.int32.0 != Self::BAD_REGISTER });
+    fn put3(&mut self, op: Op, dest: isize, left: isize, right: isize) {
         if self.constant == false {
-            self.code.push(FatInstr { op, dest, .. data.unpack() });
+            let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 }) as u32;
+            let left = i32::try_from(left).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 }) as u32;
+            let right = i32::try_from(right).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 }) as u32;
+            self.code.push(FatInstr { op, dest, left, right });
         } else {
             // todo: expr position
             error!(self, 0, "non-constant expression");
         }
     }
 
-    fn put_inc(&mut self, op: Op, data: RegValue) -> u32 {
+    fn put(&mut self, op: Op, dest: isize, data: RegValue) {
+        if self.constant == false {
+            let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 }) as u32;
+            self.code.push(FatInstr { op, dest, left: unsafe { data.int32.0 }, right: unsafe { data.int32.1 }});
+        } else {
+            // todo: expr position
+            error!(self, 0, "non-constant expression");
+        }
+    }
+
+    fn put0(&mut self, op: Op) {
+        self.put3(op, 0, 0, 0);
+    }
+
+    fn put2(&mut self, op: Op, dest: isize, left: isize) {
+        self.put3(op, dest, left, 0);
+    }
+
+    fn put3p(&mut self, op: Op, dest: isize, leftright: isize) {
+        self.put3(op, dest, leftright & 0xffffffff, leftright >> 32);
+    }
+
+    fn put_inc(&mut self, op: Op, data: RegValue) -> isize {
         let dest = self.inc_reg();
         self.put(op, dest, data);
         dest
     }
 
-    fn put_immediate(&mut self, expr: &ExprGen) -> u32 {
-        match expr.value {
-            Some(v) => self.put_inc(Op::Immediate, v),
-            None => {
-                if expr.is_field {
-                    if let Some(op) = load_op(expr.ty) {
-                        self.put_inc(op, expr.reg.into())
-                    } else {
-                        expr.reg
-                    }
+    fn put2_inc(&mut self, op: Op, left: isize) -> isize {
+        let dest = self.inc_reg();
+        self.put2(op, dest, left);
+        dest
+    }
+
+    fn put3_inc(&mut self, op: Op, left: isize, right: isize) -> isize {
+        let dest = self.inc_reg();
+        self.put3(op, dest, left, right);
+        dest
+    }
+
+    fn register(&mut self, expr: &ExprResult) -> isize {
+        match expr.addr.kind {
+            LocationKind::None => match expr.value {
+                Some(v) if expr.ty.is_pointer() => self.put_inc(Op::LoadStackAddress, v),
+                Some(v) => self.constant(v),
+                None => Location::BAD_LOCATION
+            },
+            LocationKind::Register => expr.addr.offset,
+            LocationKind::Stack => {
+                if let Some(op) = load_op_stack(expr.ty) {
+                    self.put2_inc(op, expr.addr.offset)
                 } else {
-                    expr.reg
+                    // todo: overwritable error here. we expect the _next_ error
+                    // will be more informative to the user. BAD_LOCATION can
+                    // appear sometimes in non-error cases, so it would be nice
+                    // to explicitly enter an error state, and generally keep
+                    // BAD_LOCATION usage to a minimum
+                    Location::BAD_LOCATION
+                }
+            }
+            LocationKind::Pointer => {
+                if let Some(op) = load_op_pointer(expr.ty) {
+                    let ptr = self.location_register(&expr.addr);
+                    self.put2_inc(op, ptr)
+                } else {
+                    // todo: weak (overwritable) error here, as above
+                    Location::BAD_LOCATION
                 }
             }
         }
     }
 
+    fn location_register(&mut self, location: &Location) -> isize {
+        assert!(location.kind == LocationKind::Pointer);
+        if location.base != 0 {
+            let offset_register = self.constant(location.offset.into());
+            self.put3_inc(Op::IntAdd, location.base, offset_register)
+        } else {
+            location.base
+        }
+    }
+
+    fn emit_constant(&mut self, expr: &ExprResult) -> ExprResult {
+        if let Some(_) = expr.value {
+            let mut expr = *expr;
+            expr.addr = Location::register(self.register(&expr));
+            expr
+        } else {
+            *expr
+        }
+    }
+
     fn put_jump(&mut self, label: Label) {
-        self.patches.push((label, Location(self.code.len())));
-        self.put(Op::Jump, 0, label.0.into());
+        self.patches.push((label, InstrLocation(self.code.len())));
+        self.put2(Op::Jump, 0, label.0 as isize);
     }
 
-    fn put_jump_zero(&mut self, cond_register: u32, label: Label) {
-        self.patches.push((label, Location(self.code.len())));
-        self.put(Op::JumpIfZero, cond_register, label.0.into());
+    fn put_jump_zero(&mut self, cond_register: isize, label: Label) {
+        self.patches.push((label, InstrLocation(self.code.len())));
+        self.put2(Op::JumpIfZero, cond_register, label.0 as isize);
     }
 
-    fn put_jump_nonzero(&mut self, cond_register: u32, label: Label) {
-        self.patches.push((label, Location(self.code.len())));
-        self.put(Op::JumpIfNotZero, cond_register, label.0.into());
+    fn put_jump_nonzero(&mut self, cond_register: isize, label: Label) {
+        self.patches.push((label, InstrLocation(self.code.len())));
+        self.put2(Op::JumpIfNotZero, cond_register, label.0 as isize);
+    }
+
+    fn stack_alloc(&mut self, ctx: &Compiler, ty: Type) -> Location {
+        let info = ctx.types.info(ty);
+        Location::stack(self.inc_bytes(info.size, info.alignment))
+    }
+
+    fn constant(&mut self, value: RegValue) -> isize {
+        // :)
+        self.put_inc(Op::Immediate, value)
+    }
+
+    fn copy(&mut self, ctx: &Compiler, destination_type: Type, dest: &Location, src: &ExprResult) {
+        let size = ctx.types.info(destination_type).size as isize;
+        let alignment = ctx.types.info(destination_type).alignment as isize;
+        debug_assert_eq!((dest.offset) & (alignment - 1), 0);
+        match dest.kind {
+            LocationKind::None => unreachable!(),
+            LocationKind::Register => {
+                let result_register = self.register(src);
+                self.put2(Op::Move, dest.offset, result_register);
+            }
+            LocationKind::Stack => {
+                if let Some(op) = store_op_stack(destination_type) {
+                    let result_register = self.register(src);
+                    self.put2(op, dest.offset, result_register);
+                } else {
+                    self.put3(Op::StackRelativeCopy, dest.offset, src.addr.offset, size);
+                }
+            }
+            LocationKind::Pointer => {
+                let dest_addr_register = self.location_register(dest);
+                let src = &self.emit_constant(src);
+
+                match src.addr.kind {
+                    LocationKind::None => (),
+                    LocationKind::Register => {
+                        if let Some(op) = store_op_pointer(destination_type) {
+                            let src = self.register(src);
+                            self.put2(op, dest_addr_register, src);
+                        } else {
+                            unreachable!();
+                        }
+                    }
+                    LocationKind::Stack => {
+                        let src_addr_register = self.put2_inc(Op::LoadStackAddress, src.addr.offset);
+                        let size_register = self.constant(size.into());
+                        self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
+                    }
+                    LocationKind::Pointer => {
+                        let src_addr_register = self.location_register(&src.addr);
+                        let size_register = self.constant(size.into());
+                        self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
+                    }
+                }
+            }
+        }
+    }
+
+    fn copy_to_stack(&mut self, ctx: &Compiler, src: &ExprResult) -> Location {
+        let info = ctx.types.info(src.ty);
+        let offset = self.inc_bytes(info.size, info.alignment);
+        let result = Location::stack(offset);
+        self.copy(ctx, src.ty, &result, &src);
+        result
     }
 
     fn label(&mut self) -> Label {
         if self.constant == false {
             let result = Label(self.labels.len());
-            self.labels.push(Location(!0));
+            self.labels.push(InstrLocation(!0));
             result
         } else {
             // TODO: expr position
@@ -903,18 +1175,20 @@ impl FatGen {
     }
 
     fn patch(&mut self, label: Label) {
-        assert!(self.labels[label.0] == Location(!0));
-        self.labels[label.0] = Location(self.code.len());
+        assert!(self.labels[label.0] == InstrLocation(!0));
+        self.labels[label.0] = InstrLocation(self.code.len());
     }
 
     fn apply_patches(&mut self) {
-        for &(Label(label), Location(from)) in self.patches.iter() {
-            let Location(to) = self.labels[label];
-            assert!(to != !0);
-            assert!(self.code[from].is_jump() && self.code[from].left == label as u32);
-            let offset = (to as isize) - (from as isize) - 1;
-            let offset = i32::try_from(offset).expect("function too large") as u32;
-            self.code[from].left = offset;
+        if self.error.is_none() {
+            for &(Label(label), InstrLocation(from)) in self.patches.iter() {
+                let InstrLocation(to) = self.labels[label];
+                assert!(to != !0);
+                assert!(self.code[from].is_jump() && self.code[from].left == label as u32);
+                let offset = (to as isize) - (from as isize) - 1;
+                let offset = i32::try_from(offset).expect("function too large") as u32;
+                self.code[from].left = offset;
+            }
         }
         self.patches.clear();
     }
@@ -941,17 +1215,17 @@ impl FatGen {
                                 if len.ty.is_integer() && len.value.is_some() {
                                     if let Some(op) = convert_op(len.ty, Type::Int) {
                                         let value = apply_unary_op(op, len.value.unwrap());
-                                        let value = Value::from(value, Type::Int);
-                                        match value {
-                                            Value::Int(len) if len > 0 => result = ctx.types.make_array(ty, len as usize),
-                                            _ => error!(self, 0, "arr length must be a positive integer and fit in a signed integer")
+                                        if unsafe { value.sint } > 0 {
+                                            result = ctx.types.array(ty, unsafe { value.sint } as usize);
+                                        } else {
+                                            error!(self, 0, "arr length must be a positive integer and fit in a signed integer");
                                         }
                                     } else {
                                         unreachable!();
                                     }
                                 } else {
                                     // todo: type expr location
-                                    error!(self, 0, "arr length must be an integer")
+                                    error!(self, 0, "arr length must be a constant integer")
                                 }
                             } else {
                                 error!(self, 0, "argument 2 of arr type must be a value expression")
@@ -1017,7 +1291,7 @@ impl FatGen {
         }
     }
 
-    fn constant_expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprGen {
+    fn constant_expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprResult {
         // This is kind of a hack to keep constant and non-constant expressions
         // totally unified while things are still incomplete
         let code_len = self.code.len();
@@ -1033,44 +1307,34 @@ impl FatGen {
         } else {
             debug_assert!(self.code.len() == code_len);
             debug_assert!(self.labels.len() == labels_len);
-            debug_assert!(result.reg == Self::BAD_REGISTER);
+            debug_assert!(result.addr.offset == Location::BAD_LOCATION);
         }
         result
     }
 
-    fn expr_in_register(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprGen {
-        let mut result = self.expr(ctx, expr);
-        result.reg = self.put_immediate(&result);
-        result
-    }
-
-    fn expr_in_register_with_predicted_compound_type(&mut self, ctx: &mut Compiler, expr: Expr, compound_type: Type) -> ExprGen {
-        self.compound.ty = Some(compound_type);
-        self.expr_in_register(ctx, expr)
-    }
-
-    fn expr_with_predicted_compound_type(&mut self, ctx: &mut Compiler, expr: Expr, compound_type: Type) -> ExprGen {
-        self.compound.ty = Some(compound_type);
+    fn expr_with_destination_type(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type) -> ExprResult {
+        self.destination.ty = Some(destination_type);
         self.expr(ctx, expr)
     }
 
-    fn expr_with_predicted_compound_type_and_destination(&mut self, ctx: &mut Compiler, expr: Expr, compound_type: Type, dest: u32) -> ExprGen {
-        self.compound.ty = Some(compound_type);
-        self.compound.dest = Some(dest);
+    fn expr_with_destination(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type, dest: &Location) -> ExprResult {
+        assert_ne!(dest.kind, LocationKind::None);
+        self.destination.ty = Some(destination_type);
+        self.destination.dest = Some(*dest);
         let mut result = self.expr(ctx, expr);
-        self.compound.dest = None;
-        if result.ty == compound_type && result.reg != dest {
-            let size = u32::try_from(ctx.types.info(compound_type).size).expect("todo");
-            let reg = self.put_immediate(&result);
-            self.put(Op::StackRelativeCopy, dest, (reg, size).into());
-            result.reg = dest;
+        self.destination.dest = None;
+        if value_fits_or_types_match(result.value, result.ty, destination_type) {
+            if result.addr != *dest {
+                self.copy(ctx, destination_type, dest, &result);
+                result.addr = *dest;
+            }
         }
         result
     }
 
-    fn expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprGen {
-        let mut result = ExprGen { reg: Self::BAD_REGISTER, ty: Type::None, value: None, is_field: false, is_local: false };
-        let compound_type = self.compound.ty.take();
+    fn expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprResult {
+        let mut result = ExprResult { addr: Location::none(), ty: Type::None, value: None };
+        let destination_type = self.destination.ty.take();
         match ctx.ast.expr(expr) {
             ExprData::Int(value) => {
                 result.value = Some(value.into());
@@ -1086,9 +1350,8 @@ impl FatGen {
             }
             ExprData::Name(name) => {
                 if let Some(local) = self.locals.get(name) {
-                    result.reg = local.reg;
+                    result.addr = local.loc;
                     result.ty = local.ty;
-                    result.is_local = true;
                 } else if let Some(&global) = ctx.globals.get(&name) {
                     result.value = Some(global.value.into());
                     result.ty = global.ty;
@@ -1097,28 +1360,19 @@ impl FatGen {
                 }
             }
             ExprData::Compound(fields) => {
-                if let Some(ty) = compound_type {
+                if let Some(ty) = destination_type {
                     // Todo: check for duplicate fields. need to consider unions and fancy paths (both unimplemented)
                     let info = ctx.types.info(ty);
-                    let base = self.compound.dest.unwrap_or_else(|| self.inc_bytes(info.size, info.alignment));
+                    let base = self.destination.dest.unwrap_or_else(|| self.stack_alloc(ctx, ty));
                     let mut path_ctx = PathContext { state: PathContextState::ExpectAny, index: 0 };
                     if matches!(info.kind, TypeKind::Struct|TypeKind::Array) {
-                        self.put(Op::StackRelativeZero, base, (info.size as u32).into());
+                        self.put2(Op::StackRelativeZero, base.offset, info.size as isize);
                         for field in fields {
                             let field = ctx.ast.compound_field(field);
                             if let Some(item) = self.path(ctx, &mut path_ctx, ty, field.path) {
-                                let dest = base + item.offset as u32;
-                                let expr = self.expr_with_predicted_compound_type_and_destination(ctx, field.value, item.ty, dest);
-                                if item.ty == expr.ty || (expr.ty == Type::Int && expr.value.is_some() && item.ty.is_integer() && value_fits(expr.value, item.ty)) {
-                                    if expr.reg != dest {
-                                        let reg = self.put_immediate(&expr);
-                                        if let Some(op) = store_op(item.ty) {
-                                            self.put(op, dest, reg.into());
-                                        } else {
-                                            unreachable!();
-                                        }
-                                    }
-                                } else {
+                                let dest = base.offset_by(item.offset as isize);
+                                let expr = self.expr_with_destination(ctx, field.value, item.ty, &dest);
+                                if !expr.is_ok() {
                                     match path_ctx.state {
                                         PathContextState::ExpectPaths =>
                                             error!(self, ctx.ast.expr_source_position(field.value), "incompatible types (field '{}' is of type {}, found {})", ctx.str(item.name), ctx.type_str(item.ty), ctx.type_str(expr.ty)),
@@ -1129,8 +1383,8 @@ impl FatGen {
                                 }
                             }
                         }
+                        result.addr = base;
                         result.ty = ty;
-                        result.reg = base;
                     } else {
                         error!(self, ctx.ast.expr_source_position(expr), "compound initializer used for non-aggregate type");
                     }
@@ -1139,35 +1393,52 @@ impl FatGen {
                 }
             }
             ExprData::Field(left_expr, field) => {
-                let left = self.expr_in_register(ctx, left_expr);
-                if let Some(item) = ctx.types.item_info(left.ty, field) {
-                    result.reg = left.reg + u32::try_from(item.offset).expect("todo");
+                let left = self.expr(ctx, left_expr);
+                if left.ty.is_pointer() {
+                    let ty = ctx.types.base_type(left.ty);
+                    if let Some(item) = ctx.types.item_info(ty, field) {
+                        match left.value {
+                            Some(lv) => result.value = Some(unsafe { lv.int + item.offset }.into()),
+                            None => {
+                                let base = self.register(&left);
+                                result.addr = Location::pointer(base, item.offset as isize, left.addr.can_assign);
+                            }
+                        }
+                        // todo: can_assign/can_access?
+                        result.ty = item.ty;
+                    } else {
+                        error!(self, ctx.ast.expr_source_position(left_expr), "no field '{}' on type {}", ctx.str(field), ctx.type_str(left.ty));
+                    }
+                } else if let Some(item) = ctx.types.item_info(left.ty, field) {
+                    debug_assert_implies!(self.error.is_none(), matches!(left.addr.kind, LocationKind::Stack|LocationKind::Pointer));
+                    result.addr = left.addr;
+                    result.addr.offset += item.offset as isize;
                     result.ty = item.ty;
-                    result.is_field = true;
                 } else {
                     error!(self, ctx.ast.expr_source_position(left_expr), "no field '{}' on type {}", ctx.str(field), ctx.type_str(left.ty));
                 }
             }
             ExprData::Index(left_expr, index_expr) => {
-                let left = self.expr_in_register(ctx, left_expr);
+                let left = self.expr(ctx, left_expr);
                 if ctx.types.info(left.ty).kind == TypeKind::Array {
-                    let base_type = ctx.types.info(left.ty).base_type;
+                    let base_type = ctx.types.base_type(left.ty);
                     let index = self.expr(ctx, index_expr);
                     if index.ty.is_integer() {
                         let element_size = ctx.types.info(base_type).size;
-                        let reg = match index.value {
-                            Some(value) => left.reg + u32::try_from(unsafe { value.int * element_size }).expect("todo"),
+                        let index = match index.value {
+                            Some(value) => unsafe { value.sint },
                             None => {
-                                let size_reg = self.put_inc(Op::Immediate, element_size.into());
-                                let offset_reg = self.put_inc(Op::IntMul, (index.reg, size_reg).into());
-                                let addr_reg = self.put_inc(Op::IntAdd, (left.reg, offset_reg).into());
+                                // let size_reg = self.put_inc(Op::Immediate, element_size.into());
+                                // let offset_reg = self.put_inc(Op::IntMul, (index.reg, size_reg).into());
+                                // let addr_reg = self.put_inc(Op::IntAdd, (left.reg, offset_reg).into());
                                 // this creates is a pointer
                                 todo!();
                             }
                         };
-                        result.reg = reg;
+                        result.addr.offset = left.addr.offset + index * element_size as isize;
+                        result.addr.kind = left.addr.kind;
+                        result.addr.can_assign = left.addr.can_assign;
                         result.ty = base_type;
-                        result.is_field = true;
                     } else {
                         error!(self, ctx.ast.expr_source_position(index_expr), "index must be an integer (found {})", ctx.type_str(index.ty))
                     }
@@ -1176,13 +1447,51 @@ impl FatGen {
                 }
             },
             ExprData::Unary(op_token, right_expr) => {
-                let right = self.expr(ctx, right_expr);
-                if let Some((op, result_ty)) = unary_op(op_token, right.ty) {
+                let right = if let (parse::TokenKind::BitAnd, Some(ty)) = (op_token, destination_type) {
+                    self.expr_with_destination_type(ctx, right_expr, ty)
+                } else {
+                    self.expr(ctx, right_expr)
+                };
+                if matches!(op_token, parse::TokenKind::BitAnd|parse::TokenKind::Mul) {
+                    if op_token == parse::TokenKind::BitAnd {
+                        match right.addr.kind {
+                            LocationKind::None =>
+                                error!(self, ctx.ast.expr_source_position(right_expr), "cannot take address of this expression"),
+                            LocationKind::Register if !right.addr.can_access =>
+                                error!(self, ctx.ast.expr_source_position(right_expr), "cannot take address of this expression"),
+                            LocationKind::Register|LocationKind::Stack => {
+                                let base = right.addr.offset;
+                                // todo: seems weird to be setting these with kind = None
+                                result.addr.can_assign = right.addr.can_assign;
+                                result.addr.can_access = right.addr.can_access;
+                                result.value = Some(base.into());
+                            }
+                            LocationKind::Pointer => {
+                                result.addr = Location::register(self.location_register(&right.addr));
+                            }
+                        }
+                        result.ty = ctx.types.pointer(right.ty);
+                    } else if op_token == parse::TokenKind::Mul {
+                        if right.ty.is_pointer() {
+                            match right.value {
+                                Some(offset) => result.addr = Location::stack(unsafe { offset.sint }),
+                                None => {
+                                    let right_register = self.register(&right);
+                                    result.addr = Location::pointer(right_register, 0, right.addr.can_assign);
+                                }
+                            }
+                            result.ty = ctx.types.base_type(right.ty);
+                        } else {
+                            error!(self, ctx.ast.expr_source_position(right_expr), "cannot dereference {}", ctx.type_str(right.ty));
+                        }
+                    }
+                } else if let Some((op, result_ty)) = unary_op(op_token, right.ty) {
                     match right.value {
+                        Some(_) if right.ty.is_pointer() => result.addr = Location::register(self.register(&right)),
                         Some(rv) => result.value = Some(apply_unary_op(op, rv)),
                         None => {
-                            let right_register = self.put_immediate(&right);
-                            result.reg = self.put_inc(op, right_register.into());
+                            let right_register = self.register(&right);
+                            result.addr = Location::register(self.put2_inc(op, right_register));
                         }
                     }
                     result.ty = result_ty;
@@ -1193,23 +1502,27 @@ impl FatGen {
             ExprData::Binary(op_token, left_expr, right_expr) => {
                 if op_token == parse::TokenKind::LogicAnd || op_token == parse::TokenKind::LogicOr {
                     // No constant folding here because it makes this code complicated for nothing in return
+                    // TODO: want it for when both sides are constant, so constant expressions don't have this one weird edge case
                     let short_circuit = self.label();
                     let done = self.label();
-                    let left = self.expr_in_register(ctx, left_expr);
+                    let left = self.expr(ctx, left_expr);
+                    let left_register = self.register(&left);
                     if op_token == parse::TokenKind::LogicAnd {
-                        self.put_jump_zero(left.reg, short_circuit);
+                        self.put_jump_zero(left_register, short_circuit);
                     } else {
-                        self.put_jump_nonzero(left.reg, short_circuit);
+                        self.put_jump_nonzero(left_register, short_circuit);
                     }
-                    let right = self.expr_in_register(ctx, right_expr);
+                    let right = self.expr(ctx, right_expr);
+                    let right_register = self.register(&right);
                     if let Some((_, result_ty)) = binary_op(op_token, left.ty, right.ty) {
-                        result.ty = result_ty;
-                        result.reg = self.inc_reg();
-                        self.put(Op::Move, result.reg, right.reg.into());
+                        let dest_register = self.inc_reg();
+                        self.put3p(Op::Move, dest_register, right_register);
                         self.put_jump(done);
                         self.patch(short_circuit);
-                        self.put(Op::Move, result.reg, left.reg.into());
+                        self.put3p(Op::Move, dest_register, left_register);
                         self.patch(done);
+                        result.addr = Location::register(dest_register);
+                        result.ty = result_ty;
                     } else {
                         error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types ({} {} {}), logical operators use booleans", ctx.type_str(left.ty), op_token, ctx.type_str(right.ty));
                     }
@@ -1218,11 +1531,12 @@ impl FatGen {
                     let right = self.expr(ctx, right_expr);
                     if let Some((op, result_ty)) = binary_op(op_token, left.ty, right.ty) {
                         match (left.value, right.value) {
-                            (Some(lv), Some(rv)) => result.value = Some(apply_binary_op(op, lv, rv)),
+                            (Some(lv), Some(rv)) if !left.ty.is_pointer() && !right.ty.is_pointer() => result.value = Some(apply_binary_op(op, lv, rv)),
                             _ => {
-                                let left_register = self.put_immediate(&left);
-                                let right_register = self.put_immediate(&right);
-                                result.reg = self.put_inc(op, (left_register, right_register).into());
+                                let left_register = self.register(&left);
+                                let right_register = self.register(&right);
+                                let result_register = self.put3_inc(op, left_register, right_register);
+                                result.addr = Location::register(result_register);
                             }
                         }
                         result.ty = result_ty;
@@ -1233,6 +1547,7 @@ impl FatGen {
             }
             ExprData::Ternary(cond_expr, left_expr, right_expr) => {
                 let cond = self.expr(ctx, cond_expr);
+                let cond_register = self.register(&cond);
                 if cond.ty == Type::Bool {
                     if let Some(cv) = cond.value {
                         // Descend into both branches to type check, then discard the generated code.
@@ -1250,17 +1565,16 @@ impl FatGen {
                     } else {
                         let right_branch = self.label();
                         let done = self.label();
-                        result.reg = self.inc_reg();
-                        self.put_jump_zero(cond.reg, right_branch);
-                        let left = self.expr_in_register(ctx, left_expr);
-                        self.put(Op::Move, result.reg, left.reg.into());
+                        self.put_jump_zero(cond_register, right_branch);
+                        let left = self.expr(ctx, left_expr);
+                        let left = self.emit_constant(&left);
                         self.put_jump(done);
                         self.patch(right_branch);
-                        let right = self.expr_in_register(ctx, right_expr);
-                        self.put(Op::Move, result.reg, right.reg.into());
+                        let right = self.expr_with_destination(ctx, right_expr, left.ty, &left.addr);
                         self.patch(done);
                         if left.ty == right.ty {
-                            result.ty = right.ty;
+                            debug_assert!(left.addr == right.addr);
+                            result = left;
                         } else {
                             error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types (... ? {} :: {})", ctx.type_str(left.ty), ctx.type_str(right.ty));
                         }
@@ -1283,18 +1597,22 @@ impl FatGen {
                             error!(self, ctx.ast.expr_source_position(expr), "argument {} is of type {}, found {}", i, ctx.type_str(item.ty), ctx.type_str(gen.ty));
                             break;
                         }
-                        arg_gens.push((gen.value, gen.reg));
+                        arg_gens.push(gen);
                     }
                     for &gen in arg_gens.iter() {
-                        match gen.0 {
-                            Some(gv) => self.put_inc(Op::Immediate, gv),
-                            _ => self.put_inc(Op::Move, gen.1.into())
+                        match gen.value {
+                            Some(gv) => self.constant(gv),
+                            _ => {
+                                assert!(gen.addr.kind == LocationKind::Register, "todo");
+                                self.put2_inc(Op::Move, gen.addr.offset)
+                            }
                         };
                     }
-                    result.reg = match addr.value {
-                        Some(func) => self.put_inc(Op::Call, func.into()),
-                        _ => self.put_inc(Op::CallIndirect, addr.reg.into())
+                    result.addr.offset = match addr.value {
+                        Some(func) => self.put_inc(Op::Call, func),
+                        _ => todo!()
                     };
+                    result.addr.kind = LocationKind::Register;
                     result.ty = return_type;
                 } else {
                     // TODO: get a string representation of the whole `callable` expr for nicer error message
@@ -1303,18 +1621,50 @@ impl FatGen {
             }
             ExprData::Cast(expr, type_expr) => {
                 let to_ty = self.type_expr(ctx, type_expr);
-                let left = self.expr_with_predicted_compound_type(ctx, expr, to_ty);
+                let left = self.expr_with_destination_type(ctx, expr, to_ty);
                 if let Some(op) = convert_op(left.ty, to_ty) {
                     match left.value {
+                        Some(_) if left.ty.is_pointer() => result.addr = Location::register(self.register(&left)),
                         Some(lv) => result.value = Some(apply_unary_op(op, lv)),
-                        None => result.reg = if op != Op::Noop { self.put_inc(op, left.reg.into()) } else { left.reg }
+                        None => {
+                            if op != Op::Noop {
+                                let reg = self.register(&left);
+                                result.addr = Location::register(self.put2_inc(op, reg));
+                            } else {
+                                result = left;
+                            }
+                        }
                     }
-                    result.ty = to_ty;
+                    if types_match_with_promotion(result.ty, to_ty) {
+                        // We can send integer types back up the tree unmodified
+                        // without doing the conversion here.
+                    } else {
+                        result.ty = to_ty;
+                    }
+                } else if let ExprData::Unary(parse::TokenKind::BitAnd, inner) = ctx.ast.expr(expr) {
+                    if let ExprData::Compound(_) = ctx.ast.expr(inner) {
+                        // The cast-on-the-right synax doesn't work great with taking addresses.
+                        //
+                        // Conceptually, this transposes
+                        //      &{}:Struct
+                        // to
+                        //      &({}:Struct)
+                        //
+                        // We only do this if the above convert_op returns None, as otherwise we cannot distinguish between
+                        //      &a:int / (&a):int
+                        // and
+                        //      &(a:int)
+                        debug_assert!(left.value.is_some());
+                        debug_assert!(left.ty.is_pointer());
+                        result = ExprResult { ty: ctx.types.pointer(to_ty), ..left };
+                    }
                 } else {
                     error!(self, ctx.ast.expr_source_position(expr), "cannot cast from {} to {}", ctx.type_str(left.ty), ctx.type_str(to_ty));
                 }
             }
         };
+        assert_implies!(self.error.is_none() && result.addr.offset == Location::BAD_LOCATION, result.addr.kind == LocationKind::None);
+        assert_implies!(self.error.is_none() && result.addr.offset != Location::BAD_LOCATION, result.addr.kind != LocationKind::None);
         result
     }
 
@@ -1325,9 +1675,10 @@ impl FatGen {
                 return_type = self.stmts(ctx, body)
             }
             StmtData::Return(Some(expr)) => {
-                let ret_expr = self.expr_in_register(ctx, expr);
+                let ret_expr = self.expr(ctx, expr);
                 if types_match_with_promotion(ret_expr.ty, self.return_type) {
-                    self.put(Op::Return, 0, ret_expr.reg.into());
+                    let reg = self.register(&ret_expr);
+                    self.put2(Op::Return, 0, reg);
                     return_type = Some(ret_expr.ty);
                 } else {
                     error!(self, ctx.ast.expr_source_position(expr), "type mismatch: expected a return value of type {} (found {})", ctx.type_str(self.return_type), ctx.type_str(ret_expr.ty));
@@ -1335,7 +1686,7 @@ impl FatGen {
             }
             StmtData::Return(None) => {
                 if self.return_type == Type::None {
-                    self.put(Op::Return, 0, 0.into());
+                    self.put0(Op::Return);
                 } else {
                     // TODO: stmt source position
                     error!(self, 0, "empty return, expected a return value of type {}", ctx.type_str(self.return_type));
@@ -1358,10 +1709,11 @@ impl FatGen {
                 }
             }
             StmtData::If(cond_expr, then_body, else_body) => {
-                let cond = self.expr_in_register(ctx, cond_expr);
+                let cond = self.expr(ctx, cond_expr);
                 if cond.ty == Type::Bool {
+                    let cond_reg = self.register(&cond);
                     let else_branch = self.label();
-                    self.put_jump_zero(cond.reg, else_branch);
+                    self.put_jump_zero(cond_reg, else_branch);
                     let then_ret = self.stmts(ctx, then_body);
                     if else_body.is_nonempty() {
                         let skip_else = self.label();
@@ -1384,17 +1736,19 @@ impl FatGen {
                     self.stmt(ctx, stmt);
                 }
                 if let Some(expr) = cond_expr {
-                    let pre_cond = self.expr_in_register(ctx, expr);
+                    let pre_cond = self.expr(ctx, expr);
+                    let pre_cond_register = self.register(&pre_cond);
                     if pre_cond.ty == Type::Bool {
-                        self.put_jump_zero(pre_cond.reg, break_label);
+                        self.put_jump_zero(pre_cond_register, break_label);
                         let loop_entry = self.label_here();
                         return_type = self.stmts(ctx, body);
                         self.patch(continue_label);
                         if let Some(stmt) = post_stmt {
                             self.stmt(ctx, stmt);
                         }
-                        let post_cond = self.expr_in_register(ctx, expr);
-                        self.put_jump_nonzero(post_cond.reg, loop_entry);
+                        let post_cond = self.expr(ctx, expr);
+                        let post_cond_register = self.register(&post_cond);
+                        self.put_jump_nonzero(post_cond_register, loop_entry);
                     } else {
                         error!(self, ctx.ast.expr_source_position(expr), "for statement requires a boolean condition");
                     }
@@ -1413,14 +1767,16 @@ impl FatGen {
             }
             StmtData::While(cond_expr, body) => {
                 let (break_label, continue_label, gen_ctx) = self.push_loop_context();
-                let pre_cond = self.expr_in_register(ctx, cond_expr);
+                let pre_cond = self.expr(ctx, cond_expr);
                 if pre_cond.ty == Type::Bool {
-                    self.put_jump_zero(pre_cond.reg, break_label);
+                    let pre_cond_register = self.register(&pre_cond);
+                    self.put_jump_zero(pre_cond_register, break_label);
                     let loop_entry = self.label_here();
                     return_type = self.stmts(ctx, body);
                     self.patch(continue_label);
-                    let post_cond = self.expr_in_register(ctx, cond_expr);
-                    self.put_jump_nonzero(post_cond.reg, loop_entry);
+                    let post_cond = self.expr(ctx, cond_expr);
+                    let post_cond_register = self.register(&post_cond);
+                    self.put_jump_nonzero(post_cond_register, loop_entry);
                 } else {
                     error!(self, ctx.ast.expr_source_position(cond_expr), "while statement requires a boolean condition");
                 }
@@ -1433,17 +1789,19 @@ impl FatGen {
                 let (end, gen_ctx) = self.push_break_context();
                 let mut labels = SmallVec::new();
                 let mut else_label = None;
-                let control = self.expr_in_register(ctx, control_expr);
+                let control = self.expr(ctx, control_expr);
+                let control_register = self.register(&control);
                 for case in cases {
                     let block_label = self.label();
                     labels.push(block_label);
                     if let SwitchCaseData::Cases(exprs, _) = ctx.ast.switch_case(case) {
                         for case_expr in exprs {
-                            let expr = self.expr_in_register(ctx, case_expr);
+                            let expr = self.expr(ctx, case_expr);
                             if let Some(_ev) = expr.value {
                                 if let Some((op, ty)) = binary_op(parse::TokenKind::Eq, control.ty, expr.ty) {
                                     debug_assert_eq!(ty, Type::Bool);
-                                    let matched = self.put_inc(op, (control.reg, expr.reg).into());
+                                    let expr_register = self.register(&expr);
+                                    let matched = self.put3_inc(op, control_register, expr_register);
                                     self.put_jump_nonzero(matched, block_label);
                                 } else {
                                     error!(self, ctx.ast.expr_source_position(case_expr), "type mismatch between switch control ({}) and case ({})", ctx.type_str(control.ty), ctx.type_str(expr.ty))
@@ -1484,11 +1842,12 @@ impl FatGen {
                 let loop_entry = self.label_here();
                 return_type = self.stmts(ctx, body);
                 self.patch(continue_label);
-                let post_cond = self.expr_in_register(ctx, cond_expr);
+                let post_cond = self.expr(ctx, cond_expr);
                 if post_cond.ty != Type::Bool {
                     error!(self, ctx.ast.expr_source_position(cond_expr), "do statement requires a boolean condition");
                 }
-                self.put_jump_nonzero(post_cond.reg, loop_entry);
+                let post_cond_register = self.register(&post_cond);
+                self.put_jump_nonzero(post_cond_register, loop_entry);
                 self.patch(break_label);
                 self.restore(gen);
             }
@@ -1510,25 +1869,20 @@ impl FatGen {
                     let expr;
                     let decl_type;
                     if matches!(ctx.ast.type_expr(ty_expr), TypeExprData::Infer) {
-                        expr = self.expr_in_register(ctx, right);
+                        expr = self.expr(ctx, right);
                         decl_type = expr.ty;
                     } else {
                         decl_type = self.type_expr(ctx, ty_expr);
-                        expr = self.expr_in_register_with_predicted_compound_type(ctx, right, decl_type);
+                        expr = self.expr_with_destination_type(ctx, right, decl_type);
                     }
-                    let mut reg = expr.reg;
-                    if expr.is_local {
-                        if expr.ty.is_basic() {
-                            reg = self.put_inc(Op::Move, expr.reg.into());
-                        } else {
-                            let info = ctx.types.info(expr.ty);
-                            reg = self.inc_bytes(info.size, info.alignment);
-                            self.put(Op::StackRelativeCopy, reg, (expr.reg, info.size as u32).into());
-                        }
-                    }
+                    let addr = if expr.addr.can_access {
+                        self.copy_to_stack(ctx, &expr)
+                    } else {
+                        self.emit_constant(&expr).addr
+                    };
                     if types_match_with_promotion(decl_type, expr.ty) {
                         if value_fits(expr.value, decl_type) {
-                            self.locals.insert(var, Local::new(reg, decl_type));
+                            self.locals.insert(var, Local::new(addr, decl_type));
                         } else {
                             error!(self, ctx.ast.expr_source_position(left), "constant expression does not fit in {}", ctx.type_str(decl_type));
                         }
@@ -1536,22 +1890,15 @@ impl FatGen {
                         error!(self, ctx.ast.expr_source_position(left), "type mismatch between declaration ({}) and value ({})", ctx.type_str(decl_type), ctx.type_str(expr.ty))
                     }
                 } else {
-                    error!(self, ctx.ast.expr_source_position(left), "cannot declare '{}' as a variable", ctx.ast.expr(left));
+                    error!(self, ctx.ast.expr_source_position(left), "cannot declare {} as a variable", ctx.ast.expr(left));
                 }
             }
             StmtData::Assign(left, right) => {
                 let lv = self.expr(ctx, left);
-                if lv.is_local || lv.is_field {
-                    let value = self.expr_in_register_with_predicted_compound_type(ctx, right, lv.ty);
-                    if lv.ty == value.ty {
-                        if value.ty.is_basic() {
-                            self.put(Op::Move, lv.reg, value.reg.into());
-                        } else {
-                            let size = u32::try_from(ctx.types.info(lv.ty).size).expect("todo");
-                            self.put(Op::StackRelativeCopy, lv.reg, (value.reg, size).into());
-                        }
-                    } else {
-                        error!(self, ctx.ast.expr_source_position(left), "type mismatch between assignee ({}) and value ({})", ctx.type_str(lv.ty), ctx.type_str(value.ty))
+                if lv.addr.can_assign {
+                    let value = self.expr_with_destination(ctx, right, lv.ty, &lv.addr);
+                    if !value.is_ok() {
+                        error!(self, ctx.ast.expr_source_position(left), "type mismatch between destination ({}) and value ({})", ctx.type_str(lv.ty), ctx.type_str(value.ty))
                     }
                 } else {
                     error!(self, ctx.ast.expr_source_position(left), "cannot assign to {}", ctx.ast.expr(left));
@@ -1582,13 +1929,13 @@ impl FatGen {
         assert!(sig.kind == TypeKind::Func);
         assert!(func.params.len() == sig.items.len() - 1, "the last element of a func's type signature's items must be the return type. it is not optional");
         self.return_type = sig.items.last().map(|i| i.ty).unwrap();
-        self.reg_counter = 1 - i32::try_from(sig.items.len()).expect("tried to generate code for a function with an excessive number of arguments");
-        self.reg_counter *= Self::REGISTER_SIZE as i32;
+        self.reg_counter = 1 - sig.items.len() as isize;
+        self.reg_counter *= Self::REGISTER_SIZE as isize;
         let param_names = func.params.map(|item| ctx.ast.item(item).name);
         let param_types = sig.items.iter().map(|i| i.ty);
         for (name, ty) in Iterator::zip(param_names, param_types) {
             let reg = self.inc_reg();
-            self.locals.insert(name, Local::new(reg, ty));
+            self.locals.insert(name, Local::new(Location::register(reg), ty));
         }
         let return_register = self.inc_reg();
         assert_eq!(return_register, 0);
@@ -1622,6 +1969,7 @@ fn position_to_line_column(str: &str, pos: usize) -> (usize, usize) {
     (line, col)
 }
 
+#[derive(Debug)]
 pub struct IncompleteError {
     source_position: usize,
     msg: String,
@@ -1733,9 +2081,7 @@ impl Compiler {
             let left = sp.wrapping_add(sign_extend(instr.left));
             let right = sp.wrapping_add(sign_extend(instr.right));
 
-            if false == matches!(instr.op, Op::StackRelativeStore8|Op::StackRelativeStore16|Op::StackRelativeStore32|Op::StackRelativeCopy|Op::StackRelativeZero) {
-                debug_assert!((dest & (FatGen::REGISTER_SIZE - 1)) == 0);
-            }
+            debug_assert_implies!(requires_register_destination(instr.op), (dest & (FatGen::REGISTER_SIZE - 1)) == 0);
 
             unsafe {
                  match instr.op {
@@ -1767,11 +2113,16 @@ impl Compiler {
                     Op::LogicOr    => { stack![dest].int = (stack![left].b8.0 || stack![right].b8.0) as usize; }
                     Op::LogicAnd   => { stack![dest].int = (stack![left].b8.0 && stack![right].b8.0) as usize; }
 
-                    Op::F32Neg     => { stack![dest].float32.0 = -stack![left].float32.0; }
-                    Op::F32Add     => { stack![dest].float32.0 = stack![left].float32.0 + stack![right].float32.0; }
-                    Op::F32Sub     => { stack![dest].float32.0 = stack![left].float32.0 - stack![right].float32.0; }
-                    Op::F32Mul     => { stack![dest].float32.0 = stack![left].float32.0 * stack![right].float32.0; }
-                    Op::F32Div     => { stack![dest].float32.0 = stack![left].float32.0 / stack![right].float32.0; }
+                    Op::F32Neg     => { stack![dest].float32.0 = -stack![left].float32.0;
+                                        stack![dest].float32.1 = 0.0; }
+                    Op::F32Add     => { stack![dest].float32.0 = stack![left].float32.0 + stack![right].float32.0;
+                                        stack![dest].float32.1 = 0.0; }
+                    Op::F32Sub     => { stack![dest].float32.0 = stack![left].float32.0 - stack![right].float32.0;
+                                        stack![dest].float32.1 = 0.0; }
+                    Op::F32Mul     => { stack![dest].float32.0 = stack![left].float32.0 * stack![right].float32.0;
+                                        stack![dest].float32.1 = 0.0; }
+                    Op::F32Div     => { stack![dest].float32.0 = stack![left].float32.0 / stack![right].float32.0;
+                                        stack![dest].float32.1 = 0.0; }
                     Op::F32Lt      => { stack![dest].int = (stack![left].float32.0 < stack![right].float32.0) as usize; }
                     Op::F32Gt      => { stack![dest].int = (stack![left].float32.0 > stack![right].float32.0) as usize; }
                     Op::F32Eq      => { stack![dest].int = (stack![left].float32.0 == stack![right].float32.0) as usize; }
@@ -1798,12 +2149,14 @@ impl Compiler {
                     Op::MoveAndSignExtendLower8  => { stack![dest].int       = stack![left].sint8.0   as usize; }
                     Op::MoveAndSignExtendLower16 => { stack![dest].int       = stack![left].sint16.0  as usize; }
                     Op::MoveAndSignExtendLower32 => { stack![dest].int       = stack![left].sint32.0  as usize; }
-                    Op::IntToFloat32             => { stack![dest].float32.0 = stack![left].sint      as f32; }
+                    Op::IntToFloat32             => { stack![dest].float32.0 = stack![left].sint      as f32;
+                                                      stack![dest].float32.1 = 0.0; }
                     Op::IntToFloat64             => { stack![dest].float64   = stack![left].sint      as f64; }
                     Op::Float32ToInt             => { stack![dest].int       = stack![left].float32.0 as usize; }
                     Op::Float32To64              => { stack![dest].float64   = stack![left].float32.0 as f64; }
                     Op::Float64ToInt             => { stack![dest].int       = stack![left].float64   as usize; }
-                    Op::Float64To32              => { stack![dest].float32.0 = stack![left].float64   as f32; }
+                    Op::Float64To32              => { stack![dest].float32.0 = stack![left].float64   as f32;
+                                                      stack![dest].float32.1 = 0.0; }
 
                     // dest is aligned, left may not be. The stores are redundant with copy, but convenient; loads ensure high bits of registers are zeroed
                     Op::StackRelativeStore8  => { stack[dest] = stack[left]; }
@@ -1840,6 +2193,22 @@ impl Compiler {
                         sp = dest;
                     },
                     Op::CallIndirect  => { todo!() },
+
+                    Op::Store8  => { *(stack![dest].int as *mut u8)  =   stack[left]; },
+                    Op::Store16 => { *(stack![dest].int as *mut u16) = *(stack[left..].as_ptr() as *const u16); },
+                    Op::Store32 => { *(stack![dest].int as *mut u32) = *(stack[left..].as_ptr() as *const u32); },
+                    Op::Store64 => { *(stack![dest].int as *mut u64) = *(stack[left..].as_ptr() as *const u64); },
+                    Op::Load8   => { stack![dest].int = *(stack![left].int as *const u8)  as usize; },
+                    Op::Load16  => { stack![dest].int = *(stack![left].int as *const u16) as usize; },
+                    Op::Load32  => { stack![dest].int = *(stack![left].int as *const u32) as usize; },
+                    Op::Load64  => { stack![dest].int = *(stack![left].int as *const u64) as usize; },
+                    Op::LoadAndSignExtend8  => { stack![dest].sint = *(stack![left].int as *const i8)  as isize; },
+                    Op::LoadAndSignExtend16 => { stack![dest].sint = *(stack![left].int as *const i16) as isize; },
+                    Op::LoadAndSignExtend32 => { stack![dest].sint = *(stack![left].int as *const i32) as isize; },
+                    Op::LoadBool => { stack![dest].b8.0 = *(stack![left].int as *const u8) != 0; },
+                    Op::Copy => { std::ptr::copy(stack![left].int as *const u8, stack![dest].int as *mut u8, stack![right].int); },
+                    Op::Zero => { for b in std::slice::from_raw_parts_mut(stack![dest].int as *mut u8, stack![right].int) { *b = 0 }},
+                    Op::LoadStackAddress => { stack![dest].int = (&stack[left] as *const u8) as usize },
                 }
             }
             ip = ip.wrapping_add(1);
@@ -1902,6 +2271,7 @@ fn eval_expr(str: &str) -> Result<Value> {
 fn repl() {
     use std::io;
     let mut line = String::new();
+    println!("lang's bad repl");
     loop {
         match io::stdin().read_line(&mut line) {
             Ok(_) => match eval_expr(&line) {
@@ -1916,17 +2286,7 @@ fn repl() {
 }
 
 fn main() {
-    compile_and_run(r#"struct RGBA {
-        r: i8,
-        g: i8,
-        b: i8,
-        a: i8,
-    }
-
-    func main(): int {
-        c := { r = 4, g = 3, b = 2, a = 1 }:RGBA;
-        return (c.r << 24) + (c.g << 16) + (c.b << 8) + c.a;
-    }"#);
+    // ptr();
     repl();
 }
 
@@ -2011,6 +2371,7 @@ fn stmt() {
         compile_and_run(&format!("func main(): int {{ {{ {} }} return 0; }}", str)).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
     }
 }
+
 #[test]
 fn decls() {
     let ok = [
@@ -2280,6 +2641,18 @@ func main(): int {
 fn structs() {
     let ok = [
 (r#"
+struct i32x4 {
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+}
+func main(): int {
+    a := {-1,-1,-1,-1}:i32x4;
+    return a.d:int;
+}
+"#, Value::Int(-1)),
+(r#"
 struct RGBA {
     r: i8,
     g: i8,
@@ -2302,12 +2675,12 @@ struct Outer {
 
 struct Inner {
     ignored: i32,
-    value: i64
+    value: i32
 }
 
 func main(): int {
-    a: Outer = { inner = { value = 1234 }};
-    b: Outer = { inner = { value = 1234 }:Inner };
+    a: Outer = { inner = { value = -1234 }};
+    b: Outer = { inner = { value = -1234 }:Inner };
     c := { inner = { value = a.inner.value }:Inner }:Outer;
     d: Outer = { inner = { value = b.inner.value }:Inner }:Outer;
     e := { inner = d.inner }:Outer;
@@ -2331,7 +2704,7 @@ func main(): int {
     }
     return 0;
 }
-"#, Value::Int(1234)),
+"#, Value::Int(-1234)),
 (r#"
 struct V2 {
     x: i32,
@@ -2354,13 +2727,15 @@ func main(): int {
 (r#"
 struct V2 {
     x: i32,
-    y: i32
+    y: i32,
+    z: i32,
+    w: i32,
 }
 
 func main(): int {
     a := ({ x = -1 }:V2).x;
-    b := (a == -1) ? { x = 3 }:V2 :: { x = 4 }:V2;
-    return b.x:int;
+    b := (a == -1) ? { w = 3 }:V2 :: { w = 4 }:V2;
+    return b.w:int;
 }
 "#, Value::Int(3)),
 ];
@@ -2435,6 +2810,101 @@ func main(): int {
 func main(): int {
     arr: arr int [1] = { 0 = 1 };
     return arr[0];
+}
+"#, r#"
+func main(): int {
+    arr: arr int [4.0] = {};
+    return arr[0];
+}
+"#];
+    for test in ok.iter() {
+        let str = test.0;
+        let expect = test.1;
+        compile_and_run(str)
+            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
+            .map_err(|e| { println!("input: \"{}\"", str); e })
+            .unwrap();
+    }
+    for str in err.iter() {
+        compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+    }
+}
+
+#[test]
+fn ptr() {
+    let ok = [
+(r#"
+func main(): int {
+    a := 1;
+    b := &a;
+    *b = 2;
+    return *b;
+}
+"#, Value::Int(2)),
+(r#"
+func main(): int {
+    a := 1;
+    *&a = 2;
+    b := &a:int;
+    return a;
+}
+"#, Value::Int(2)),
+(r#"
+struct V2 { x: i32, y: i32 }
+func main(): int {
+    aa := {1, 2}:V2;
+    bb := aa;
+    a := &aa;
+    b := &bb;
+    c := &{1, 2}:V2;
+    *a = {3, 4}:V2;
+    *b = *a;
+    c.x = b.x;
+    c.y = b.y;
+    if (a.x == aa.x && b.x == bb.x && a.x == b.x && b.x == c.x
+     && a.y == aa.y && b.y == bb.y && a.y == b.y && b.y == c.y) {
+        return aa.x;
+    }
+    return 0;
+}
+"#, Value::Int(3)),
+(r#"
+func main(): int {
+    arr := {}:arr u8 [8];
+    for (p := &arr[0]; p != &arr[8]; p = p + 1) {
+        *p = 1;
+    }
+    acc := 0;
+    acc = acc + arr[0];
+    acc = acc + arr[1];
+    acc = acc + arr[2];
+    acc = acc + arr[3];
+    acc = acc + arr[4];
+    acc = acc + arr[5];
+    acc = acc + arr[6];
+    acc = acc + arr[7];
+    // for (i := 0; i < 8; i = i + 1) {
+    //     acc = acc + arr[i];
+    // }
+    return acc;
+}
+"#, Value::Int(8)),
+];
+    let err = [r#""
+func main(): int {
+    a := 1;
+    return *a;
+}
+"#,r#"
+func main(): int {
+    a := &-1:u8;
+    return *a;
+}
+"#,r#"
+func main(): int {
+    a := -1;
+    b := &a:f32;
+    return *b;
 }
 "#];
     for test in ok.iter() {

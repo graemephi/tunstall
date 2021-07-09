@@ -35,6 +35,11 @@ pub fn builtins(ctx: &mut Compiler) {
         assert!(size == 0 || size.is_power_of_two());
         sym::builtin(ctx, name, ty);
     }
+
+    let voidptr = ctx.types.pointer(Type::None);
+    let u8ptr = ctx.types.pointer(Type::U8);
+    debug_assert_eq!(voidptr, Type::VoidPtr);
+    debug_assert_eq!(u8ptr, Type::U8Ptr);
 }
 
 #[derive(Copy, Clone, Default, PartialEq, Eq, Debug, Hash)]
@@ -42,6 +47,12 @@ pub struct Type(u32);
 
 #[allow(non_upper_case_globals)]
 impl Type {
+    // Pointer types have the last bit set on the handle. This is so pointers
+    // get folded into "base types" that can be reasoned about by the handle
+    // alone without having to look up information from the handle. It's for
+    // convenience, more than anything else.
+    const POINTER_BIT: u32 = 1 << (u32::BITS - 1);
+
     pub const None: Type = Type(TypeKind::None as u32);
     pub const Int:  Type = Type(TypeKind::Int as u32);
     pub const I8:   Type = Type(TypeKind::I8 as u32);
@@ -55,13 +66,19 @@ impl Type {
     pub const F32:  Type = Type(TypeKind::F32 as u32);
     pub const F64:  Type = Type(TypeKind::F64 as u32);
     pub const Bool: Type = Type(TypeKind::Bool as u32);
+    pub const VoidPtr: Type = Type((TypeKind::Bool as u32 + 1) | Self::POINTER_BIT);
+    pub const U8Ptr:   Type = Type((TypeKind::Bool as u32 + 2) | Self::POINTER_BIT);
 
     pub fn is_integer(self) -> bool {
         matches!(self, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64|Type::Int)
     }
 
     pub fn is_basic(self) -> bool {
-        self.0 <= TypeKind::Bool as u32
+        self.0 <= TypeKind::Bool as u32 || self.is_pointer()
+    }
+
+    pub fn is_pointer(self) -> bool {
+        (self.0 & Self::POINTER_BIT) == Self::POINTER_BIT
     }
 }
 
@@ -94,6 +111,7 @@ pub enum TypeKind {
     Func,
     Struct,
     Array,
+    Pointer,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,11 +165,11 @@ impl Types {
     }
 
     pub fn info(&self, ty: Type) -> &TypeInfo {
-        &self.types[ty.0 as usize]
+        &self.types[(ty.0 & !Type::POINTER_BIT) as usize]
     }
 
     fn info_mut(&mut self, ty: Type) -> &mut TypeInfo {
-        &mut self.types[ty.0 as usize]
+        &mut self.types[(ty.0 & !Type::POINTER_BIT) as usize]
     }
 
     pub fn item_info(&self, ty: Type, name: Intern) -> Option<Item> {
@@ -181,7 +199,10 @@ impl Types {
     }
 
     pub fn make(&mut self, kind: TypeKind, name: Intern) -> Type {
-        let result = u32::try_from(self.types.len()).expect("Program too big!!");
+        let mut result = u32::try_from(self.types.len()).expect("Program too big!!");
+        if result >= Type::POINTER_BIT {
+            todo!("Program too big!!");
+        }
         self.types.push(TypeInfo {
             kind: kind,
             name: name,
@@ -191,10 +212,13 @@ impl Types {
             base_type: Type::None,
             num_array_elements: 0,
         });
+        if kind == TypeKind::Pointer {
+            result |= Type::POINTER_BIT;
+        }
         Type(result)
     }
 
-    pub fn make_anonymous(&mut self, kind: TypeKind, items: &[Type]) -> Type {
+    pub fn anonymous(&mut self, kind: TypeKind, items: &[Type]) -> Type {
         let hash = hash(&(kind, items));
         if let Some(types) = self.type_by_hash.get(&hash) {
             for &ty in types.iter() {
@@ -212,7 +236,8 @@ impl Types {
         ty
     }
 
-    pub fn make_array(&mut self, base_type: Type, num_array_elements: usize) -> Type {
+    // Callers responsibility to make sure base_type.size * num_array_elements doesn't overflow (and trap).
+    pub fn array(&mut self, base_type: Type, num_array_elements: usize) -> Type {
         assert!(num_array_elements > 0);
         let hash = hash(&(TypeKind::Array, base_type, num_array_elements));
         if let Some(types) = self.type_by_hash.get(&hash) {
@@ -237,6 +262,29 @@ impl Types {
         ty
     }
 
+    pub fn pointer(&mut self, base_type: Type) -> Type {
+        let hash = hash(&(TypeKind::Pointer, base_type));
+        if let Some(types) = self.type_by_hash.get(&hash) {
+            for &ty in types.iter() {
+                let info = self.info(ty);
+                if info.kind == TypeKind::Pointer && info.base_type == base_type {
+                    return ty;
+                }
+            }
+        }
+        let ty = self.make(TypeKind::Pointer, Intern(0));
+        let ptr = self.info_mut(ty);
+        ptr.size = std::mem::size_of::<*const u8>();
+        ptr.alignment = ptr.size;
+        ptr.base_type = base_type;
+        self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
+        ty
+    }
+
+    pub fn base_type(&self, ty: Type) -> Type {
+        self.info(ty).base_type
+    }
+
     pub fn add_item_to_type(&mut self, ty: Type, name: Intern, item: Type) {
         let (size, alignment) = {
             let item_info = self.info(item);
@@ -255,6 +303,7 @@ impl Types {
         let alignment = info.alignment;
         info.size = (info.size + (alignment - 1)) & !(alignment - 1);
         assert!(info.size & !(alignment - 1) == info.size);
+        assert!(info.size as isize >= 0);
     }
 }
 
