@@ -83,12 +83,11 @@ proc bounds() {
     b := data3[0];
     b := *data3;
 
-
     buf: arr u8 [128] = {};
     buf_ptr := buf; // ptr u8 [128]
     ptr_ptr := &buf_ptr; // ptr (ptr u8), bound erased
     buf_ptr = *ptr_ptr; // fails to type check
-    buf_ptr = *(ptr_ptr:[sizeof(buf)]) // need to manaully rebind
+    buf_ptr = *ptr_ptr:[sizeof(buf)] // need to manaully rebind
 
     // never allowed
     // buf[-1];
@@ -110,4 +109,14 @@ proc bounds() {
         data = alloc(rng());
     }
     // bound is not part of the type proper--so should have the correct bound here either way
+
+    p := {}:Packet;
+    h := p.h; // ptr u8 [(p.h:ptr Header).len]
+
+    pp := &p;
+    h := pp.h; // ptr u8 [(pp.h:ptr Header).len]
+
+    b := buf.buf     // ptr u8 [buf.len]
+    bufp := &buf;    // ptr Buf
+    bb := bufp.buf;  // ptr u8 [bufp.len]
 }

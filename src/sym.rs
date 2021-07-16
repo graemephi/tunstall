@@ -122,7 +122,8 @@ fn resolve(ctx: &mut Compiler, name: Intern) -> Symbol {
     } else {
         // todo: source location of where we are resolving from. push/restore
         error!(ctx, 0, "cannot find {}", ctx.str(name));
-        ctx.symbols.get(&Intern(0)).copied().unwrap()
+        let none = &ctx.intern("_");
+        ctx.symbols.get(none).copied().unwrap()
     }
 }
 

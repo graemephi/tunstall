@@ -564,6 +564,7 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
     } else if from.is_pointer() {
         match to {
             Type::U64|Type::I64|Type::Int => Op::Noop,
+            _ if to.is_pointer() => Op::Noop,
             _ => return None
         }
     } else if to.is_integer() {
@@ -596,15 +597,15 @@ fn store_op_stack(ty: Type) -> Option<Op> {
 
 fn load_op_stack(ty: Type) -> Option<Op> {
     match ty {
-        Type::Bool                    => Some(Op::StackRelativeLoadBool),
-        Type::I8                      => Some(Op::StackRelativeLoadAndSignExtend8),
-        Type::I16                     => Some(Op::StackRelativeLoadAndSignExtend16),
-        Type::I32                     => Some(Op::StackRelativeLoadAndSignExtend32),
-        Type::U8                      => Some(Op::StackRelativeLoad8),
-        Type::U16                     => Some(Op::StackRelativeLoad16),
-        Type::U32                     => Some(Op::StackRelativeLoad32),
-        Type::Int|Type::I64|Type::U64 => Some(Op::Move),
-        _ if ty.is_pointer()          => Some(Op::Move),
+        Type::Bool                              => Some(Op::StackRelativeLoadBool),
+        Type::I8                                => Some(Op::StackRelativeLoadAndSignExtend8),
+        Type::I16                               => Some(Op::StackRelativeLoadAndSignExtend16),
+        Type::I32                               => Some(Op::StackRelativeLoadAndSignExtend32),
+        Type::U8                                => Some(Op::StackRelativeLoad8),
+        Type::U16                               => Some(Op::StackRelativeLoad16),
+        Type::U32|Type::F32                     => Some(Op::StackRelativeLoad32),
+        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Move),
+        _ if ty.is_pointer()                    => Some(Op::Move),
         _ => None
     }
 }
@@ -622,15 +623,15 @@ fn store_op_pointer(ty: Type) -> Option<Op> {
 
 fn load_op_pointer(ty: Type) -> Option<Op> {
     match ty {
-        Type::Bool                    => Some(Op::LoadBool),
-        Type::I8                      => Some(Op::LoadAndSignExtend8),
-        Type::I16                     => Some(Op::LoadAndSignExtend16),
-        Type::I32                     => Some(Op::LoadAndSignExtend32),
-        Type::U8                      => Some(Op::Load8),
-        Type::U16                     => Some(Op::Load16),
-        Type::U32                     => Some(Op::Load32),
-        Type::Int|Type::I64|Type::U64 => Some(Op::Load64),
-        _ if ty.is_pointer()          => Some(Op::Load64),
+        Type::Bool                              => Some(Op::LoadBool),
+        Type::I8                                => Some(Op::LoadAndSignExtend8),
+        Type::I16                               => Some(Op::LoadAndSignExtend16),
+        Type::I32                               => Some(Op::LoadAndSignExtend32),
+        Type::U8                                => Some(Op::Load8),
+        Type::U16                               => Some(Op::Load16),
+        Type::U32|Type::F32                     => Some(Op::Load32),
+        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Load64),
+        _ if ty.is_pointer()                    => Some(Op::Load64),
         _ => None
     }
 }
@@ -732,8 +733,16 @@ struct Local {
 impl Local {
     fn new(loc: Location, ty: Type) -> Local {
         let mut loc = loc;
-        loc.can_assign = true;
-        loc.can_access = true;
+        loc.is_mutable = true;
+        loc.is_place = true;
+        Local { loc, ty }
+    }
+
+    fn argument(loc: Location, ty: Type) -> Local {
+        let mut loc = loc;
+        debug_assert!(loc.is_mutable == false);
+        loc.is_mutable = false;
+        loc.is_place = true;
         Local { loc, ty }
     }
 }
@@ -794,18 +803,29 @@ fn value_fits(value: Option<RegValue>, ty: Type) -> bool {
     }
 }
 
-/// Given a constant of type `value_ty`, determine if it is acceptable to store
-/// it in a `want_ty`. This is distinct from the integer promotion rules. There
-/// is no automatic coercion on writes, except for values known at compile-time
-/// (through constant folding) to fit in the destination.
-fn value_fits_or_types_match(value: Option<RegValue>, value_ty: Type, want_ty: Type) -> bool {
-    value_ty == want_ty || (value_ty == Type::Int && value.is_some() && want_ty.is_integer() && value_fits(value, want_ty))
+fn expr_matches_destination(value: &ExprResult, dest_ty: Type, dest: &Location) -> bool {
+    if value.ty == dest_ty {
+        return true;
+    }
+    if value.ty.is_integer() {
+        if dest_ty == Type::Int {
+            return true;
+        }
+        if value.value.is_some() && value_fits(value.value, dest_ty) {
+            return true;
+        }
+    }
+    if matches!(dest.kind, LocationKind::Register) {
+        return value.ty.is_integer() && dest_ty.is_integer();
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum LocationKind {
     None,
+    Return,
     Register,
     Stack,
     Based,
@@ -816,27 +836,31 @@ pub struct Location {
     base: isize,
     offset: isize,
     kind: LocationKind,
-    can_assign: bool,
-    can_access: bool
+    is_mutable: bool,
+    is_place: bool
 }
 
 impl Location {
     const BAD_LOCATION: isize = isize::MAX;
 
     fn none() -> Location {
-        Location { base: Self::BAD_LOCATION, offset: Self::BAD_LOCATION, kind: LocationKind::None, can_assign: false, can_access: false }
+        Location { base: Self::BAD_LOCATION, offset: Self::BAD_LOCATION, kind: LocationKind::None, is_mutable: false, is_place: false }
     }
 
     fn register(value: isize) -> Location {
-        Location { base: Self::BAD_LOCATION, offset: value, kind: LocationKind::Register, can_assign: false, can_access: false }
+        Location { base: Self::BAD_LOCATION, offset: value, kind: LocationKind::Register, is_mutable: false, is_place: false }
+    }
+
+    fn ret() -> Location {
+        Location { base: Self::BAD_LOCATION, offset: 0, kind: LocationKind::Return, is_mutable: false, is_place: false }
     }
 
     fn stack(offset: isize) -> Location {
-        Location { base: Self::BAD_LOCATION, offset: offset, kind: LocationKind::Stack, can_assign: true, can_access: false }
+        Location { base: Self::BAD_LOCATION, offset: offset, kind: LocationKind::Stack, is_mutable: true, is_place: true }
     }
 
-    fn based(base: isize, offset: isize, can_assign: bool) -> Location {
-        Location { base, offset, kind: LocationKind::Based, can_assign, can_access: false }
+    fn based(base: isize, offset: isize, is_mutable: bool) -> Location {
+        Location { base, offset, kind: LocationKind::Based, is_mutable, is_place: true }
     }
 
     fn offset_by(&self, offset: isize) -> Location {
@@ -1001,6 +1025,7 @@ impl FatGen {
                 Some(v) => self.constant(v),
                 None => Location::BAD_LOCATION
             },
+            LocationKind::Return => 0,
             LocationKind::Register => expr.addr.offset,
             LocationKind::Stack => {
                 if let Some(op) = load_op_stack(expr.ty) {
@@ -1027,12 +1052,21 @@ impl FatGen {
     }
 
     fn location_register(&mut self, location: &Location) -> isize {
-        assert!(location.kind == LocationKind::Based);
-        if location.base != 0 {
-            let offset_register = self.constant(location.offset.into());
-            self.put3_inc(Op::IntAdd, location.base, offset_register)
-        } else {
-            location.base
+        match location.kind {
+            LocationKind::None => Location::BAD_LOCATION,
+            LocationKind::Return => 0,
+            LocationKind::Register => location.offset,
+            LocationKind::Stack => {
+                self.put_inc(Op::LoadStackAddress, location.offset.into())
+            }
+            LocationKind::Based => {
+                if location.offset != 0 {
+                    let offset_register = self.constant(location.offset.into());
+                    self.put3_inc(Op::IntAdd, location.base, offset_register)
+                } else {
+                    location.base
+                }
+            }
         }
     }
 
@@ -1075,7 +1109,7 @@ impl FatGen {
         match dest.kind {
             LocationKind::None => unreachable!(),
             LocationKind::Register => unreachable!(),
-            LocationKind::Stack => {
+            LocationKind::Return|LocationKind::Stack => {
                 self.put2(Op::StackRelativeZero, dest.offset, size);
             }
             LocationKind::Based => {
@@ -1096,6 +1130,15 @@ impl FatGen {
                 let result_register = self.register(src);
                 self.put2(Op::Move, dest.offset, result_register);
             }
+            LocationKind::Return => {
+                if destination_type.is_basic() {
+                    assert_eq!(dest.offset, 0);
+                    let result_register = self.register(src);
+                    self.put2(Op::Move, 0, result_register);
+                } else {
+                    self.put3(Op::StackRelativeCopy, 0, src.addr.offset, size);
+                }
+            },
             LocationKind::Stack => {
                 if let Some(op) = store_op_stack(destination_type) {
                     let result_register = self.register(src);
@@ -1109,7 +1152,7 @@ impl FatGen {
                 let src = &self.emit_constant(src);
 
                 match src.addr.kind {
-                    LocationKind::None => (),
+                    LocationKind::None|LocationKind::Return => (),
                     LocationKind::Register => {
                         if let Some(op) = store_op_pointer(destination_type) {
                             let src = self.register(src);
@@ -1216,10 +1259,14 @@ impl FatGen {
         match ctx.ast.type_expr(expr) {
             TypeExprData::Infer => (unreachable!()),
             TypeExprData::Name(intern) => {
-                result = sym::resolve_type(ctx, intern).ty;
-                let resolve_error = std::mem::take(&mut ctx.error);
-                let old_error = std::mem::take(&mut self.error);
-                self.error = old_error.or(resolve_error);
+                if intern == ctx.intern("ptr") {
+                    result = Type::VoidPtr;
+                } else {
+                    result = sym::resolve_type(ctx, intern).ty;
+                    let resolve_error = std::mem::take(&mut ctx.error);
+                    let old_error = std::mem::take(&mut self.error);
+                    self.error = old_error.or(resolve_error);
+                }
             }
             TypeExprData::Expr(_) => unreachable!(),
             TypeExprData::List(intern, args) => {
@@ -1267,7 +1314,7 @@ impl FatGen {
                                     todo!();
                                 } else {
                                     // todo: type expr location
-                                    error!(self, 0, "ptr bound must be a place")
+                                    error!(self, 0, "ptr bound must be an integer place")
                                 }
                             } else {
                                 error!(self, 0, "argument 2 of ptr type must be a value expression")
@@ -1366,11 +1413,14 @@ impl FatGen {
         self.destination.dest = Some(*dest);
         let mut result = self.expr(ctx, expr);
         self.destination.dest = None;
-        if value_fits_or_types_match(result.value, result.ty, destination_type) {
+        if expr_matches_destination(&result, destination_type, dest) {
             if result.addr != *dest {
                 self.copy(ctx, destination_type, dest, &result);
                 result.addr = *dest;
             }
+        } else {
+            result.addr = Location::none();
+            result.value = None;
         }
         result
     }
@@ -1406,7 +1456,12 @@ impl FatGen {
                 if let Some(ty) = destination_type {
                     // Todo: check for duplicate fields. need to consider unions and fancy paths (both unimplemented)
                     let info = ctx.types.info(ty);
-                    let base = self.destination.dest.unwrap_or_else(|| self.stack_alloc(ctx, ty));
+                    let base;
+                    if fields.is_empty() {
+                        base = self.destination.dest.unwrap_or_else(|| self.stack_alloc(ctx, ty));
+                    } else {
+                        base = self.stack_alloc(ctx, ty);
+                    }
                     let mut path_ctx = PathContext { state: PathContextState::ExpectAny, index: 0 };
                     if matches!(info.kind, TypeKind::Struct|TypeKind::Array) {
                         self.zero(&base, info.size as isize);
@@ -1420,8 +1475,8 @@ impl FatGen {
                                         PathContextState::ExpectPaths =>
                                             error!(self, ctx.ast.expr_source_position(field.value), "incompatible types (field '{}' is of type {}, found {})", ctx.str(item.name), ctx.type_str(item.ty), ctx.type_str(expr.ty)),
                                         PathContextState::ExpectImplict => //|PathContextState::ExpectIndices =>
-                                            error!(self, ctx.ast.expr_source_position(field.value), "incompatible types (arr is of type {}, found {})", ctx.type_str(item.ty), ctx.type_str(expr.ty)),
-                                        _ => todo!()
+                                            error!(self, ctx.ast.expr_source_position(field.value), "incompatible types (slot is of type {}, found {})", ctx.type_str(item.ty), ctx.type_str(expr.ty)),
+                                        _ => todo!("PathContextState::ExpectIndices")
                                     }
                                 }
                             }
@@ -1444,10 +1499,9 @@ impl FatGen {
                             Some(lv) => result.value = Some(unsafe { lv.int + item.offset }.into()),
                             None => {
                                 let base = self.register(&left);
-                                result.addr = Location::based(base, item.offset as isize, left.addr.can_assign);
+                                result.addr = Location::based(base, item.offset as isize, true);
                             }
                         }
-                        // todo: can_assign/can_access?
                         result.ty = item.ty;
                     } else {
                         error!(self, ctx.ast.expr_source_position(left_expr), "no field '{}' on type {}", ctx.str(field), ctx.type_str(left.ty));
@@ -1471,10 +1525,23 @@ impl FatGen {
                         let addr = match index.value {
                             Some(value) => {
                                 let index = unsafe { value.sint };
-                                left.addr.offset_by(index * element_size as isize)
+                                let offset = index * element_size as isize;
+                                if left.ty.is_pointer() {
+                                    // mostly the same code as below
+                                    let offset_reg = self.constant(offset.into());
+                                    let (old_base_reg, old_offset) = if left.addr.kind == LocationKind::Based {
+                                        (left.addr.base, left.addr.offset)
+                                    } else {
+                                        (self.register(&left), 0)
+                                    };
+                                    let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                                    Location::based(base, old_offset, left.addr.is_mutable)
+                                } else {
+                                    left.addr.offset_by(offset)
+                                }
                             }
                             None => {
-                                // This has a weird transposition where, if accessing an array member of a
+                                // This has a transposition where, if accessing an array member of a
                                 // pointer, we update the base pointer, but leave the offset intact.
                                 // In other words, we compute
                                 //      a.b[i]
@@ -1484,19 +1551,19 @@ impl FatGen {
                                 // instead of
                                 //      (a.b + i*sizeof(b[0]))
                                 //       ^base                 ^ offset (0)
-                                // So we can keep accumulating static offsets at compile time.
+                                // So we can keep accumulating static offsets without emitting code.
                                 let size_reg = self.constant(element_size.into());
                                 let index_reg = self.register(&index);
                                 let offset_reg = self.put3_inc(Op::IntMul, index_reg, size_reg);
                                 // TODO: probably fold these 3 cases together and just decay arrays to pointers like an animal
                                 if left.ty.is_pointer() {
-                                    let (old_base_reg, offset) = if left.addr.kind == LocationKind::Based {
+                                    let (old_base_reg, old_offset) = if left.addr.kind == LocationKind::Based {
                                         (left.addr.base, left.addr.offset)
                                     } else {
                                         (self.register(&left), 0)
                                     };
                                     let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
-                                    Location::based(base, offset, left.addr.can_assign)
+                                    Location::based(base, old_offset, left.addr.is_mutable)
                                 } else {
                                     match left.addr.kind {
                                         LocationKind::Stack => {
@@ -1515,6 +1582,7 @@ impl FatGen {
                             }
                         };
                         result.addr = addr;
+                        result.addr.is_place = true;
                         result.ty = base_type;
                     } else {
                         error!(self, ctx.ast.expr_source_position(index_expr), "index must be an integer (found {})", ctx.type_str(index.ty))
@@ -1532,15 +1600,15 @@ impl FatGen {
                 if matches!(op_token, parse::TokenKind::BitAnd|parse::TokenKind::Mul) {
                     if op_token == parse::TokenKind::BitAnd {
                         match right.addr.kind {
-                            LocationKind::None =>
+                            LocationKind::None|LocationKind::Return =>
                                 error!(self, ctx.ast.expr_source_position(right_expr), "cannot take address of this expression"),
-                            LocationKind::Register if !right.addr.can_access =>
+                            LocationKind::Register if !right.addr.is_place =>
                                 error!(self, ctx.ast.expr_source_position(right_expr), "cannot take address of this expression"),
                             LocationKind::Register|LocationKind::Stack => {
                                 let base = right.addr.offset;
                                 // todo: seems weird to be setting these with kind = None
-                                result.addr.can_assign = right.addr.can_assign;
-                                result.addr.can_access = right.addr.can_access;
+                                result.addr.is_mutable = right.addr.is_mutable;
+                                result.addr.is_place = right.addr.is_place;
                                 result.value = Some(base.into());
                             }
                             LocationKind::Based => {
@@ -1554,9 +1622,11 @@ impl FatGen {
                                 Some(offset) => result.addr = Location::stack(unsafe { offset.sint }),
                                 None => {
                                     let right_register = self.register(&right);
-                                    result.addr = Location::based(right_register, 0, right.addr.can_assign);
+                                    result.addr = Location::based(right_register, 0, true);
                                 }
                             }
+                            result.addr.is_mutable = true;
+                            result.addr.is_place = true;
                             result.ty = ctx.types.base_type(right.ty);
                         } else {
                             error!(self, ctx.ast.expr_source_position(right_expr), "cannot dereference {}", ctx.type_str(right.ty));
@@ -1669,27 +1739,39 @@ impl FatGen {
                     for (i, expr) in args.enumerate() {
                         let info = ctx.types.info(addr.ty);
                         let item = info.items[i];
-                        let gen = self.expr(ctx, expr);
+                        let gen = self.expr_with_destination_type(ctx, expr, item.ty);
                         if gen.ty != item.ty {
                             error!(self, ctx.ast.expr_source_position(expr), "argument {} is of type {}, found {}", i, ctx.type_str(item.ty), ctx.type_str(gen.ty));
                             break;
                         }
-                        arg_gens.push(gen);
+                        let reg = self.location_register(&gen.addr);
+                        arg_gens.push((gen, reg));
                     }
-                    for &gen in arg_gens.iter() {
+                    for &(gen, reg) in arg_gens.iter() {
                         match gen.value {
-                            Some(gv) => self.constant(gv),
-                            _ => {
-                                assert!(gen.addr.kind == LocationKind::Register, "todo");
-                                self.put2_inc(Op::Move, gen.addr.offset)
-                            }
+                            Some(_) if gen.ty.is_pointer() => self.register(&gen),
+                            Some(gv) => { assert!(reg == Location::BAD_LOCATION); self.constant(gv) },
+                            _ => self.put2_inc(Op::Move, reg)
                         };
                     }
-                    result.addr.offset = match addr.value {
-                        Some(func) => self.put_inc(Op::Call, func),
+                    result.addr = match addr.value {
+                        Some(func) => {
+                            if return_type.is_basic() {
+                                let dest = self.inc_reg();
+                                self.put(Op::Call, dest, func);
+                                Location::register(dest)
+                            } else {
+                                let (return_size, return_alignment) = {
+                                    let info = ctx.types.info(return_type);
+                                    (info.size, info.alignment)
+                                };
+                                let dest = self.inc_bytes(return_size, return_alignment);
+                                self.put(Op::Call, dest, func);
+                                Location::stack(dest)
+                            }
+                        },
                         _ => todo!()
                     };
-                    result.addr.kind = LocationKind::Register;
                     result.ty = return_type;
                 } else {
                     // TODO: get a string representation of the whole `callable` expr for nicer error message
@@ -1699,6 +1781,14 @@ impl FatGen {
             ExprData::Cast(expr, type_expr) => {
                 let to_ty = self.type_expr(ctx, type_expr);
                 let left = self.expr_with_destination_type(ctx, expr, to_ty);
+                let epxression_transposable = || {
+                    if let ExprData::Unary(parse::TokenKind::BitAnd, inner) = ctx.ast.expr(expr) {
+                        if let ExprData::Compound(_) = ctx.ast.expr(inner) {
+                            return true;
+                        }
+                    }
+                    false
+                };
                 if let Some(op) = convert_op(left.ty, to_ty) {
                     match left.value {
                         Some(_) if left.ty.is_pointer() => result.addr = Location::register(self.register(&left)),
@@ -1718,23 +1808,21 @@ impl FatGen {
                     } else {
                         result.ty = to_ty;
                     }
-                } else if let ExprData::Unary(parse::TokenKind::BitAnd, inner) = ctx.ast.expr(expr) {
-                    if let ExprData::Compound(_) = ctx.ast.expr(inner) {
-                        // The cast-on-the-right synax doesn't work great with taking addresses.
-                        //
-                        // Conceptually, this transposes
-                        //      &{}:Struct
-                        // to
-                        //      &({}:Struct)
-                        //
-                        // We only do this if the above convert_op returns None, as otherwise we cannot distinguish between
-                        //      &a:int / (&a):int
-                        // and
-                        //      &(a:int)
-                        debug_assert!(left.value.is_some());
-                        debug_assert!(left.ty.is_pointer());
-                        result = ExprResult { ty: ctx.types.pointer(to_ty), ..left };
-                    }
+                } else if epxression_transposable() {
+                    // The cast-on-the-right synax doesn't work great with taking addresses.
+                    //
+                    // Conceptually, this transposes
+                    //      &{}:Struct
+                    // to
+                    //      &({}:Struct)
+                    //
+                    // We only do this if the above convert_op returns None, as otherwise we cannot distinguish between
+                    //      &a:int (which is equivalent to (&a):int)
+                    // and
+                    //      &(a:int)
+                    debug_assert!(left.value.is_some());
+                    debug_assert!(left.ty.is_pointer());
+                    result = ExprResult { ty: ctx.types.pointer(to_ty), ..left };
                 } else {
                     error!(self, ctx.ast.expr_source_position(expr), "cannot cast from {} to {}", ctx.type_str(left.ty), ctx.type_str(to_ty));
                 }
@@ -1753,10 +1841,13 @@ impl FatGen {
                 return_type = self.stmts(ctx, body)
             }
             StmtData::Return(Some(expr)) => {
-                let ret_expr = self.expr(ctx, expr);
-                if types_match_with_promotion(ret_expr.ty, self.return_type) {
-                    let reg = self.register(&ret_expr);
-                    self.put2(Op::Return, 0, reg);
+                let ret_expr = self.expr_with_destination(ctx, expr, self.return_type, &Location::ret());
+                if ret_expr.is_ok() {
+                    if self.return_type.is_basic() {
+                        let reg = self.register(&ret_expr);
+                        self.put2(Op::Move, 0, reg);
+                    }
+                    self.put0(Op::Return);
                     return_type = Some(ret_expr.ty);
                 } else {
                     error!(self, ctx.ast.expr_source_position(expr), "type mismatch: expected a return value of type {} (found {})", ctx.type_str(self.return_type), ctx.type_str(ret_expr.ty));
@@ -1953,7 +2044,7 @@ impl FatGen {
                         decl_type = self.type_expr(ctx, ty_expr);
                         expr = self.expr_with_destination_type(ctx, right, decl_type);
                     }
-                    let addr = if expr.addr.can_access {
+                    let addr = if expr.addr.is_place {
                         self.copy_to_stack(ctx, &expr)
                     } else {
                         self.emit_constant(&expr).addr
@@ -1973,13 +2064,14 @@ impl FatGen {
             }
             StmtData::Assign(left, right) => {
                 let lv = self.expr(ctx, left);
-                if lv.addr.can_assign {
+                if lv.addr.is_mutable {
                     let value = self.expr_with_destination(ctx, right, lv.ty, &lv.addr);
                     if !value.is_ok() {
                         error!(self, ctx.ast.expr_source_position(left), "type mismatch between destination ({}) and value ({})", ctx.type_str(lv.ty), ctx.type_str(value.ty))
                     }
                 } else {
-                    error!(self, ctx.ast.expr_source_position(left), "cannot assign to {}", ctx.ast.expr(left));
+                    // todo: terrible error message
+                    error!(self, ctx.ast.expr_source_position(left), "{} is not mutable", ctx.ast.expr(left));
                 }
             }
         }
@@ -2013,10 +2105,19 @@ impl FatGen {
         let param_types = sig.items.iter().map(|i| i.ty);
         for (name, ty) in Iterator::zip(param_names, param_types) {
             let reg = self.inc_reg();
-            self.locals.insert(name, Local::new(Location::register(reg), ty));
+            let loc = if ty.is_basic() {
+                Location::register(reg)
+            } else {
+                Location::based(reg, 0, false)
+            };
+            self.locals.insert(name, Local::argument(loc, ty));
         }
-        let return_register = self.inc_reg();
-        assert_eq!(return_register, 0);
+        let (return_size, return_alignment) = {
+            let info = ctx.types.info(self.return_type);
+            (info.size, info.alignment)
+        };
+        let return_dest = self.inc_bytes(return_size, return_alignment);
+        assert_eq!(return_dest, 0);
         let returned = self.stmts(ctx, body);
         if matches!(returned, None) {
             let func = ctx.ast.callable(decl);
@@ -2144,7 +2245,7 @@ impl Compiler {
         let mut code = &self.entry_stub[..];
         let mut sp: usize = 0;
         let mut ip: usize = 0;
-        let mut call_stack = vec![(code, ip, sp, 0)];
+        let mut call_stack = vec![(code, ip, sp)];
 
         // The VM allows taking (real!) pointers to addresses on the VM stack. These are
         // immediately invalidated by taking a _reference_ to the stack. Solution: never
@@ -2278,10 +2379,9 @@ impl Compiler {
                         code = ret.0;
                         ip = ret.1;
                         sp = ret.2;
-                        reg![ret.3] = reg![left];
                     },
                     Op::Call          => {
-                        call_stack.push((code, ip, sp, dest));
+                        call_stack.push((code, ip, sp));
                         let f = self.funcs.get(&Intern(instr.left as u32)).expect("Bad bytecode");
                         code = &f.code[..];
                         ip = !0;
@@ -2383,7 +2483,28 @@ fn repl() {
 }
 
 fn main() {
-    // arr();
+    let ok = [
+        (r#"
+        struct V2 { x: i32, y: i32 }
+
+        func add(a: V2, b: V2): V2 {
+            return { (a.x + a.x):i32, (a.y + b.y):i32 };
+        }
+
+        func main(): int {
+            v := add({1, 2}, {3, 4});
+            return v.y:int;
+        }
+        "#, Value::Int(6)),
+        ];
+    for test in ok.iter() {
+        let str = test.0;
+        let expect = test.1;
+        compile_and_run(str)
+            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
+            .map_err(|e| { println!("input: \"{}\"", str); e })
+            .unwrap();
+    }
     repl();
 }
 
@@ -2596,7 +2717,30 @@ func odd(n: int): bool {
 func main(): int {
     return even(10):int;
 }
-"#, Value::Int(1))
+"#, Value::Int(1)),
+(r#"
+struct V2 { x: f32, y: f32 }
+
+func dot(a: V2, b: V2): f32 {
+    return a.x*b.x + a.y*b.y;
+}
+
+func main(): int {
+    return dot({ 1.0, 2.0 }, { 3.0, 4.0 }):i32;
+}
+"#, Value::Int(3+8)),
+(r#"
+struct V2 { x: i32, y: i32 }
+
+func add(a: V2, b: V2): V2 {
+    return { (a.x + b.x):i32, (a.y + b.y):i32 };
+}
+
+func main(): int {
+    v := add({1, 2}, {3, 4});
+    return v.y;
+}
+"#, Value::Int(2+4))
     ];
     for test in ok.iter() {
         let str = test.0;
@@ -2722,7 +2866,15 @@ func main(): int {
         }
     } while (a < 10);
     return a;
-}"#, Value::Int(14))
+}"#, Value::Int(14)),
+(r#"
+func main(): int {
+    a := 1;
+    b := 2;
+    c := 3;
+    (a == 1 ? b :: c) = 4;
+    return b;
+}"#, Value::Int(4))
     ];
     for test in ok.iter() {
         let str = test.0;
@@ -3009,6 +3161,51 @@ func main(): int {
     return acc;
 }
 "#, Value::Int(8)),
+(r#"
+struct Buf {
+    buf: ptr u8,
+    len: int
+}
+func main(): int {
+    arr := {}:arr u8 [8];
+    arr[1] = 1;
+    buf: Buf = { &arr[0], 8 };
+    return buf.buf[1];
+}
+"#, Value::Int(1)),
+(r#"
+struct A {
+    padding: arr i16 [9],
+    b: ptr B
+}
+struct B {
+    padding: arr i16 [3],
+    c: ptr C
+}
+struct C {
+    padding: i16,
+    d: ptr i32
+}
+func main(): int {
+    d := -1234;
+    c: C = {d=&d:ptr(i32)};
+    b: B = {c=&c};
+    a: A = {b=&b};
+    return *a.b.c.d;
+}
+"#, Value::Int(-1234)),
+(r#"
+struct V2 { x: i32, y: i32 }
+func rot(v: ptr V2): int {
+    *v = { (-v.y):i32, v.x };
+    return 0;
+}
+func main(): int {
+    v: V2 = {0,1};
+    rot(&v);
+    return v.x;
+}
+"#, Value::Int(-1)),
 ];
     let err = [r#""
 func main(): int {

@@ -116,10 +116,15 @@ pub enum TypeKind {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Bound {
-    None,
-    Constant(usize),
-    Offset(usize),
-    Indirect(usize, usize)
+    Constant(isize),
+    Offset(isize),
+    Indirect(isize, isize)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BoundType {
+    Free(Type),
+    Bound(Type, Bound)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,7 +132,6 @@ pub struct Item {
     pub name: Intern,
     pub ty: Type,
     pub offset: usize,
-    pub bound: Bound,
 }
 
 #[derive(Clone, Debug)]
@@ -198,7 +202,6 @@ impl Types {
                         name: Intern(0),
                         ty: info.base_type,
                         offset: index * element_size,
-                        bound: Bound::Constant(info.num_array_elements - index)
                     })
                 } else {
                     None
@@ -305,7 +308,7 @@ impl Types {
         assert!(offset & !(alignment - 1) == offset);
         info.size = offset + size;
         info.alignment = info.alignment.max(alignment);
-        info.items.push(Item { name, ty: item, offset, bound: Bound::None });
+        info.items.push(Item { name, ty: item, offset });
     }
 
     pub fn complete_type(&mut self, ty: Type) {
@@ -353,6 +356,12 @@ struct Padding2 {
     c: i16,
 }
 
+struct Ptr {
+    a: ptr,
+    b: ptr u8,
+    c: ptr int
+}
+
 func main(): int { return 0; }
     "#;
 
@@ -361,14 +370,18 @@ func main(): int { return 0; }
     let rect = c.intern("Rect");
     let rect2 = c.intern("Rect2");
     let arr = c.intern("Arr");
+    let ptr = c.intern("Ptr");
     let padding = c.intern("Padding");
     let padding2 = c.intern("Padding2");
+
+    let int_ptr = c.types.pointer(Type::Int);
 
     let get = |name: Intern| c.symbols.get(&name).map(|sym| c.types.info(sym.ty)).unwrap();
     let v2 = get(v2);
     let rect = get(rect);
     let rect2 = get(rect2);
     let arr = get(arr);
+    let ptr = get(ptr);
     let padding = get(padding);
     let padding2 = get(padding2);
 
@@ -412,6 +425,13 @@ func main(): int { return 0; }
     assert_eq!(aoi.alignment, 4);
     assert_eq!(aoi.base_type, Type::I32);
     assert_eq!(aoi.num_array_elements, 3);
+
+    assert_eq!(ptr.kind, TypeKind::Struct);
+    assert_eq!(ptr.size, 24);
+    assert_eq!(ptr.alignment, 8);
+    assert_eq!(ptr.items[0].ty, Type::VoidPtr);
+    assert_eq!(ptr.items[1].ty, Type::U8Ptr);
+    assert_eq!(ptr.items[2].ty, int_ptr);
 
     assert_eq!(padding.size, 24);
     assert_eq!(padding.alignment, 8);
