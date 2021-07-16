@@ -15,7 +15,7 @@ func syntax(a: int, b: int): int
     m := a: int & b;      // a & b
     n: ptr int = &a: int; //
     o: int = (&a): int;   // (int)(&a);
-    p: ptr (ptr int) = &&a;
+    p: ptr (ptr int) = &n;
 
 
     // add: func (int, int) int (1,2)          // funcs always have a return type
@@ -27,45 +27,87 @@ func syntax(a: int, b: int): int
     v: V2 = { x = 0.0, y = 0.0 };
     v: V2 = { x = 0.0, y = 0.0 }:V2;
 
-    anon := { a = 0, b = 0 }:struct { a: i32, y: i32 };
+    anon := { a = 0, b = 0 }:struct { a: i32, b: i32 };
 
     return r;
 }
 
-struct Blah {
-    a: Map i32 (Map Agh i32)
-}
-
-struct Slice T {
-    buf: ptr T,
-    len: int
+struct Buf {
+    buf: ptr u8 [cap],
+    len: int,
     cap: int
 }
 
-struct Func V {
-    func: ptr _ -> V,
-    userdata: ptr _
+proc buf_copy(buf: ptr Buf, dest: ptr u8 [buf.len]) {
+    // checks buf.len < buf.cap
+    memcpy(dest, buf.buf, buf.len)
 }
 
-struct Map K V {
-    values: ptr K,
-    keys: ptr V,
-    hashes: ptr u64,
-    // ...
+// bounds are checked at call site
+proc memcpy(dest: ptr u8 [len], src: ptr u8 [len], len: int) {
+    // dest and src shared a bound so no bounds checking
 }
 
-// lean style ?
-proc map_put { K, V: Type } [Hashable K] (map: ptr (Map K V), key: K, value: V) {
-
+proc alloc(size: int): ptr u8 [size] {
+    // impl doesn't matter, but size in type needs to be transferred to callers view of arguments on return
 }
 
-struct Agh {
-    x, y: i32
+struct Header {
+    len: int;
 }
 
+struct Packet {
+    h: ptr u8 [(h:ptr Header).len];
+}
 
-const len := 3;
-a := { 0, 1, 2 } : int [len]
-b := { 0, 1, 2, 3 } : int [len + 1]
-d := &a : ptr (int [len]);
-c := &a[0] : ptr int [len];
+proc bounds() {
+    buf := {}:Buf;
+    // data's type is ptr u8 [anonymous register holding load of buf.len]
+    data := alloc(buf.len);
+    // we can't use buf.len directly, as it could change in the call to buf_copy (no smarts) and data is its own allocation
+    // type checks, bound check can be optimized out
+    buf_copy(&buf, data);
+
+    // data2's type is ptr u8 [anonymous register holding result of rng()]
+    data2 := alloc(rng());
+    // type checks and inserts buf.len and data2 len bounds check
+    buf_copy(&buf, data2);
+
+    data3 := ptr_from_ether();
+    // data3 is unbound, so these fails to typecheck
+    // b := data3[2];
+    // buf_copy(&buf, data3);
+    // shorthand for data:ptr u8 [buf.len]
+    buf_copy(&buf, data3:[buf.len]);
+    // These are okay
+    b := data3[0];
+    b := *data3;
+
+
+    buf: arr u8 [128] = {};
+    buf_ptr := buf; // ptr u8 [128]
+    ptr_ptr := &buf_ptr; // ptr (ptr u8), bound erased
+    buf_ptr = *ptr_ptr; // fails to type check
+    buf_ptr = *(ptr_ptr:[sizeof(buf)]) // need to manaully rebind
+
+    // never allowed
+    // buf[-1];
+    // do pointer arthimetic instead
+    b := (buf - 1)[0];
+    // Update bounds when both are known
+    ptr := buf - 1; // ptr u8 [128 - -1]
+    ptr := buf + 1; // ptr u8 [128 - 1]
+    ptr := &buf[1]; // ptr u8 [128 - 1]
+    i := rng();
+    ptr := &buf[i]; // ptr u8, bounds checked on assignment
+    ptr := buf + i; // ptr u8, not bounds checked
+
+    data: ptr = 0;
+    if (rng()&1 == 1) {
+        // bounded assigned to unbounded, data becomes bounded
+        data = alloc(buf.len);
+    } else {
+        data = alloc(rng());
+    }
+    // bound is not part of the type proper--so should have the correct bound here either way
+}

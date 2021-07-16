@@ -58,6 +58,7 @@ macro_rules! define_node_list {
 pub struct CompoundField(u32);
 define_node_list!(CompoundField, CompoundFieldList, CompoundFieldListIter);
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum CompoundPath {
     Implicit,
@@ -218,6 +219,7 @@ impl DeclData {
         }
     }
 
+    #[allow(dead_code)]
     pub fn items(&self) -> ItemList {
         match &self {
             DeclData::Callable(decl) => decl.params,

@@ -38,8 +38,8 @@ pub fn builtins(ctx: &mut Compiler) {
 
     let voidptr = ctx.types.pointer(Type::None);
     let u8ptr = ctx.types.pointer(Type::U8);
-    debug_assert_eq!(voidptr, Type::VoidPtr);
-    debug_assert_eq!(u8ptr, Type::U8Ptr);
+    assert_eq!(voidptr, Type::VoidPtr);
+    assert_eq!(u8ptr, Type::U8Ptr);
 }
 
 #[derive(Copy, Clone, Default, PartialEq, Eq, Debug, Hash)]
@@ -115,10 +115,19 @@ pub enum TypeKind {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum Bound {
+    None,
+    Constant(usize),
+    Offset(usize),
+    Indirect(usize, usize)
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Item {
     pub name: Intern,
     pub ty: Type,
-    pub offset: usize
+    pub offset: usize,
+    pub bound: Bound,
 }
 
 #[derive(Clone, Debug)]
@@ -188,7 +197,8 @@ impl Types {
                     Some(Item {
                         name: Intern(0),
                         ty: info.base_type,
-                        offset: index * element_size
+                        offset: index * element_size,
+                        bound: Bound::Constant(info.num_array_elements - index)
                     })
                 } else {
                     None
@@ -295,7 +305,7 @@ impl Types {
         assert!(offset & !(alignment - 1) == offset);
         info.size = offset + size;
         info.alignment = info.alignment.max(alignment);
-        info.items.push(Item { name, ty: item, offset });
+        info.items.push(Item { name, ty: item, offset, bound: Bound::None });
     }
 
     pub fn complete_type(&mut self, ty: Type) {

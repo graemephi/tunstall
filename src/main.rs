@@ -128,6 +128,9 @@ impl Interns {
     }
 }
 
+// If the compiler was a library we'd need this. As an application this just
+// wastes time at exit
+#[cfg(test)]
 impl Drop for Interns {
     fn drop(&mut self) {
         unsafe { if self.bufs.is_null() == false { Box::from_raw(self.bufs); } }
@@ -801,15 +804,15 @@ fn value_fits_or_types_match(value: Option<RegValue>, value_ty: Type, want_ty: T
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-enum LocationKind {
+pub enum LocationKind {
     None,
     Register,
     Stack,
-    Pointer,
+    Based,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Location {
+pub struct Location {
     base: isize,
     offset: isize,
     kind: LocationKind,
@@ -832,12 +835,12 @@ impl Location {
         Location { base: Self::BAD_LOCATION, offset: offset, kind: LocationKind::Stack, can_assign: true, can_access: false }
     }
 
-    fn pointer(base: isize, offset: isize, can_assign: bool) -> Location {
-        Location { base, offset, kind: LocationKind::Pointer, can_assign, can_access: false }
+    fn based(base: isize, offset: isize, can_assign: bool) -> Location {
+        Location { base, offset, kind: LocationKind::Based, can_assign, can_access: false }
     }
 
     fn offset_by(&self, offset: isize) -> Location {
-        debug_assert_implies!(offset > 0, matches!(self.kind, LocationKind::Stack|LocationKind::Pointer));
+        debug_assert_implies!(offset > 0, matches!(self.kind, LocationKind::Stack|LocationKind::Based));
         let mut result = *self;
         result.offset += offset;
         result
@@ -880,7 +883,7 @@ enum PathContextState {
     ExpectAny,
     ExpectImplict,
     ExpectPaths,
-    ExpectIndices,
+    // ExpectIndices,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1011,7 +1014,7 @@ impl FatGen {
                     Location::BAD_LOCATION
                 }
             }
-            LocationKind::Pointer => {
+            LocationKind::Based => {
                 if let Some(op) = load_op_pointer(expr.ty) {
                     let ptr = self.location_register(&expr.addr);
                     self.put2_inc(op, ptr)
@@ -1024,7 +1027,7 @@ impl FatGen {
     }
 
     fn location_register(&mut self, location: &Location) -> isize {
-        assert!(location.kind == LocationKind::Pointer);
+        assert!(location.kind == LocationKind::Based);
         if location.base != 0 {
             let offset_register = self.constant(location.offset.into());
             self.put3_inc(Op::IntAdd, location.base, offset_register)
@@ -1068,6 +1071,21 @@ impl FatGen {
         self.put_inc(Op::Immediate, value)
     }
 
+    fn zero(&mut self, dest: &Location, size: isize) {
+        match dest.kind {
+            LocationKind::None => unreachable!(),
+            LocationKind::Register => unreachable!(),
+            LocationKind::Stack => {
+                self.put2(Op::StackRelativeZero, dest.offset, size);
+            }
+            LocationKind::Based => {
+                let dest_addr_register = self.location_register(dest);
+                let size_register = self.constant(size.into());
+                self.put2(Op::Zero, dest_addr_register, size_register);
+            }
+        }
+    }
+
     fn copy(&mut self, ctx: &Compiler, destination_type: Type, dest: &Location, src: &ExprResult) {
         let size = ctx.types.info(destination_type).size as isize;
         let alignment = ctx.types.info(destination_type).alignment as isize;
@@ -1086,7 +1104,7 @@ impl FatGen {
                     self.put3(Op::StackRelativeCopy, dest.offset, src.addr.offset, size);
                 }
             }
-            LocationKind::Pointer => {
+            LocationKind::Based => {
                 let dest_addr_register = self.location_register(dest);
                 let src = &self.emit_constant(src);
 
@@ -1105,7 +1123,7 @@ impl FatGen {
                         let size_register = self.constant(size.into());
                         self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
                     }
-                    LocationKind::Pointer => {
+                    LocationKind::Based => {
                         let src_addr_register = self.location_register(&src.addr);
                         let size_register = self.constant(size.into());
                         self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
@@ -1213,6 +1231,8 @@ impl FatGen {
                             if let TypeExprData::Expr(len_expr) = ctx.ast.type_expr(len_expr) {
                                 let len = self.constant_expr(ctx, len_expr);
                                 if len.ty.is_integer() && len.value.is_some() {
+                                    // TODO: This convert op is a roundabout way to check for the positive+fits condition
+                                    // but should be more direct/less subtle
                                     if let Some(op) = convert_op(len.ty, Type::Int) {
                                         let value = apply_unary_op(op, len.value.unwrap());
                                         if unsafe { value.sint } > 0 {
@@ -1230,12 +1250,35 @@ impl FatGen {
                             } else {
                                 error!(self, 0, "argument 2 of arr type must be a value expression")
                             }
-                        } else { // Some(len_expr) != args.next()
+                        } else /* Some(len_expr) != args.next() */ {
                             // infer?
                             todo!();
                         }
                     } else {
                         error!(self, 0, "type arr takes 2 arguments, base type and [length]")
+                    }
+                } else if intern == ctx.intern("ptr") {
+                    if let Some(ty_expr) = args.next() {
+                        let ty = self.type_expr(ctx, ty_expr);
+                        if let Some(bound_expr) = args.next() {
+                            if let TypeExprData::Expr(bound_expr) = ctx.ast.type_expr(bound_expr) {
+                                let bound = self.constant_expr(ctx, bound_expr);
+                                if bound.ty.is_integer() {
+                                    todo!();
+                                } else {
+                                    // todo: type expr location
+                                    error!(self, 0, "ptr bound must be a place")
+                                }
+                            } else {
+                                error!(self, 0, "argument 2 of ptr type must be a value expression")
+                            }
+                        } else /* Some(len_expr) != args.next() */ {
+                            // unbounded
+                            result = ctx.types.pointer(ty);
+                        }
+                    } else {
+                        // untyped
+                        result = Type::VoidPtr;
                     }
                 }
             }
@@ -1285,7 +1328,7 @@ impl FatGen {
                     None
                 }
             }
-            CompoundPath::Index(index) => {
+            CompoundPath::Index(_index) => {
                 todo!();
             }
         }
@@ -1366,7 +1409,7 @@ impl FatGen {
                     let base = self.destination.dest.unwrap_or_else(|| self.stack_alloc(ctx, ty));
                     let mut path_ctx = PathContext { state: PathContextState::ExpectAny, index: 0 };
                     if matches!(info.kind, TypeKind::Struct|TypeKind::Array) {
-                        self.put2(Op::StackRelativeZero, base.offset, info.size as isize);
+                        self.zero(&base, info.size as isize);
                         for field in fields {
                             let field = ctx.ast.compound_field(field);
                             if let Some(item) = self.path(ctx, &mut path_ctx, ty, field.path) {
@@ -1376,7 +1419,7 @@ impl FatGen {
                                     match path_ctx.state {
                                         PathContextState::ExpectPaths =>
                                             error!(self, ctx.ast.expr_source_position(field.value), "incompatible types (field '{}' is of type {}, found {})", ctx.str(item.name), ctx.type_str(item.ty), ctx.type_str(expr.ty)),
-                                        PathContextState::ExpectImplict|PathContextState::ExpectIndices =>
+                                        PathContextState::ExpectImplict => //|PathContextState::ExpectIndices =>
                                             error!(self, ctx.ast.expr_source_position(field.value), "incompatible types (arr is of type {}, found {})", ctx.type_str(item.ty), ctx.type_str(expr.ty)),
                                         _ => todo!()
                                     }
@@ -1401,7 +1444,7 @@ impl FatGen {
                             Some(lv) => result.value = Some(unsafe { lv.int + item.offset }.into()),
                             None => {
                                 let base = self.register(&left);
-                                result.addr = Location::pointer(base, item.offset as isize, left.addr.can_assign);
+                                result.addr = Location::based(base, item.offset as isize, left.addr.can_assign);
                             }
                         }
                         // todo: can_assign/can_access?
@@ -1410,7 +1453,7 @@ impl FatGen {
                         error!(self, ctx.ast.expr_source_position(left_expr), "no field '{}' on type {}", ctx.str(field), ctx.type_str(left.ty));
                     }
                 } else if let Some(item) = ctx.types.item_info(left.ty, field) {
-                    debug_assert_implies!(self.error.is_none(), matches!(left.addr.kind, LocationKind::Stack|LocationKind::Pointer));
+                    debug_assert_implies!(self.error.is_none(), matches!(left.addr.kind, LocationKind::Stack|LocationKind::Based));
                     result.addr = left.addr;
                     result.addr.offset += item.offset as isize;
                     result.ty = item.ty;
@@ -1420,24 +1463,58 @@ impl FatGen {
             }
             ExprData::Index(left_expr, index_expr) => {
                 let left = self.expr(ctx, left_expr);
-                if ctx.types.info(left.ty).kind == TypeKind::Array {
+                if matches!(ctx.types.info(left.ty).kind, TypeKind::Array|TypeKind::Pointer) {
                     let base_type = ctx.types.base_type(left.ty);
                     let index = self.expr(ctx, index_expr);
                     if index.ty.is_integer() {
                         let element_size = ctx.types.info(base_type).size;
-                        let index = match index.value {
-                            Some(value) => unsafe { value.sint },
+                        let addr = match index.value {
+                            Some(value) => {
+                                let index = unsafe { value.sint };
+                                left.addr.offset_by(index * element_size as isize)
+                            }
                             None => {
-                                // let size_reg = self.put_inc(Op::Immediate, element_size.into());
-                                // let offset_reg = self.put_inc(Op::IntMul, (index.reg, size_reg).into());
-                                // let addr_reg = self.put_inc(Op::IntAdd, (left.reg, offset_reg).into());
-                                // this creates is a pointer
-                                todo!();
+                                // This has a weird transposition where, if accessing an array member of a
+                                // pointer, we update the base pointer, but leave the offset intact.
+                                // In other words, we compute
+                                //      a.b[i]
+                                // as
+                                //      (a +   i*sizeof(b[0])).b
+                                //       ^ base                ^ offset
+                                // instead of
+                                //      (a.b + i*sizeof(b[0]))
+                                //       ^base                 ^ offset (0)
+                                // So we can keep accumulating static offsets at compile time.
+                                let size_reg = self.constant(element_size.into());
+                                let index_reg = self.register(&index);
+                                let offset_reg = self.put3_inc(Op::IntMul, index_reg, size_reg);
+                                // TODO: probably fold these 3 cases together and just decay arrays to pointers like an animal
+                                if left.ty.is_pointer() {
+                                    let (old_base_reg, offset) = if left.addr.kind == LocationKind::Based {
+                                        (left.addr.base, left.addr.offset)
+                                    } else {
+                                        (self.register(&left), 0)
+                                    };
+                                    let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                                    Location::based(base, offset, left.addr.can_assign)
+                                } else {
+                                    match left.addr.kind {
+                                        LocationKind::Stack => {
+                                            let old_base_reg = self.put_inc(Op::LoadStackAddress, left.addr.offset.into());
+                                            let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                                            Location { base, offset: 0, kind: LocationKind::Based, ..left.addr }
+                                        }
+                                        LocationKind::Based => {
+                                            let old_base_reg = left.addr.base;
+                                            let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                                            Location { base, ..left.addr }
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                }
                             }
                         };
-                        result.addr.offset = left.addr.offset + index * element_size as isize;
-                        result.addr.kind = left.addr.kind;
-                        result.addr.can_assign = left.addr.can_assign;
+                        result.addr = addr;
                         result.ty = base_type;
                     } else {
                         error!(self, ctx.ast.expr_source_position(index_expr), "index must be an integer (found {})", ctx.type_str(index.ty))
@@ -1466,7 +1543,7 @@ impl FatGen {
                                 result.addr.can_access = right.addr.can_access;
                                 result.value = Some(base.into());
                             }
-                            LocationKind::Pointer => {
+                            LocationKind::Based => {
                                 result.addr = Location::register(self.location_register(&right.addr));
                             }
                         }
@@ -1477,7 +1554,7 @@ impl FatGen {
                                 Some(offset) => result.addr = Location::stack(unsafe { offset.sint }),
                                 None => {
                                     let right_register = self.register(&right);
-                                    result.addr = Location::pointer(right_register, 0, right.addr.can_assign);
+                                    result.addr = Location::based(right_register, 0, right.addr.can_assign);
                                 }
                             }
                             result.ty = ctx.types.base_type(right.ty);
@@ -1663,8 +1740,9 @@ impl FatGen {
                 }
             }
         };
-        assert_implies!(self.error.is_none() && result.addr.offset == Location::BAD_LOCATION, result.addr.kind == LocationKind::None);
-        assert_implies!(self.error.is_none() && result.addr.offset != Location::BAD_LOCATION, result.addr.kind != LocationKind::None);
+        debug_assert_implies!(self.error.is_none() && result.addr.offset == Location::BAD_LOCATION, result.addr.kind == LocationKind::None);
+        debug_assert_implies!(self.error.is_none() && result.addr.offset != Location::BAD_LOCATION, result.addr.kind != LocationKind::None);
+        debug_assert_implies!(self.error.is_none() && result.addr.base != Location::BAD_LOCATION, result.addr.kind == LocationKind::Based);
         result
     }
 
@@ -2041,7 +2119,7 @@ impl Compiler {
     }
 
     fn type_str(&self, ty: Type) -> &str {
-        // TODO: String representation of anoymous types
+        // TODO: String representation of anonymous types
         self.str(self.types.info(ty).name)
     }
 
@@ -2066,13 +2144,30 @@ impl Compiler {
         let mut code = &self.entry_stub[..];
         let mut sp: usize = 0;
         let mut ip: usize = 0;
-        let mut stack = [0u8; 8192];
         let mut call_stack = vec![(code, ip, sp, 0)];
 
+        // The VM allows taking (real!) pointers to addresses on the VM stack. These are
+        // immediately invalidated by taking a _reference_ to the stack. Solution: never
+        // take a reference to the stack (even one immediately turned into a pointer).
+
+        // This just ensures the compiler knows the correct invariants involved, it
+        // doesn't make the vm sound
+
+        // MIRI shits the bed if this is on the stack
+        let layout = std::alloc::Layout::array::<RegValue>(8192).unwrap();
+        let stack: *mut [u8] = unsafe {
+            let ptr = std::alloc::alloc(layout);
+            std::slice::from_raw_parts_mut(ptr, layout.size())
+        };
+
+        // Access the stack by byte
         macro_rules! stack {
-            ($addr:expr) => {
-                *std::mem::transmute::<&mut u8, &mut RegValue>(&mut stack[$addr])
-            }
+            ($addr:expr) => { (*stack)[$addr] }
+        }
+
+        // Access the stack by register. Register accesses must be aligned correctly (asserted below)
+        macro_rules! reg {
+            ($addr:expr) => { *(std::ptr::addr_of_mut!(stack![$addr]) as *mut RegValue) }
         }
 
         loop {
@@ -2081,109 +2176,109 @@ impl Compiler {
             let left = sp.wrapping_add(sign_extend(instr.left));
             let right = sp.wrapping_add(sign_extend(instr.right));
 
-            debug_assert_implies!(requires_register_destination(instr.op), (dest & (FatGen::REGISTER_SIZE - 1)) == 0);
+            assert_implies!(requires_register_destination(instr.op), (dest & (FatGen::REGISTER_SIZE - 1)) == 0);
 
             unsafe {
                  match instr.op {
                     Op::Halt       => { break; }
                     Op::Noop       => {}
-                    Op::Immediate  => { stack![dest] = RegValue::from((instr.left, instr.right)); }
-                    Op::IntNeg     => { stack![dest].sint = -stack![left].sint; }
-                    Op::IntAdd     => { stack![dest].wint = stack![left].wint + stack![right].wint; }
-                    Op::IntSub     => { stack![dest].wint = stack![left].wint - stack![right].wint; }
-                    Op::IntMul     => { stack![dest].wint = stack![left].wint * stack![right].wint; }
-                    Op::IntDiv     => { stack![dest].wint = stack![left].wint / stack![right].wint; }
-                    Op::IntMod     => { stack![dest].wint = stack![left].wint % stack![right].wint; }
-                    Op::IntLt      => { stack![dest].int = (stack![left].int < stack![right].int) as usize; }
-                    Op::IntGt      => { stack![dest].int = (stack![left].int > stack![right].int) as usize; }
-                    Op::IntEq      => { stack![dest].int = (stack![left].int == stack![right].int) as usize; }
-                    Op::IntNEq     => { stack![dest].int = (stack![left].int != stack![right].int) as usize; }
-                    Op::IntLtEq    => { stack![dest].int = (stack![left].int <= stack![right].int) as usize; }
-                    Op::IntGtEq    => { stack![dest].int = (stack![left].int >= stack![right].int) as usize; }
-                    Op::BitNeg     => { stack![dest].int = !stack![left].int }
-                    Op::BitAnd     => { stack![dest].int = stack![left].int & stack![right].int; }
-                    Op::BitOr      => { stack![dest].int = stack![left].int | stack![right].int; }
-                    Op::BitXor     => { stack![dest].int = stack![left].int ^ stack![right].int; }
+                    Op::Immediate  => { reg![dest] = RegValue::from((instr.left, instr.right)); }
+                    Op::IntNeg     => { reg![dest].sint = -reg![left].sint; }
+                    Op::IntAdd     => { reg![dest].wint = reg![left].wint + reg![right].wint; }
+                    Op::IntSub     => { reg![dest].wint = reg![left].wint - reg![right].wint; }
+                    Op::IntMul     => { reg![dest].wint = reg![left].wint * reg![right].wint; }
+                    Op::IntDiv     => { reg![dest].wint = reg![left].wint / reg![right].wint; }
+                    Op::IntMod     => { reg![dest].wint = reg![left].wint % reg![right].wint; }
+                    Op::IntLt      => { reg![dest].int = (reg![left].int < reg![right].int) as usize; }
+                    Op::IntGt      => { reg![dest].int = (reg![left].int > reg![right].int) as usize; }
+                    Op::IntEq      => { reg![dest].int = (reg![left].int == reg![right].int) as usize; }
+                    Op::IntNEq     => { reg![dest].int = (reg![left].int != reg![right].int) as usize; }
+                    Op::IntLtEq    => { reg![dest].int = (reg![left].int <= reg![right].int) as usize; }
+                    Op::IntGtEq    => { reg![dest].int = (reg![left].int >= reg![right].int) as usize; }
+                    Op::BitNeg     => { reg![dest].int = !reg![left].int }
+                    Op::BitAnd     => { reg![dest].int = reg![left].int & reg![right].int; }
+                    Op::BitOr      => { reg![dest].int = reg![left].int | reg![right].int; }
+                    Op::BitXor     => { reg![dest].int = reg![left].int ^ reg![right].int; }
 
-                    Op::LShift     => { stack![dest].int = stack![left].int << stack![right].int; }
-                    Op::RShift     => { stack![dest].int = stack![left].int >> stack![right].int; }
+                    Op::LShift     => { reg![dest].int = reg![left].int << reg![right].int; }
+                    Op::RShift     => { reg![dest].int = reg![left].int >> reg![right].int; }
 
-                    Op::Not        => { stack![dest].int = (stack![left].int == 0) as usize; }
-                    Op::CmpZero    => { stack![dest].int = (stack![left].int != 0) as usize; }
-                    Op::LogicOr    => { stack![dest].int = (stack![left].b8.0 || stack![right].b8.0) as usize; }
-                    Op::LogicAnd   => { stack![dest].int = (stack![left].b8.0 && stack![right].b8.0) as usize; }
+                    Op::Not        => { reg![dest].int = (reg![left].int == 0) as usize; }
+                    Op::CmpZero    => { reg![dest].int = (reg![left].int != 0) as usize; }
+                    Op::LogicOr    => { reg![dest].int = (reg![left].b8.0 || reg![right].b8.0) as usize; }
+                    Op::LogicAnd   => { reg![dest].int = (reg![left].b8.0 && reg![right].b8.0) as usize; }
 
-                    Op::F32Neg     => { stack![dest].float32.0 = -stack![left].float32.0;
-                                        stack![dest].float32.1 = 0.0; }
-                    Op::F32Add     => { stack![dest].float32.0 = stack![left].float32.0 + stack![right].float32.0;
-                                        stack![dest].float32.1 = 0.0; }
-                    Op::F32Sub     => { stack![dest].float32.0 = stack![left].float32.0 - stack![right].float32.0;
-                                        stack![dest].float32.1 = 0.0; }
-                    Op::F32Mul     => { stack![dest].float32.0 = stack![left].float32.0 * stack![right].float32.0;
-                                        stack![dest].float32.1 = 0.0; }
-                    Op::F32Div     => { stack![dest].float32.0 = stack![left].float32.0 / stack![right].float32.0;
-                                        stack![dest].float32.1 = 0.0; }
-                    Op::F32Lt      => { stack![dest].int = (stack![left].float32.0 < stack![right].float32.0) as usize; }
-                    Op::F32Gt      => { stack![dest].int = (stack![left].float32.0 > stack![right].float32.0) as usize; }
-                    Op::F32Eq      => { stack![dest].int = (stack![left].float32.0 == stack![right].float32.0) as usize; }
-                    Op::F32NEq     => { stack![dest].int = (stack![left].float32.0 != stack![right].float32.0) as usize; }
-                    Op::F32LtEq    => { stack![dest].int = (stack![left].float32.0 <= stack![right].float32.0) as usize; }
-                    Op::F32GtEq    => { stack![dest].int = (stack![left].float32.0 >= stack![right].float32.0) as usize; }
+                    Op::F32Neg     => { reg![dest].float32.0 = -reg![left].float32.0;
+                                        reg![dest].float32.1 = 0.0; }
+                    Op::F32Add     => { reg![dest].float32.0 = reg![left].float32.0 + reg![right].float32.0;
+                                        reg![dest].float32.1 = 0.0; }
+                    Op::F32Sub     => { reg![dest].float32.0 = reg![left].float32.0 - reg![right].float32.0;
+                                        reg![dest].float32.1 = 0.0; }
+                    Op::F32Mul     => { reg![dest].float32.0 = reg![left].float32.0 * reg![right].float32.0;
+                                        reg![dest].float32.1 = 0.0; }
+                    Op::F32Div     => { reg![dest].float32.0 = reg![left].float32.0 / reg![right].float32.0;
+                                        reg![dest].float32.1 = 0.0; }
+                    Op::F32Lt      => { reg![dest].int = (reg![left].float32.0 < reg![right].float32.0) as usize; }
+                    Op::F32Gt      => { reg![dest].int = (reg![left].float32.0 > reg![right].float32.0) as usize; }
+                    Op::F32Eq      => { reg![dest].int = (reg![left].float32.0 == reg![right].float32.0) as usize; }
+                    Op::F32NEq     => { reg![dest].int = (reg![left].float32.0 != reg![right].float32.0) as usize; }
+                    Op::F32LtEq    => { reg![dest].int = (reg![left].float32.0 <= reg![right].float32.0) as usize; }
+                    Op::F32GtEq    => { reg![dest].int = (reg![left].float32.0 >= reg![right].float32.0) as usize; }
 
-                    Op::F64Neg     => { stack![dest].float64 = -stack![left].float64; }
-                    Op::F64Add     => { stack![dest].float64 = stack![left].float64 + stack![right].float64; }
-                    Op::F64Sub     => { stack![dest].float64 = stack![left].float64 - stack![right].float64; }
-                    Op::F64Mul     => { stack![dest].float64 = stack![left].float64 * stack![right].float64; }
-                    Op::F64Div     => { stack![dest].float64 = stack![left].float64 / stack![right].float64; }
-                    Op::F64Lt      => { stack![dest].int = (stack![left].float64 < stack![right].float64) as usize; }
-                    Op::F64Gt      => { stack![dest].int = (stack![left].float64 > stack![right].float64) as usize; }
-                    Op::F64Eq      => { stack![dest].int = (stack![left].float64 == stack![right].float64) as usize; }
-                    Op::F64NEq     => { stack![dest].int = (stack![left].float64 != stack![right].float64) as usize; }
-                    Op::F64LtEq    => { stack![dest].int = (stack![left].float64 <= stack![right].float64) as usize; }
-                    Op::F64GtEq    => { stack![dest].int = (stack![left].float64 >= stack![right].float64) as usize; }
+                    Op::F64Neg     => { reg![dest].float64 = -reg![left].float64; }
+                    Op::F64Add     => { reg![dest].float64 = reg![left].float64 + reg![right].float64; }
+                    Op::F64Sub     => { reg![dest].float64 = reg![left].float64 - reg![right].float64; }
+                    Op::F64Mul     => { reg![dest].float64 = reg![left].float64 * reg![right].float64; }
+                    Op::F64Div     => { reg![dest].float64 = reg![left].float64 / reg![right].float64; }
+                    Op::F64Lt      => { reg![dest].int = (reg![left].float64 < reg![right].float64) as usize; }
+                    Op::F64Gt      => { reg![dest].int = (reg![left].float64 > reg![right].float64) as usize; }
+                    Op::F64Eq      => { reg![dest].int = (reg![left].float64 == reg![right].float64) as usize; }
+                    Op::F64NEq     => { reg![dest].int = (reg![left].float64 != reg![right].float64) as usize; }
+                    Op::F64LtEq    => { reg![dest].int = (reg![left].float64 <= reg![right].float64) as usize; }
+                    Op::F64GtEq    => { reg![dest].int = (reg![left].float64 >= reg![right].float64) as usize; }
 
                     // dest and left are aligned to register size
-                    Op::MoveLower8               => { stack![dest].int       = stack![left].int8.0    as usize; }
-                    Op::MoveLower16              => { stack![dest].int       = stack![left].int16.0   as usize; }
-                    Op::MoveLower32              => { stack![dest].int       = stack![left].int32.0   as usize; }
-                    Op::MoveAndSignExtendLower8  => { stack![dest].int       = stack![left].sint8.0   as usize; }
-                    Op::MoveAndSignExtendLower16 => { stack![dest].int       = stack![left].sint16.0  as usize; }
-                    Op::MoveAndSignExtendLower32 => { stack![dest].int       = stack![left].sint32.0  as usize; }
-                    Op::IntToFloat32             => { stack![dest].float32.0 = stack![left].sint      as f32;
-                                                      stack![dest].float32.1 = 0.0; }
-                    Op::IntToFloat64             => { stack![dest].float64   = stack![left].sint      as f64; }
-                    Op::Float32ToInt             => { stack![dest].int       = stack![left].float32.0 as usize; }
-                    Op::Float32To64              => { stack![dest].float64   = stack![left].float32.0 as f64; }
-                    Op::Float64ToInt             => { stack![dest].int       = stack![left].float64   as usize; }
-                    Op::Float64To32              => { stack![dest].float32.0 = stack![left].float64   as f32;
-                                                      stack![dest].float32.1 = 0.0; }
+                    Op::MoveLower8               => { reg![dest].int       = reg![left].int8.0    as usize; }
+                    Op::MoveLower16              => { reg![dest].int       = reg![left].int16.0   as usize; }
+                    Op::MoveLower32              => { reg![dest].int       = reg![left].int32.0   as usize; }
+                    Op::MoveAndSignExtendLower8  => { reg![dest].int       = reg![left].sint8.0   as usize; }
+                    Op::MoveAndSignExtendLower16 => { reg![dest].int       = reg![left].sint16.0  as usize; }
+                    Op::MoveAndSignExtendLower32 => { reg![dest].int       = reg![left].sint32.0  as usize; }
+                    Op::IntToFloat32             => { reg![dest].float32.0 = reg![left].sint      as f32;
+                                                      reg![dest].float32.1 = 0.0; }
+                    Op::IntToFloat64             => { reg![dest].float64   = reg![left].sint      as f64; }
+                    Op::Float32ToInt             => { reg![dest].int       = reg![left].float32.0 as usize; }
+                    Op::Float32To64              => { reg![dest].float64   = reg![left].float32.0 as f64; }
+                    Op::Float64ToInt             => { reg![dest].int       = reg![left].float64   as usize; }
+                    Op::Float64To32              => { reg![dest].float32.0 = reg![left].float64   as f32;
+                                                      reg![dest].float32.1 = 0.0; }
 
                     // dest is aligned, left may not be. The stores are redundant with copy, but convenient; loads ensure high bits of registers are zeroed
-                    Op::StackRelativeStore8  => { stack[dest] = stack[left]; }
-                    Op::StackRelativeStore16 => { stack.copy_within(left..left+2, dest) }
-                    Op::StackRelativeStore32 => { stack.copy_within(left..left+4, dest) }
+                    Op::StackRelativeStore8  => { stack![dest] = stack![left]; }
+                    Op::StackRelativeStore16 => { (*stack).copy_within(left..left+2, dest) }
+                    Op::StackRelativeStore32 => { (*stack).copy_within(left..left+4, dest) }
 
-                    Op::StackRelativeLoad8  => { stack![dest].int = stack[left] as usize; }
-                    Op::StackRelativeLoad16 => { stack.copy_within(left..left+2, dest); stack![dest].int = stack![dest].int16.0 as usize }
-                    Op::StackRelativeLoad32 => { stack.copy_within(left..left+4, dest); stack![dest].int = stack![dest].int32.0 as usize; }
-                    Op::StackRelativeLoadAndSignExtend8  => { stack![dest].sint = stack[left] as isize; }
-                    Op::StackRelativeLoadAndSignExtend16 => { stack.copy_within(left..left+2, dest); stack![dest].sint = stack![dest].sint16.0 as isize }
-                    Op::StackRelativeLoadAndSignExtend32 => { stack.copy_within(left..left+4, dest); stack![dest].sint = stack![dest].sint32.0 as isize }
-                    Op::StackRelativeLoadBool => { stack![dest].int = (stack[left] != 0) as usize }
+                    Op::StackRelativeLoad8  => { reg![dest].int = stack![left] as usize; }
+                    Op::StackRelativeLoad16 => { (*stack).copy_within(left..left+2, dest); reg![dest].int = reg![dest].int16.0 as usize }
+                    Op::StackRelativeLoad32 => { (*stack).copy_within(left..left+4, dest); reg![dest].int = reg![dest].int32.0 as usize; }
+                    Op::StackRelativeLoadAndSignExtend8  => { reg![dest].sint = stack![left] as isize; }
+                    Op::StackRelativeLoadAndSignExtend16 => { (*stack).copy_within(left..left+2, dest); reg![dest].sint = reg![dest].sint16.0 as isize }
+                    Op::StackRelativeLoadAndSignExtend32 => { (*stack).copy_within(left..left+4, dest); reg![dest].sint = reg![dest].sint32.0 as isize }
+                    Op::StackRelativeLoadBool => { reg![dest].int = (stack![left] != 0) as usize }
 
-                    Op::StackRelativeCopy =>  { stack.copy_within(left..left+(instr.right as usize), dest) }
-                    Op::StackRelativeZero =>  { for b in &mut stack[dest..dest+(instr.left as usize)] { *b = 0 }}
+                    Op::StackRelativeCopy =>  { (*stack).copy_within(left..left+(instr.right as usize), dest) }
+                    Op::StackRelativeZero =>  { for i in 0..instr.left as usize { stack![dest+i] = 0 }}
 
-                    Op::Move          => { stack![dest] = stack![left]; }
+                    Op::Move          => { reg![dest] = reg![left]; }
                     Op::Jump          => { ip = ip.wrapping_add(sign_extend(instr.left)); }
-                    Op::JumpIfZero    => { if stack![dest].int == 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
-                    Op::JumpIfNotZero => { if stack![dest].int != 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
+                    Op::JumpIfZero    => { if reg![dest].int == 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
+                    Op::JumpIfNotZero => { if reg![dest].int != 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
                     Op::Return        => {
                         let ret = call_stack.pop().expect("Bad bytecode");
                         code = ret.0;
                         ip = ret.1;
                         sp = ret.2;
-                        stack![ret.3] = stack![left];
+                        reg![ret.3] = reg![left];
                     },
                     Op::Call          => {
                         call_stack.push((code, ip, sp, dest));
@@ -2194,26 +2289,28 @@ impl Compiler {
                     },
                     Op::CallIndirect  => { todo!() },
 
-                    Op::Store8  => { *(stack![dest].int as *mut u8)  =   stack[left]; },
-                    Op::Store16 => { *(stack![dest].int as *mut u16) = *(stack[left..].as_ptr() as *const u16); },
-                    Op::Store32 => { *(stack![dest].int as *mut u32) = *(stack[left..].as_ptr() as *const u32); },
-                    Op::Store64 => { *(stack![dest].int as *mut u64) = *(stack[left..].as_ptr() as *const u64); },
-                    Op::Load8   => { stack![dest].int = *(stack![left].int as *const u8)  as usize; },
-                    Op::Load16  => { stack![dest].int = *(stack![left].int as *const u16) as usize; },
-                    Op::Load32  => { stack![dest].int = *(stack![left].int as *const u32) as usize; },
-                    Op::Load64  => { stack![dest].int = *(stack![left].int as *const u64) as usize; },
-                    Op::LoadAndSignExtend8  => { stack![dest].sint = *(stack![left].int as *const i8)  as isize; },
-                    Op::LoadAndSignExtend16 => { stack![dest].sint = *(stack![left].int as *const i16) as isize; },
-                    Op::LoadAndSignExtend32 => { stack![dest].sint = *(stack![left].int as *const i32) as isize; },
-                    Op::LoadBool => { stack![dest].b8.0 = *(stack![left].int as *const u8) != 0; },
-                    Op::Copy => { std::ptr::copy(stack![left].int as *const u8, stack![dest].int as *mut u8, stack![right].int); },
-                    Op::Zero => { for b in std::slice::from_raw_parts_mut(stack![dest].int as *mut u8, stack![right].int) { *b = 0 }},
-                    Op::LoadStackAddress => { stack![dest].int = (&stack[left] as *const u8) as usize },
+                    Op::Store8  => { *(reg![dest].int as *mut u8)  =   stack![left]; },
+                    Op::Store16 => { *(reg![dest].int as *mut u16) = *(stack![left..].as_ptr() as *const u16); },
+                    Op::Store32 => { *(reg![dest].int as *mut u32) = *(stack![left..].as_ptr() as *const u32); },
+                    Op::Store64 => { *(reg![dest].int as *mut u64) = *(stack![left..].as_ptr() as *const u64); },
+                    Op::Load8   => { reg![dest].int = *(reg![left].int as *const u8)  as usize; },
+                    Op::Load16  => { reg![dest].int = *(reg![left].int as *const u16) as usize; },
+                    Op::Load32  => { reg![dest].int = *(reg![left].int as *const u32) as usize; },
+                    Op::Load64  => { reg![dest].int = *(reg![left].int as *const u64) as usize; },
+                    Op::LoadAndSignExtend8  => { reg![dest].sint = *(reg![left].int as *const i8)  as isize; },
+                    Op::LoadAndSignExtend16 => { reg![dest].sint = *(reg![left].int as *const i16) as isize; },
+                    Op::LoadAndSignExtend32 => { reg![dest].sint = *(reg![left].int as *const i32) as isize; },
+                    Op::LoadBool => { reg![dest].b8.0 = *(reg![left].int as *const u8) != 0; },
+                    Op::Copy => { std::ptr::copy(reg![left].int as *const u8, reg![dest].int as *mut u8, reg![right].int); },
+                    Op::Zero => { for b in std::slice::from_raw_parts_mut(reg![dest].int as *mut u8, reg![left].int) { *b = 0 }},
+                    Op::LoadStackAddress => { reg![dest].int = std::ptr::addr_of_mut!(stack![left]) as usize },
                 }
             }
             ip = ip.wrapping_add(1);
         }
-        unsafe { Value::from(stack![0 as usize], Type::Int) }
+        let result = unsafe { Value::from(reg![0 as usize], Type::Int) };
+        unsafe { std::alloc::dealloc((*stack).as_mut_ptr(), layout); }
+        result
     }
 }
 
@@ -2286,7 +2383,7 @@ fn repl() {
 }
 
 fn main() {
-    // ptr();
+    // arr();
     repl();
 }
 
@@ -2799,6 +2896,36 @@ func main(): int {
     return asdf.arr[256:i8] + arr[1] + more[2];
 }
 "#, Value::Int(321)),
+(r#"
+func main(): int {
+    arr := {}:arr u8 [8];
+    for (i := 0; i != 8; i = i + 1) {
+        arr[i] = 1;
+    }
+    acc := 0;
+    for (i := 0; i < 8; i = i + 1) {
+        acc = acc + arr[i];
+    }
+    return acc;
+}
+"#, Value::Int(8)),
+(r#"
+struct V4 { padding: i16, c: arr i32 [4] }
+struct M4 { padding: i16, r: arr V4 [4] }
+func main(): int {
+    a: M4 = {
+        r = {
+            { c = { 1, 2, 3, 4}},
+            { c = { 5, 6, 7, 8}},
+            { c = { 9,10,11,12}},
+            { c = {13,14,15,16}}
+        }
+    };
+    i := 3;
+    j := 2;
+    return a.r[i].c[j];
+}
+"#, Value::Int(15)),
 ];
     let err = ["r#
 func main(): int {
@@ -2874,18 +3001,11 @@ func main(): int {
     for (p := &arr[0]; p != &arr[8]; p = p + 1) {
         *p = 1;
     }
+    arrp := &arr[0];
     acc := 0;
-    acc = acc + arr[0];
-    acc = acc + arr[1];
-    acc = acc + arr[2];
-    acc = acc + arr[3];
-    acc = acc + arr[4];
-    acc = acc + arr[5];
-    acc = acc + arr[6];
-    acc = acc + arr[7];
-    // for (i := 0; i < 8; i = i + 1) {
-    //     acc = acc + arr[i];
-    // }
+    for (i := 0; i < 8; i = i + 1) {
+        acc = acc + arrp[i];
+    }
     return acc;
 }
 "#, Value::Int(8)),
