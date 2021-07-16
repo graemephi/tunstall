@@ -815,7 +815,7 @@ fn expr_matches_destination(value: &ExprResult, dest_ty: Type, dest: &Location) 
             return true;
         }
     }
-    if matches!(dest.kind, LocationKind::Register) {
+    if let LocationKind::Register = dest.kind {
         return value.ty.is_integer() && dest_ty.is_integer();
     }
     false
@@ -896,12 +896,6 @@ struct StmtContext {
     continue_to: Option<Label>,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
-struct DestinationContext {
-    ty: Option<Type>,
-    dest: Option<Location>,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum PathContextState {
     ExpectAny,
@@ -921,7 +915,6 @@ struct FatGen {
     locals: Locals,
     reg_counter: isize,
     context: StmtContext,
-    destination: DestinationContext,
     labels: Vec<InstrLocation>,
     patches: Vec<(Label, InstrLocation)>,
     return_type: Type,
@@ -938,7 +931,6 @@ impl FatGen {
             locals: Locals::default(),
             reg_counter: 0,
             context: StmtContext::default(),
-            destination: DestinationContext::default(),
             labels: Vec::new(),
             patches: Vec::new(),
             return_type: Type::None,
@@ -1402,32 +1394,16 @@ impl FatGen {
         result
     }
 
+    fn expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprResult {
+        self.expr_with_destination(ctx, expr, Type::None, &Location::none())
+    }
+
     fn expr_with_destination_type(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type) -> ExprResult {
-        self.destination.ty = Some(destination_type);
-        self.expr(ctx, expr)
+        self.expr_with_destination(ctx, expr, destination_type, &Location::none())
     }
 
     fn expr_with_destination(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type, dest: &Location) -> ExprResult {
-        assert_ne!(dest.kind, LocationKind::None);
-        self.destination.ty = Some(destination_type);
-        self.destination.dest = Some(*dest);
-        let mut result = self.expr(ctx, expr);
-        self.destination.dest = None;
-        if expr_matches_destination(&result, destination_type, dest) {
-            if result.addr != *dest {
-                self.copy(ctx, destination_type, dest, &result);
-                result.addr = *dest;
-            }
-        } else {
-            result.addr = Location::none();
-            result.value = None;
-        }
-        result
-    }
-
-    fn expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprResult {
         let mut result = ExprResult { addr: Location::none(), ty: Type::None, value: None };
-        let destination_type = self.destination.ty.take();
         match ctx.ast.expr(expr) {
             ExprData::Int(value) => {
                 result.value = Some(value.into());
@@ -1453,21 +1429,21 @@ impl FatGen {
                 }
             }
             ExprData::Compound(fields) => {
-                if let Some(ty) = destination_type {
+                if destination_type != Type::None {
                     // Todo: check for duplicate fields. need to consider unions and fancy paths (both unimplemented)
-                    let info = ctx.types.info(ty);
-                    let base;
-                    if fields.is_empty() {
-                        base = self.destination.dest.unwrap_or_else(|| self.stack_alloc(ctx, ty));
-                    } else {
-                        base = self.stack_alloc(ctx, ty);
-                    }
-                    let mut path_ctx = PathContext { state: PathContextState::ExpectAny, index: 0 };
+                    let info = ctx.types.info(destination_type);
                     if matches!(info.kind, TypeKind::Struct|TypeKind::Array) {
+                        let base;
+                        if fields.is_empty() && dest.kind != LocationKind::None {
+                            base = *dest;
+                        } else {
+                            base = self.stack_alloc(ctx, destination_type);
+                        }
+                        let mut path_ctx = PathContext { state: PathContextState::ExpectAny, index: 0 };
                         self.zero(&base, info.size as isize);
                         for field in fields {
                             let field = ctx.ast.compound_field(field);
-                            if let Some(item) = self.path(ctx, &mut path_ctx, ty, field.path) {
+                            if let Some(item) = self.path(ctx, &mut path_ctx, destination_type, field.path) {
                                 let dest = base.offset_by(item.offset as isize);
                                 let expr = self.expr_with_destination(ctx, field.value, item.ty, &dest);
                                 if !expr.is_ok() {
@@ -1482,7 +1458,7 @@ impl FatGen {
                             }
                         }
                         result.addr = base;
-                        result.ty = ty;
+                        result.ty = destination_type;
                     } else {
                         error!(self, ctx.ast.expr_source_position(expr), "compound initializer used for non-aggregate type");
                     }
@@ -1592,8 +1568,9 @@ impl FatGen {
                 }
             },
             ExprData::Unary(op_token, right_expr) => {
-                let right = if let (parse::TokenKind::BitAnd, Some(ty)) = (op_token, destination_type) {
-                    self.expr_with_destination_type(ctx, right_expr, ty)
+                // Co-ordination with the cast case's address/cast transposition
+                let right = if op_token == parse::TokenKind::BitAnd && destination_type != Type::None {
+                    self.expr_with_destination_type(ctx, right_expr, destination_type)
                 } else {
                     self.expr(ctx, right_expr)
                 };
@@ -1831,9 +1808,19 @@ impl FatGen {
         debug_assert_implies!(self.error.is_none() && result.addr.offset == Location::BAD_LOCATION, result.addr.kind == LocationKind::None);
         debug_assert_implies!(self.error.is_none() && result.addr.offset != Location::BAD_LOCATION, result.addr.kind != LocationKind::None);
         debug_assert_implies!(self.error.is_none() && result.addr.base != Location::BAD_LOCATION, result.addr.kind == LocationKind::Based);
+        if destination_type != Type::None && dest.kind != LocationKind::None {
+            if expr_matches_destination(&result, destination_type, dest) {
+                if result.addr != *dest {
+                    self.copy(ctx, destination_type, dest, &result);
+                    result.addr = *dest;
+                }
+            } else {
+                result.addr = Location::none();
+                result.value = None;
+            }
+        }
         result
     }
-
     fn stmt(&mut self, ctx: &mut Compiler, stmt: Stmt) -> Option<Type> {
         let mut return_type = None;
         match ctx.ast.stmt(stmt) {
