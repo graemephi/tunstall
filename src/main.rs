@@ -285,7 +285,8 @@ pub enum Op {
     LoadBool,
     Copy,
     Zero,
-    LoadStackAddress
+    LoadStackAddress,
+    Panic
 }
 
 fn requires_register_destination(op: Op) -> bool {
@@ -314,6 +315,7 @@ struct FatInstr {
 
 impl FatInstr {
     const HALT: FatInstr = FatInstr { op: Op::Halt, dest: 0, left: 0, right: 0 };
+    const PANIC: FatInstr = FatInstr { op: Op::Panic, dest: 0, left: 0, right: 0 };
 
     fn is_jump(&self) -> bool {
         use Op::*;
@@ -433,6 +435,10 @@ impl Value {
             Type::Bool => unsafe { Value::Bool(reg.b8.0) }
             _ => unsafe { Value::Int(reg.sint) }
         }
+    }
+
+    fn ident(reg: RegValue) -> Value {
+        Value::Ident(unsafe { Intern(reg.int32.0) })
     }
 }
 
@@ -919,6 +925,7 @@ struct FatGen {
     patches: Vec<(Label, InstrLocation)>,
     return_type: Type,
     constant: bool,
+    generating_code_for_func: bool,
     error: Option<IncompleteError>,
 }
 
@@ -935,6 +942,7 @@ impl FatGen {
             patches: Vec::new(),
             return_type: Type::None,
             constant: false,
+            generating_code_for_func: false,
             error: None,
         }
     }
@@ -948,7 +956,7 @@ impl FatGen {
     fn inc_bytes(&mut self, size: usize, align: usize) -> isize {
         debug_assert!(align.is_power_of_two());
         let result = (self.reg_counter as usize + (align - 1)) & !(align - 1);
-        self.reg_counter += size as isize;
+        self.reg_counter = result as isize + size as isize;
         // todo: error if size does not fit on the stack
         assert!(self.reg_counter < i32::MAX as isize);
         result as isize
@@ -1475,7 +1483,7 @@ impl FatGen {
                             Some(lv) => result.value = Some(unsafe { lv.int + item.offset }.into()),
                             None => {
                                 let base = self.register(&left);
-                                result.addr = Location::based(base, item.offset as isize, true);
+                                result.addr = Location::based(base, item.offset as isize, left.addr.is_mutable);
                             }
                         }
                         result.ty = item.ty;
@@ -1557,8 +1565,9 @@ impl FatGen {
                                 }
                             }
                         };
+                        assert!(addr.is_mutable == left.addr.is_mutable);
+                        assert!(addr.is_place == true);
                         result.addr = addr;
-                        result.addr.is_place = true;
                         result.ty = base_type;
                     } else {
                         error!(self, ctx.ast.expr_source_position(index_expr), "index must be an integer (found {})", ctx.type_str(index.ty))
@@ -1568,9 +1577,9 @@ impl FatGen {
                 }
             },
             ExprData::Unary(op_token, right_expr) => {
-                // Co-ordination with the cast case's address/cast transposition
                 let right = if op_token == parse::TokenKind::BitAnd && destination_type != Type::None {
-                    self.expr_with_destination_type(ctx, right_expr, destination_type)
+                    // Address/cast/compound transposition
+                    self.expr_with_destination_type(ctx, right_expr, ctx.types.base_type(destination_type))
                 } else {
                     self.expr(ctx, right_expr)
                 };
@@ -1583,7 +1592,7 @@ impl FatGen {
                                 error!(self, ctx.ast.expr_source_position(right_expr), "cannot take address of this expression"),
                             LocationKind::Register|LocationKind::Stack => {
                                 let base = right.addr.offset;
-                                // todo: seems weird to be setting these with kind = None
+                                // todo: seems weird to be setting these with kind == None
                                 result.addr.is_mutable = right.addr.is_mutable;
                                 result.addr.is_place = right.addr.is_place;
                                 result.value = Some(base.into());
@@ -1592,6 +1601,7 @@ impl FatGen {
                                 result.addr = Location::register(self.location_register(&right.addr));
                             }
                         }
+                        result.addr.is_mutable = right.addr.is_mutable;
                         result.ty = ctx.types.pointer(right.ty);
                     } else if op_token == parse::TokenKind::Mul {
                         if right.ty.is_pointer() {
@@ -1602,7 +1612,7 @@ impl FatGen {
                                     result.addr = Location::based(right_register, 0, true);
                                 }
                             }
-                            result.addr.is_mutable = true;
+                            result.addr.is_mutable = !right.ty.is_immutable_pointer();
                             result.addr.is_place = true;
                             result.ty = ctx.types.base_type(right.ty);
                         } else {
@@ -1711,48 +1721,56 @@ impl FatGen {
                 let addr = self.expr(ctx, callable);
                 let info = ctx.types.info(addr.ty);
                 let return_type = info.items.last().expect("tried to generate code to call a func without return type").ty;
-                if info.kind == TypeKind::Func {
-                    let mut arg_gens = SmallVec::new();
-                    for (i, expr) in args.enumerate() {
-                        let info = ctx.types.info(addr.ty);
-                        let item = info.items[i];
-                        let gen = self.expr_with_destination_type(ctx, expr, item.ty);
-                        if gen.ty != item.ty {
-                            error!(self, ctx.ast.expr_source_position(expr), "argument {} is of type {}, found {}", i, ctx.type_str(item.ty), ctx.type_str(gen.ty));
-                            break;
-                        }
-                        let reg = self.location_register(&gen.addr);
-                        arg_gens.push((gen, reg));
-                    }
-                    for &(gen, reg) in arg_gens.iter() {
-                        match gen.value {
-                            Some(_) if gen.ty.is_pointer() => self.register(&gen),
-                            Some(gv) => { assert!(reg == Location::BAD_LOCATION); self.constant(gv) },
-                            _ => self.put2_inc(Op::Move, reg)
-                        };
-                    }
-                    result.addr = match addr.value {
-                        Some(func) => {
-                            if return_type.is_basic() {
-                                let dest = self.inc_reg();
-                                self.put(Op::Call, dest, func);
-                                Location::register(dest)
-                            } else {
-                                let (return_size, return_alignment) = {
-                                    let info = ctx.types.info(return_type);
-                                    (info.size, info.alignment)
-                                };
-                                let dest = self.inc_bytes(return_size, return_alignment);
-                                self.put(Op::Call, dest, func);
-                                Location::stack(dest)
+                if info.kind == TypeKind::Callable {
+                    if !(self.generating_code_for_func && info.mutable) {
+                        let mut arg_gens = SmallVec::new();
+                        for (i, expr) in args.enumerate() {
+                            let info = ctx.types.info(addr.ty);
+                            let item = info.items[i];
+                            let gen = self.expr_with_destination_type(ctx, expr, item.ty);
+                            if gen.ty != item.ty {
+                                error!(self, ctx.ast.expr_source_position(expr), "argument {} is of type {}, found {}", i, ctx.type_str(item.ty), ctx.type_str(gen.ty));
+                                break;
                             }
-                        },
-                        _ => todo!()
-                    };
-                    result.ty = return_type;
+                            let reg = self.location_register(&gen.addr);
+                            arg_gens.push((gen, reg));
+                        }
+                        for &(gen, reg) in arg_gens.iter() {
+                            match gen.value {
+                                Some(_) if gen.ty.is_pointer() => self.register(&gen),
+                                Some(gv) => self.constant(gv),
+                                _ => self.put2_inc(Op::Move, reg)
+                            };
+                        }
+                        result.addr = match addr.value {
+                            Some(func) => {
+                                if return_type.is_basic() {
+                                    let dest = self.inc_reg();
+                                    self.put(Op::Call, dest, func);
+                                    Location::register(dest)
+                                } else {
+                                    let (return_size, return_alignment) = {
+                                        let info = ctx.types.info(return_type);
+                                        (info.size, info.alignment)
+                                    };
+                                    let dest = self.inc_bytes(return_size, return_alignment);
+                                    self.put(Op::Call, dest, func);
+                                    Location::stack(dest)
+                                }
+                            },
+                            _ => todo!("indirect call")
+                        };
+                        result.ty = return_type;
+                    } else {
+                        if let Value::Ident(name) = Value::ident(addr.value.unwrap()) {
+                            error!(self, ctx.ast.expr_source_position(callable), "cannot call proc '{}' from within a func", ctx.str(name));
+                        } else {
+                            unreachable!();
+                        }
+                    }
                 } else {
                     // TODO: get a string representation of the whole `callable` expr for nicer error message
-                    error!(self, ctx.ast.expr_source_position(callable), "cannot call a {:?}", info.kind);
+                    error!(self, ctx.ast.expr_source_position(callable), "cannot call a {}", ctx.type_str(addr.ty));
                 }
             }
             ExprData::Cast(expr, type_expr) => {
@@ -1783,7 +1801,7 @@ impl FatGen {
                         // We can send integer types back up the tree unmodified
                         // without doing the conversion here.
                     } else {
-                        result.ty = to_ty;
+                        result.ty = to_ty.copy_mutability(result.ty);
                     }
                 } else if epxression_transposable() {
                     // The cast-on-the-right synax doesn't work great with taking addresses.
@@ -1808,6 +1826,16 @@ impl FatGen {
         debug_assert_implies!(self.error.is_none() && result.addr.offset == Location::BAD_LOCATION, result.addr.kind == LocationKind::None);
         debug_assert_implies!(self.error.is_none() && result.addr.offset != Location::BAD_LOCATION, result.addr.kind != LocationKind::None);
         debug_assert_implies!(self.error.is_none() && result.addr.base != Location::BAD_LOCATION, result.addr.kind == LocationKind::Based);
+        if destination_type != Type::None {
+            let result_info = ctx.types.info(result.ty);
+            if destination_type.is_pointer()
+            && result_info.kind == TypeKind::Array
+            && result_info.base_type == ctx.types.base_type(destination_type) {
+                // Decay array to pointer
+                result.addr = Location::based(self.location_register(&result.addr), 0, result.addr.is_mutable);
+                result.ty = destination_type;
+            }
+        }
         if destination_type != Type::None && dest.kind != LocationKind::None {
             if expr_matches_destination(&result, destination_type, dest) {
                 if result.addr != *dest {
@@ -1821,6 +1849,7 @@ impl FatGen {
         }
         result
     }
+
     fn stmt(&mut self, ctx: &mut Compiler, stmt: Stmt) -> Option<Type> {
         let mut return_type = None;
         match ctx.ast.stmt(stmt) {
@@ -2078,17 +2107,19 @@ impl FatGen {
         return_type
     }
 
-    fn func(&mut self, ctx: &mut Compiler, signature: Type, decl: Decl) -> Func {
-        let func = ctx.ast.callable(decl);
-        let body = func.body;
+    fn callable(&mut self, ctx: &mut Compiler, signature: Type, decl: Decl) -> Func {
+        let callable = ctx.ast.callable(decl);
+        let body = callable.body;
         let sig = ctx.types.info(signature);
+        self.generating_code_for_func = callable.kind == CallableKind::Function;
         assert!(self.code.len() == 0);
-        assert!(sig.kind == TypeKind::Func);
-        assert!(func.params.len() == sig.items.len() - 1, "the last element of a func's type signature's items must be the return type. it is not optional");
+        assert!(sig.kind == TypeKind::Callable);
+        assert!(callable.params.len() == sig.items.len() - 1, "the last element of a callable's type signature's items must be the return type");
         self.return_type = sig.items.last().map(|i| i.ty).unwrap();
+        assert_implies!(self.generating_code_for_func, self.return_type != Type::None);
         self.reg_counter = 1 - sig.items.len() as isize;
         self.reg_counter *= Self::REGISTER_SIZE as isize;
-        let param_names = func.params.map(|item| ctx.ast.item(item).name);
+        let param_names = callable.params.map(|item| ctx.ast.item(item).name);
         let param_types = sig.items.iter().map(|i| i.ty);
         for (name, ty) in Iterator::zip(param_names, param_types) {
             let reg = self.inc_reg();
@@ -2097,7 +2128,12 @@ impl FatGen {
             } else {
                 Location::based(reg, 0, false)
             };
-            self.locals.insert(name, Local::argument(loc, ty));
+            if self.generating_code_for_func {
+                let const_ty = ctx.types.immutable(ty);
+                self.locals.insert(name, Local::argument(loc, const_ty));
+            } else {
+                self.locals.insert(name, Local::argument(loc, ty));
+            }
         }
         let (return_size, return_alignment) = {
             let info = ctx.types.info(self.return_type);
@@ -2106,9 +2142,13 @@ impl FatGen {
         let return_dest = self.inc_bytes(return_size, return_alignment);
         assert_eq!(return_dest, 0);
         let returned = self.stmts(ctx, body);
-        if matches!(returned, None) {
-            let func = ctx.ast.callable(decl);
-            error!(self, func.pos, "func {}: not all control paths return a value", ctx.str(func.name))
+        if self.return_type != Type::None {
+            if matches!(returned, None) {
+                let callable = ctx.ast.callable(decl);
+                error!(self, callable.pos, "{} {}: not all control paths return a value", callable.kind, ctx.str(callable.name))
+            }
+        } else {
+            self.put0(Op::Return);
         }
         self.apply_patches();
         assert!(self.patches.len() == 0);
@@ -2228,11 +2268,11 @@ impl Compiler {
         }
     }
 
-    fn run(&self) -> Value {
+    fn run(&self) -> Result<Value> {
         let mut code = &self.entry_stub[..];
         let mut sp: usize = 0;
         let mut ip: usize = 0;
-        let mut call_stack = vec![(code, ip, sp)];
+        let mut call_stack = vec![(code, ip, sp, Intern(0))];
 
         // The VM allows taking (real!) pointers to addresses on the VM stack. These are
         // immediately invalidated by taking a _reference_ to the stack. Solution: never
@@ -2269,6 +2309,7 @@ impl Compiler {
             unsafe {
                  match instr.op {
                     Op::Halt       => { break; }
+                    Op::Panic      => { return Err(format!("panic in {}", self.str(call_stack[call_stack.len()-2].3)).into()) }
                     Op::Noop       => {}
                     Op::Immediate  => { reg![dest] = RegValue::from((instr.left, instr.right)); }
                     Op::IntNeg     => { reg![dest].sint = -reg![left].sint; }
@@ -2368,8 +2409,9 @@ impl Compiler {
                         sp = ret.2;
                     },
                     Op::Call          => {
-                        call_stack.push((code, ip, sp));
-                        let f = self.funcs.get(&Intern(instr.left as u32)).expect("Bad bytecode");
+                        let name = Intern(instr.left as u32);
+                        call_stack.push((code, ip, sp, name));
+                        let f = self.funcs.get(&name).expect("Bad bytecode");
                         code = &f.code[..];
                         ip = !0;
                         sp = dest;
@@ -2397,24 +2439,61 @@ impl Compiler {
         }
         let result = unsafe { Value::from(reg![0 as usize], Type::Int) };
         unsafe { std::alloc::dealloc((*stack).as_mut_ptr(), layout); }
-        result
+        Ok(result)
     }
 }
 
 fn compile(str: &str) -> Result<Compiler> {
     let mut c = Compiler::new();
+
+    c.ast = parse::parse(&mut c, r#"
+func panic(): int {
+    // built-in
+}
+"#);
+
+    resolve_all(&mut c);
+
     c.ast = parse::parse(&mut c, str);
 
     c.check_and_clear_error(str)?;
     resolve_all(&mut c);
 
+    for decl in c.ast.decl_list() {
+        if c.ast.is_callable(decl) {
+            let decl_data = c.ast.decl(decl);
+            let name = decl_data.name();
+            let pos = decl_data.pos();
+            if let Some(sym) = sym::lookup(&c, name) {
+                let ty = sym.ty;
+                match c.globals.entry(name) {
+                    std::collections::hash_map::Entry::Occupied(_) => { error!(c, pos, "{} {} has already been defined", c.ast.decl(decl), c.str(name)); }
+                    std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(Global { decl: decl, value: Value::Ident(name), ty: ty }); }
+                }
+            }
+        }
+    }
+
+    c.check_and_clear_error(str)?;
+
     let main = c.intern("main");
     if let Some(&main) = c.globals.get(&main) {
         let info = c.types.info(main.ty);
-        if !matches!(info.arguments(), Some(&[])) || !matches!(info.return_type(), Some(Type::Int)) {
+        if info.mutable
+        && matches!(info.arguments(), Some(&[]))
+        && matches!(info.return_type(), Some(Type::Int)) {
+            // main's ok
+        } else {
             let pos = c.ast.decl(main.decl).pos();
-            error!(c, pos, "main must be a function that takes zero arguments and returns int");
+            error!(c, pos, "main must be a procedure that takes zero arguments and returns int");
         }
+    }
+
+    let panic = c.intern("panic");
+    if let Some(&panic_def) = c.globals.get(&panic) {
+        let info = c.types.info(panic_def.ty);
+        assert!(matches!(info.arguments(), Some(&[])) && matches!(info.return_type(), Some(Type::Int)));
+        c.funcs.insert(panic, Func { _signature: panic_def.ty, code: vec![FatInstr::PANIC] });
     }
 
     c.check_and_clear_error(str)?;
@@ -2424,7 +2503,7 @@ fn compile(str: &str) -> Result<Compiler> {
         if c.ast.is_callable(decl) {
             let name = c.ast.decl(decl).name();
             let sig = c.globals.get(&name).unwrap().ty;
-            let func = gen.func(&mut c, sig, decl);
+            let func = gen.callable(&mut c, sig, decl);
             c.funcs.insert(name, func);
         }
     }
@@ -2441,7 +2520,7 @@ fn compile(str: &str) -> Result<Compiler> {
 
 fn compile_and_run(str: &str) -> Result<Value> {
     let c = compile(str)?;
-    Ok(c.run())
+    c.run()
 }
 
 fn sign_extend(val: u32) -> usize {
@@ -2449,7 +2528,7 @@ fn sign_extend(val: u32) -> usize {
 }
 
 fn eval_expr(str: &str) -> Result<Value> {
-    compile_and_run(&format!("func main(): int {{ return {}; }}", str))
+    compile_and_run(&format!("proc main(): int {{ return {}; }}", str))
 }
 
 fn repl() {
@@ -2472,17 +2551,25 @@ fn repl() {
 fn main() {
     let ok = [
         (r#"
-        struct V2 { x: i32, y: i32 }
-
-        func add(a: V2, b: V2): V2 {
-            return { (a.x + a.x):i32, (a.y + b.y):i32 };
+        func id(a: arr i32 [4]): int {
+            acc := 0;
+            for (i := 0; i < 4; i = i + 1) {
+                acc = acc + a[i];
+            }
+            return acc;
+        }
+        func sum2(a: ptr (arr i32 [4])): int {
+            acc := 0;
+            for (i := 0; i < 4; i = i + 1) {
+                acc = acc + (*a)[i];
+            }
+            return acc;
         }
 
-        func main(): int {
-            v := add({1, 2}, {3, 4});
-            return v.y:int;
+        proc main(): int {
+            return id({2,3,1,1}) + sum2(&{2,3,1,1});
         }
-        "#, Value::Int(6)),
+        "#, Value::Int(2+3+1+2+3+3))
         ];
     for test in ok.iter() {
         let str = test.0;
@@ -2569,11 +2656,11 @@ fn stmt() {
         "();"
     ];
     for str in ok.iter() {
-        compile_and_run(&format!("func main(): int {{ {{ {} }} return 0; }}", str)).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
+        compile_and_run(&format!("proc main(): int {{ {{ {} }} return 0; }}", str)).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
     }
     for str in err.iter() {
         // Not checking it's the right error yet--maybe later
-        compile_and_run(&format!("func main(): int {{ {{ {} }} return 0; }}", str)).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+        compile_and_run(&format!("proc main(): int {{ {{ {} }} return 0; }}", str)).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
     }
 }
 
@@ -2675,7 +2762,7 @@ func madd(a: int, b: int, c: int): int {
     return a * b + c;
 }
 
-func main(): int {
+proc main(): int {
     return madd(1, 2, 3);
 }
 "#, Value::Int(5)),
@@ -2688,7 +2775,7 @@ func fib(n: int): int {
     return fib(n - 2) + fib(n - 1);
 }
 
-func main(): int {
+proc main(): int {
     return fib(6);
 }
 "#, Value::Int(8)),
@@ -2701,7 +2788,7 @@ func odd(n: int): bool {
     return n == 0 ? 0:bool :: even(n - 1);
 }
 
-func main(): int {
+proc main(): int {
     return even(10):int;
 }
 "#, Value::Int(1)),
@@ -2712,7 +2799,7 @@ func dot(a: V2, b: V2): f32 {
     return a.x*b.x + a.y*b.y;
 }
 
-func main(): int {
+proc main(): int {
     return dot({ 1.0, 2.0 }, { 3.0, 4.0 }):i32;
 }
 "#, Value::Int(3+8)),
@@ -2723,12 +2810,68 @@ func add(a: V2, b: V2): V2 {
     return { (a.x + b.x):i32, (a.y + b.y):i32 };
 }
 
-func main(): int {
+proc main(): int {
     v := add({1, 2}, {3, 4});
     return v.y;
 }
-"#, Value::Int(2+4))
+"#, Value::Int(2+4)),
+(r#"
+func sum(a: arr i32 [3]): int {
+    acc := 0;
+    for (i := 0; i < 3; i = i + 1) {
+        acc = acc + a[i];
+    }
+    return acc;
+}
+func sum2(a: ptr (arr i32 [3])): int {
+    acc := 0;
+    for (i := 0; i < 3; i = i + 1) {
+        acc = acc + (*a)[i];
+    }
+    return acc;
+}
+func sum3(a: ptr i32): int {
+    acc := 0;
+    for (i := 0; i < 3; i = i + 1) {
+        acc = acc + a[i];
+    }
+    return acc;
+}
+
+proc main(): int {
+    return sum({2,3,1}) + sum2(&{2,3,1}) + sum3({2,3,1}:arr i32 [3]);
+}
+"#, Value::Int(18)),
+(r#"
+proc does_something_without_return_value(a: ptr i32) {
+    if (*a == 0) {
+        *a = 1;
+        return;
+    }
+
+    *a = 2;
+}
+
+proc main(): int {
+    a: i32 = 1;
+    does_something_without_return_value(&a);
+    return a;
+}
+"#, Value::Int(2)),
     ];
+    let err = [r#"
+proc even(n: int): bool {
+    return n == 0 ? 1:bool :: odd(n - 1);
+}
+
+func odd(n: int): bool {
+    return n == 0 ? 0:bool :: even(n - 1);
+}
+
+proc main(): int {
+    return even(10):int;
+}
+"#];
     for test in ok.iter() {
         let str = test.0;
         let expect = test.1;
@@ -2737,13 +2880,16 @@ func main(): int {
             .map_err(|e| { println!("input: \"{}\"", str); e })
             .unwrap();
     }
+    for str in err.iter() {
+        compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+    }
 }
 
 #[test]
 fn control_structures() {
     let ok = [
 (r#"
-func main(): int {
+proc main(): int {
     a := 0;
     for (i := 0; i < 10; i = i + 1) {
         a = a + 1;
@@ -2752,14 +2898,14 @@ func main(): int {
 }
 "#, Value::Int(10)),
 (r#"
-func main(): int {
+proc main(): int {
     a := 0;
     for (; a < 10; a = a + 2) {}
     return a;
 }
 "#, Value::Int(10)),
 (r#"
-func main(): int {
+proc main(): int {
     a := 0;
     for (;;) {
         a = a + 1;
@@ -2773,7 +2919,7 @@ func main(): int {
 "#, Value::Int(10)),
 (r#"
 //
-func main(): int {
+proc main(): int {
     a := 0;
     b := 0;
     for (; a < 10; a = a + 1) {
@@ -2786,7 +2932,7 @@ func main(): int {
 }
 "#, Value::Int(15)),
 (r#"
-func main(): int {
+proc main(): int {
     a := 10;
     switch (a) {
         1 {}
@@ -2801,7 +2947,7 @@ func main(): int {
 }
 "#, Value::Int(100)),
 (r#"
-func main(): int {
+proc main(): int {
     a := 3.0;
     b := 0;
     switch (a) {
@@ -2822,7 +2968,7 @@ func main(): int {
 }
 "#, Value::Int(1)),
 (r#"
-func main(): int {
+proc main(): int {
     a := 3.0;
     b := 0;
     switch (a) {
@@ -2843,7 +2989,7 @@ func main(): int {
 }
 "#, Value::Int(4)),
 (r#"
-func main(): int {
+proc main(): int {
     a := 1;
     do {
         if (a > 2) {
@@ -2855,7 +3001,7 @@ func main(): int {
     return a;
 }"#, Value::Int(14)),
 (r#"
-func main(): int {
+proc main(): int {
     a := 1;
     b := 2;
     c := 3;
@@ -2883,7 +3029,7 @@ struct i32x4 {
     c: i32,
     d: i32,
 }
-func main(): int {
+proc main(): int {
     a := {-1,-1,-1,-1}:i32x4;
     return a.d:int;
 }
@@ -2896,7 +3042,7 @@ struct RGBA {
     a: i8,
 }
 
-func main(): int {
+proc main(): int {
     c := { r = 1, g = 2, b = 3, a = 4 }:RGBA;
     d := { g = 5, r = 6, a = 7, b = 8, }:RGBA;
     e: RGBA = { 9, 10, 11, 12 };
@@ -2914,7 +3060,7 @@ struct Inner {
     value: i32
 }
 
-func main(): int {
+proc main(): int {
     a: Outer = { inner = { value = -1234 }};
     b: Outer = { inner = { value = -1234 }:Inner };
     c := { inner = { value = a.inner.value }:Inner }:Outer;
@@ -2954,7 +3100,7 @@ func fn(): i32 {
     return b.x;
 }
 
-func main(): int {
+proc main(): int {
     a := 0;
     b := 0;
     return fn():int;
@@ -2968,7 +3114,7 @@ struct V2 {
     w: i32,
 }
 
-func main(): int {
+proc main(): int {
     a := ({ x = -1 }:V2).x;
     b := (a == -1) ? { w = 3 }:V2 :: { w = 4 }:V2;
     return b.w:int;
@@ -2976,25 +3122,25 @@ func main(): int {
 "#, Value::Int(3)),
 ];
     let err = [r#"
-func main(): int {
+proc main(): int {
     v := {0}:int;
     return v;
 }
 "#, r#"
 struct V2 { x: int, y: int }
-func main(): int {
+proc main(): int {
     v := {}:V2;
     v.a = 0;
     return v.x:int;
 }
 "#, r#"
 struct V2 { x: int, y: int }
-func main(): int {
+proc main(): int {
     v := { a = 0 }:V2;
     return v.a;
 },
 struct V2 { x: int, y: int }
-func main(): int {
+proc main(): int {
     v := { x = 0, 1 }:V2;
     return v.a;
 }
@@ -3020,7 +3166,7 @@ fn arr() {
 struct asdf {
     arr: arr int [4],
 }
-func main(): int {
+proc main(): int {
     asdf := {}:asdf;
     arr: arr int [4:i8] = {};
     asdf.arr[0] = 1;
@@ -3036,7 +3182,7 @@ func main(): int {
 }
 "#, Value::Int(321)),
 (r#"
-func main(): int {
+proc main(): int {
     arr := {}:arr u8 [8];
     for (i := 0; i != 8; i = i + 1) {
         arr[i] = 1;
@@ -3051,7 +3197,7 @@ func main(): int {
 (r#"
 struct V4 { padding: i16, c: arr i32 [4] }
 struct M4 { padding: i16, r: arr V4 [4] }
-func main(): int {
+proc main(): int {
     a: M4 = {
         r = {
             { c = { 1, 2, 3, 4}},
@@ -3067,18 +3213,18 @@ func main(): int {
 "#, Value::Int(15)),
 ];
     let err = ["r#
-func main(): int {
+proc main(): int {
     a := 2;
     arr: arr int [a] = {};
     return arr[0];
 }
 #",r#"
-func main(): int {
+proc main(): int {
     arr: arr int [1] = { 0 = 1 };
     return arr[0];
 }
 "#, r#"
-func main(): int {
+proc main(): int {
     arr: arr int [4.0] = {};
     return arr[0];
 }
@@ -3100,7 +3246,7 @@ func main(): int {
 fn ptr() {
     let ok = [
 (r#"
-func main(): int {
+proc main(): int {
     a := 1;
     b := &a;
     *b = 2;
@@ -3108,7 +3254,7 @@ func main(): int {
 }
 "#, Value::Int(2)),
 (r#"
-func main(): int {
+proc main(): int {
     a := 1;
     *&a = 2;
     b := &a:int;
@@ -3117,7 +3263,7 @@ func main(): int {
 "#, Value::Int(2)),
 (r#"
 struct V2 { x: i32, y: i32 }
-func main(): int {
+proc main(): int {
     aa := {1, 2}:V2;
     bb := aa;
     a := &aa;
@@ -3135,7 +3281,7 @@ func main(): int {
 }
 "#, Value::Int(3)),
 (r#"
-func main(): int {
+proc main(): int {
     arr := {}:arr u8 [8];
     for (p := &arr[0]; p != &arr[8]; p = p + 1) {
         *p = 1;
@@ -3153,7 +3299,7 @@ struct Buf {
     buf: ptr u8,
     len: int
 }
-func main(): int {
+proc main(): int {
     arr := {}:arr u8 [8];
     arr[1] = 1;
     buf: Buf = { &arr[0], 8 };
@@ -3173,7 +3319,7 @@ struct C {
     padding: i16,
     d: ptr i32
 }
-func main(): int {
+proc main(): int {
     d := -1234;
     c: C = {d=&d:ptr(i32)};
     b: B = {c=&c};
@@ -3183,11 +3329,11 @@ func main(): int {
 "#, Value::Int(-1234)),
 (r#"
 struct V2 { x: i32, y: i32 }
-func rot(v: ptr V2): int {
+proc rot(v: ptr V2): int {
     *v = { (-v.y):i32, v.x };
     return 0;
 }
-func main(): int {
+proc main(): int {
     v: V2 = {0,1};
     rot(&v);
     return v.x;
@@ -3195,20 +3341,31 @@ func main(): int {
 "#, Value::Int(-1)),
 ];
     let err = [r#""
-func main(): int {
+proc main(): int {
     a := 1;
     return *a;
 }
 "#,r#"
-func main(): int {
+proc main(): int {
     a := &-1:u8;
     return *a;
 }
 "#,r#"
-func main(): int {
+proc main(): int {
     a := -1;
     b := &a:f32;
     return *b;
+}
+"#,r#"
+struct V2 { x: i32, y: i32 }
+func rot(v: ptr V2): int {
+    *v = { (-v.y):i32, v.x };
+    return 0;
+}
+proc main(): int {
+    v: V2 = {0,1};
+    rot(&v);
+    return v.x;
 }
 "#];
     for test in ok.iter() {

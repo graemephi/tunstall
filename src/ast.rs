@@ -1,5 +1,6 @@
 use std::convert::TryFrom;
 use std::collections::hash_map::HashMap;
+use std::fmt::Display;
 
 use crate::Intern;
 use crate::parse::TokenKind;
@@ -93,7 +94,7 @@ pub enum ExprData {
     Cast(Expr, TypeExpr),
 }
 
-impl std::fmt::Display for ExprData {
+impl Display for ExprData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             ExprData::Int(a) => write!(f, "integer ({})", a),
@@ -159,10 +160,19 @@ pub enum StmtData {
     VarDecl(TypeExpr, Expr, Expr)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallableKind {
     Function,
-    // Procedure
+    Procedure
+}
+
+impl Display for CallableKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            CallableKind::Function => write!(f, "func"),
+            CallableKind::Procedure => write!(f, "proc"),
+        }
+    }
 }
 
 /// A named declaration of a type, as in function parameters and
@@ -224,6 +234,15 @@ impl DeclData {
         match &self {
             DeclData::Callable(decl) => decl.params,
             DeclData::Struct(decl) => decl.fields,
+        }
+    }
+}
+
+impl Display for DeclData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            DeclData::Callable(c) => c.kind.fmt(f),
+            DeclData::Struct(_) => write!(f, "struct"),
         }
     }
 }

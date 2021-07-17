@@ -31,7 +31,7 @@ pub fn builtins(ctx: &mut Compiler) {
         let name = ctx.interns.put(str);
         let ty = Type(i as u32);
         let items = Vec::new();
-        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: Type::None, num_array_elements: 0 });
+        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: ty, mutable: true, num_array_elements: 0 });
         assert!(size == 0 || size.is_power_of_two());
         sym::builtin(ctx, name, ty);
     }
@@ -52,6 +52,9 @@ impl Type {
     // alone without having to look up information from the handle. It's for
     // convenience, more than anything else.
     const POINTER_BIT: u32 = 1 << (u32::BITS - 1);
+    // Likewise, we always put immutable and mutable pointers adjacent in the big
+    // type array, with immutable pointers in the odd indices.
+    const IMMUTABLE_BIT: u32 = 1;
 
     pub const None: Type = Type(TypeKind::None as u32);
     pub const Int:  Type = Type(TypeKind::Int as u32);
@@ -66,8 +69,8 @@ impl Type {
     pub const F32:  Type = Type(TypeKind::F32 as u32);
     pub const F64:  Type = Type(TypeKind::F64 as u32);
     pub const Bool: Type = Type(TypeKind::Bool as u32);
-    pub const VoidPtr: Type = Type((TypeKind::Bool as u32 + 1) | Self::POINTER_BIT);
-    pub const U8Ptr:   Type = Type((TypeKind::Bool as u32 + 2) | Self::POINTER_BIT);
+    pub const VoidPtr: Type = Type((TypeKind::Bool as u32 + 2) | Self::POINTER_BIT);
+    pub const U8Ptr:   Type = Type((TypeKind::Bool as u32 + 4) | Self::POINTER_BIT);
 
     pub fn is_integer(self) -> bool {
         matches!(self, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64|Type::Int)
@@ -79,6 +82,18 @@ impl Type {
 
     pub fn is_pointer(self) -> bool {
         (self.0 & Self::POINTER_BIT) == Self::POINTER_BIT
+    }
+
+    pub fn is_immutable_pointer(self) -> bool {
+        self.is_pointer() && (self.0 & Self::IMMUTABLE_BIT) == Self::IMMUTABLE_BIT
+    }
+
+    pub fn copy_mutability(self, other: Type) -> Type {
+        if self.is_pointer() && other.is_pointer() {
+            Type((self.0 & !Self::IMMUTABLE_BIT) | (other.0 & Self::IMMUTABLE_BIT))
+        } else {
+            self
+        }
     }
 }
 
@@ -108,7 +123,7 @@ pub enum TypeKind {
     F32,
     F64,
     Bool,
-    Func,
+    Callable,
     Struct,
     Array,
     Pointer,
@@ -142,12 +157,16 @@ pub struct TypeInfo {
     pub alignment: usize,
     pub items: Vec<Item>,
     pub base_type: Type,
+    // Two kinds of type can be mutable
+    //  pointers: appear as immutable when passed into funcs
+    //  callables: procs are "mutable" in that they allow side-effects
+    pub mutable: bool,
     pub num_array_elements: usize,
 }
 
 impl TypeInfo {
     pub fn arguments(&self) -> Option<&[Item]> {
-        if self.kind == TypeKind::Func {
+        if self.kind == TypeKind::Callable {
             let end = if self.items.len() == 0 { 0 } else { self.items.len() - 1 };
             Some(&self.items[..end])
         } else {
@@ -156,7 +175,7 @@ impl TypeInfo {
     }
 
     pub fn return_type(&self) -> Option<Type> {
-        if self.kind == TypeKind::Func {
+        if self.kind == TypeKind::Callable {
             self.items.last().map(|i| i.ty)
         } else {
             None
@@ -211,18 +230,19 @@ impl Types {
         }
     }
 
-    pub fn make(&mut self, kind: TypeKind, name: Intern) -> Type {
+    pub fn make(&mut self, kind: TypeKind) -> Type {
         let mut result = u32::try_from(self.types.len()).expect("Program too big!!");
         if result >= Type::POINTER_BIT {
             todo!("Program too big!!");
         }
         self.types.push(TypeInfo {
             kind: kind,
-            name: name,
+            name: Intern(0),
             size: 0,
             alignment: 1,
             items: Vec::new(),
-            base_type: Type::None,
+            base_type: Type(result),
+            mutable: true,
             num_array_elements: 0,
         });
         if kind == TypeKind::Pointer {
@@ -231,22 +251,39 @@ impl Types {
         Type(result)
     }
 
-    pub fn anonymous(&mut self, kind: TypeKind, items: &[Type]) -> Type {
-        let hash = hash(&(kind, items));
+    pub fn anonymous(&mut self, kind: TypeKind, items: &[Type], mutable: bool) -> Type {
+        let hash = hash(&(kind, items, mutable));
         if let Some(types) = self.type_by_hash.get(&hash) {
             for &ty in types.iter() {
                 let info = self.info(ty);
-                if info.items.iter().map(|item| &item.ty).eq(items.iter()) {
+                if info.mutable == mutable
+                && info.items.iter().map(|item| &item.ty).eq(items.iter()) {
                     return ty;
                 }
             }
         }
-        let ty = self.make(kind, Intern(0));
+        let ty = self.make(kind);
         for &item in items {
             self.add_item_to_type(ty, Intern(0), item);
         }
+        self.info_mut(ty).mutable = mutable;
         self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
         ty
+    }
+
+    pub fn strukt(&mut self, name: Intern) -> Type {
+        let hash = hash(&(TypeKind::Struct, name));
+        if let Some(types) = self.type_by_hash.get(&hash) {
+            for &ty in types.iter() {
+                let info = self.info(ty);
+                if info.kind == TypeKind::Array && info.name == name {
+                    panic!("struct made twice: calling code must check for cycles");
+                }
+            }
+        }
+        let result = self.make(TypeKind::Struct);
+        self.info_mut(result).name = name;
+        result
     }
 
     // Callers responsibility to make sure base_type.size * num_array_elements doesn't overflow (and trap).
@@ -261,13 +298,13 @@ impl Types {
                 }
             }
         }
-        let ty = self.make(TypeKind::Array, Intern(0));
+        let ty = self.make(TypeKind::Array);
         let (base_size, alignment) = {
             let base = self.info(base_type);
             (base.size, base.alignment)
         };
         let arr = self.info_mut(ty);
-        arr.size = base_size * num_array_elements;
+        arr.size = base_size.checked_mul(num_array_elements).unwrap();
         arr.alignment = alignment;
         arr.base_type = base_type;
         arr.num_array_elements = num_array_elements;
@@ -285,13 +322,63 @@ impl Types {
                 }
             }
         }
-        let ty = self.make(TypeKind::Pointer, Intern(0));
-        let ptr = self.info_mut(ty);
-        ptr.size = std::mem::size_of::<*const u8>();
-        ptr.alignment = ptr.size;
-        ptr.base_type = base_type;
-        self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
-        ty
+        let mut result = Type::None;
+        {
+            let ty = self.make(TypeKind::Pointer);
+            let ptr = self.info_mut(ty);
+            ptr.size = std::mem::size_of::<*const u8>();
+            ptr.alignment = ptr.size;
+            ptr.base_type = base_type;
+            ptr.mutable = (ty.0 & 1) == 0;
+            if ptr.mutable {
+                self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
+                result = ty;
+            }
+        }
+        {
+            // Immediately make an immutable variant of the pointer.
+            // This........ means self.immutable() does not have to take
+            // a mutable reference to self. Not sorry
+            let ty = self.make(TypeKind::Pointer);
+            let ptr = self.info_mut(ty);
+            ptr.size = std::mem::size_of::<*const u8>();
+            ptr.alignment = ptr.size;
+            ptr.base_type = base_type;
+            ptr.mutable = (ty.0 & 1) == 0;
+            if ptr.mutable {
+                self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
+                result = ty;
+            }
+        }
+        assert!(result != Type::None);
+        result
+    }
+
+    pub fn immutable(&self, ty: Type) -> Type {
+        if !ty.is_pointer() {
+            return ty;
+        }
+        let info = self.info(ty);
+        if !info.mutable {
+            return ty;
+        }
+        let left = Type(ty.0 - 1);
+        let left_info = self.info(left);
+        if left_info.base_type == info.base_type
+             && left_info.kind == TypeKind::Pointer {
+            assert!(left_info.mutable == false);
+            assert!(left.is_immutable_pointer());
+            return left;
+        }
+        let right = Type(ty.0 + 1);
+        let right_info = self.info(right);
+        if right_info.base_type == info.base_type
+             && right_info.kind == TypeKind::Pointer {
+            assert!(right_info.mutable == false);
+            assert!(right.is_immutable_pointer());
+            return right;
+        }
+        unreachable!();
     }
 
     pub fn base_type(&self, ty: Type) -> Type {
@@ -361,8 +448,6 @@ struct Ptr {
     b: ptr u8,
     c: ptr int
 }
-
-func main(): int { return 0; }
     "#;
 
     let mut c = crate::compile(&code).unwrap();

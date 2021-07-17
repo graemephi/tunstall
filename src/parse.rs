@@ -163,6 +163,7 @@ pub enum Keyword {
     Do,
     Switch,
     Func,
+    Proc,
     Struct
 }
 
@@ -179,7 +180,8 @@ impl Keyword {
             8  => Some(Keyword::Do),
             9  => Some(Keyword::Switch),
             10 => Some(Keyword::Func),
-            11 => Some(Keyword::Struct),
+            11 => Some(Keyword::Proc),
+            12 => Some(Keyword::Struct),
             _  => None,
         }
     }
@@ -196,6 +198,7 @@ impl Keyword {
             Keyword::Do => "do",
             Keyword::Switch => "switch",
             Keyword::Func => "func",
+            Keyword::Proc => "proc",
             Keyword::Struct => "struct"
         }
     }
@@ -885,6 +888,30 @@ impl<'c, 'a> Parser<'_, '_> {
             .unwrap_or_else(|| parse_error!(self, "{} has already been defined", self.ctx.str(name)));
     }
 
+    fn proc_decl(&mut self) {
+        let kind = CallableKind::Procedure;
+        let pos = self.pos();
+        self.keyword(Keyword::Proc);
+        let name = self.name();
+        self.token(TokenKind::LParen);
+        let params;
+        if let None = self.try_token(TokenKind::RParen) {
+            params = self.items();
+            self.token(TokenKind::RParen);
+        } else {
+            params = ItemList::empty();
+        }
+        let returns;
+        if let Some(_) = self.try_token(TokenKind::Colon) {
+            returns = Some(self.type_expr());
+        } else {
+            returns = None;
+        }
+        let body = self.stmt_block();
+        self.ast.push_callable_decl(CallableDecl { kind, pos, name, params, returns, body })
+            .unwrap_or_else(|| parse_error!(self, "{} has already been defined", self.ctx.str(name)));
+    }
+
     fn struct_decl(&mut self) {
         let pos = self.pos();
         self.keyword(Keyword::Struct);
@@ -903,6 +930,7 @@ pub fn parse(ctx: &mut Compiler, str: &str) -> Ast {
         parser.comment();
         match parser.token.keyword {
             Some(Keyword::Func) => parser.func_decl(),
+            Some(Keyword::Proc) => parser.proc_decl(),
             Some(Keyword::Struct) => parser.struct_decl(),
             Some(keyword) => parse_error!(parser, "Unexpected keyword '{}'", keyword),
             None => parse_error!(parser, "Unexpected {}", parser.token)

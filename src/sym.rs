@@ -1,9 +1,4 @@
-// use std::collections::hash_map::HashMap;
-use std::collections::hash_map::Entry;
-
 use crate::Compiler;
-use crate::Global;
-use crate::Value;
 use crate::Type;
 use crate::TypeKind;
 use crate::Intern;
@@ -61,8 +56,10 @@ fn resolve_callable(ctx: &mut Compiler, decl: Decl, data: &CallableDecl) -> Symb
     if let Some(returns) = data.returns {
         let return_type = eval_type(ctx, returns);
         decl_types.push(return_type);
+    } else {
+        decl_types.push(Type::None);
     }
-    let ty = ctx.types.anonymous(TypeKind::Func, &decl_types);
+    let ty = ctx.types.anonymous(TypeKind::Callable, &decl_types, data.kind == CallableKind::Procedure);
     let name = data.name;
     if let Some(dup) = check_duplicate_items(&ctx.ast, data.params) {
         error!(ctx, data.pos, "duplicate parameter name {} in func {}", ctx.str(dup), ctx.str(name));
@@ -72,7 +69,7 @@ fn resolve_callable(ctx: &mut Compiler, decl: Decl, data: &CallableDecl) -> Symb
 
 fn resolve_struct(ctx: &mut Compiler, decl: Decl, data: &StructDecl) -> Symbol {
     let name = data.name;
-    let ty = ctx.types.make(TypeKind::Struct, name);
+    let ty = ctx.types.strukt(name);
     let resolving = Symbol { kind: Kind::Type, state: State::Resolving, decl, ty, name };
     let existing_symbol = ctx.symbols.insert(name, resolving);
     assert!(matches!(existing_symbol, None));
@@ -93,18 +90,8 @@ fn resolve_struct(ctx: &mut Compiler, decl: Decl, data: &StructDecl) -> Symbol {
 
 fn resolve_decl(ctx: &mut Compiler, decl: Decl) -> Symbol {
     let result = match *ctx.ast.decl(decl) {
-        DeclData::Callable(func) => {
-            let sym = resolve_callable(ctx, decl, &func);
-            // todo: move out of here or remove entirely
-            match ctx.globals.entry(func.name) {
-                Entry::Occupied(_) => { error!(ctx, func.pos, "func {} has already been defined", ctx.str(func.name)); }
-                Entry::Vacant(entry) => { entry.insert(Global { decl: decl, value: Value::Ident(func.name), ty: sym.ty }); }
-            }
-            sym
-        }
-        DeclData::Struct(data) => {
-            resolve_struct(ctx, decl, &data)
-        }
+        DeclData::Callable(func) => resolve_callable(ctx, decl, &func),
+        DeclData::Struct(data) => resolve_struct(ctx, decl, &data)
     };
     let name = ctx.ast.decl(decl).name();
     ctx.symbols.insert(name, result);
@@ -153,4 +140,8 @@ pub fn resolve_type(ctx: &mut Compiler, name: Intern) -> Symbol {
 
 pub fn builtin(ctx: &mut Compiler, name: Intern, ty: Type) {
     ctx.symbols.insert(name, Symbol { kind: Kind::Type, state: State::Resolved, decl: Decl::default(), ty, name });
+}
+
+pub fn lookup(ctx: &Compiler, name: Intern) -> Option<&Symbol> {
+    ctx.symbols.get(&name)
 }
