@@ -47,13 +47,16 @@ pub struct Type(u32);
 
 #[allow(non_upper_case_globals)]
 impl Type {
-    // Pointer types have the last bit set on the handle. This is so pointers
-    // get folded into "base types" that can be reasoned about by the handle
-    // alone without having to look up information from the handle. It's for
-    // convenience, more than anything else.
+    // Pointer types have the last bit set on the handle. This is so pointers get
+    // folded into "base types" that can be reasoned about by the handle alone
+    // without having to look up information from the handle. It's for convenience,
+    // more than anything else.
     const POINTER_BIT: u32 = 1 << (u32::BITS - 1);
-    // Likewise, we always put immutable and mutable pointers adjacent in the big
-    // type array, with immutable pointers in the odd indices.
+    // Likewise, we always put immutable and mutable pointers to the same base type
+    // adjacent in the big type array, with immutable pointers in the odd indices.
+    // But we still pack them tight, so, if a pointer is immutable, its mutable dual
+    // might be in either of the two neighbouring slots. (Non-pointer types are
+    // never immutable so the immutable bit is free to vary).
     const IMMUTABLE_BIT: u32 = 1;
 
     pub const None: Type = Type(TypeKind::None as u32);
@@ -73,7 +76,7 @@ impl Type {
     pub const U8Ptr:   Type = Type((TypeKind::Bool as u32 + 4) | Self::POINTER_BIT);
 
     pub fn is_integer(self) -> bool {
-        matches!(self, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64|Type::Int)
+        Type::Int.0 <= self.0 && self.0 <= Type::U64.0
     }
 
     pub fn is_basic(self) -> bool {
@@ -87,25 +90,10 @@ impl Type {
     pub fn is_immutable_pointer(self) -> bool {
         self.is_pointer() && (self.0 & Self::IMMUTABLE_BIT) == Self::IMMUTABLE_BIT
     }
-
-    pub fn copy_mutability(self, other: Type) -> Type {
-        if self.is_pointer() && other.is_pointer() {
-            Type((self.0 & !Self::IMMUTABLE_BIT) | (other.0 & Self::IMMUTABLE_BIT))
-        } else {
-            self
-        }
-    }
 }
 
 pub fn integer_promote(ty: Type) -> Type {
-    match ty {
-        Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64 => Type::Int,
-        ty => ty
-    }
-}
-
-pub fn types_match_with_promotion(promotable: Type, other: Type) -> bool {
-    promotable == other || integer_promote(promotable) == other
+    if ty.is_integer() { Type::Int } else { ty }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -404,6 +392,43 @@ impl Types {
         info.size = (info.size + (alignment - 1)) & !(alignment - 1);
         assert!(info.size & !(alignment - 1) == info.size);
         assert!(info.size as isize >= 0);
+    }
+
+    pub fn annoying_deep_eq(&self, a: Type, b: Type) -> bool {
+        // This is bad side of encoding mutability in the pointer type.
+        // We could do a kind of half-baked provenance thing while
+        // generating code, but I don't know else how to handle cases like
+        //
+        // a = mutable local ptr;
+        // b = immutable ptr from func args;
+        // ab: SomeStruct = { a, b };
+        // ab.a.v = ...; // allow
+        // ab.b.v = ...; // disallow
+        //
+        // without actual "analysis"
+
+        if a == b {
+            return true;
+        }
+
+        if a.is_pointer() && b.is_pointer() {
+            if self.immutable(a) == b {
+                return true;
+            }
+
+            let a_base = self.base_type(a);
+            let b_base = self.base_type(b);
+            if a_base != a && b_base != b {
+                // Should be very shallow in practice
+                return self.annoying_deep_eq(a_base, b_base);
+            }
+        }
+
+        false
+    }
+
+    pub fn types_match_with_promotion(&self, promotable: Type, other: Type) -> bool {
+        self.annoying_deep_eq(promotable, other) || integer_promote(promotable) == other
     }
 }
 
