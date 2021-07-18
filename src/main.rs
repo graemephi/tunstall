@@ -483,9 +483,10 @@ fn unary_op(op: parse::TokenKind, ty: Type) -> Option<(Op, Type)> {
 
 fn binary_op(op: parse::TokenKind, left: Type, right: Type) -> Option<(Op, Type)> {
     use parse::TokenKind;
+    let pointers = left.is_pointer() && right.is_pointer();
     let left = integer_promote(left);
     let right = integer_promote(right);
-    if left != right {
+    if left != right && !pointers {
         return None;
     }
     match (op, left) {
@@ -532,19 +533,26 @@ fn binary_op(op: parse::TokenKind, left: Type, right: Type) -> Option<(Op, Type)
         (TokenKind::LtEq,     Type::F64) => Some((Op::F64LtEq, Type::Bool)),
         (TokenKind::GtEq,     Type::F64) => Some((Op::F64GtEq, Type::Bool)),
 
-        (TokenKind::Add,      Type::VoidPtr)             => Some((Op::IntAdd,  Type::VoidPtr)),
-        (TokenKind::Sub,      Type::VoidPtr)             => Some((Op::IntSub,  Type::VoidPtr)),
-        (TokenKind::Add,      Type::U8Ptr)               => Some((Op::IntAdd,  Type::U8Ptr)),
-        (TokenKind::Sub,      Type::U8Ptr)               => Some((Op::IntSub,  Type::U8Ptr)),
-        (TokenKind::GtEq,     Type::U8Ptr|Type::VoidPtr) => Some((Op::IntGtEq, Type::Bool)),
-        (TokenKind::Lt,       Type::U8Ptr|Type::VoidPtr) => Some((Op::IntLt,   Type::Bool)),
-        (TokenKind::Gt,       Type::U8Ptr|Type::VoidPtr) => Some((Op::IntGt,   Type::Bool)),
-        (TokenKind::Eq,       Type::U8Ptr|Type::VoidPtr) => Some((Op::IntEq,   Type::Bool)),
-        (TokenKind::NEq,      Type::U8Ptr|Type::VoidPtr) => Some((Op::IntNEq,  Type::Bool)),
-        (TokenKind::LtEq,     Type::U8Ptr|Type::VoidPtr) => Some((Op::IntLtEq, Type::Bool)),
+        (TokenKind::GtEq, _)  if pointers => Some((Op::IntGtEq, Type::Bool)),
+        (TokenKind::Lt,   _)  if pointers => Some((Op::IntLt,   Type::Bool)),
+        (TokenKind::Gt,   _)  if pointers => Some((Op::IntGt,   Type::Bool)),
+        (TokenKind::Eq,   _)  if pointers => Some((Op::IntEq,   Type::Bool)),
+        (TokenKind::NEq,  _)  if pointers => Some((Op::IntNEq,  Type::Bool)),
+        (TokenKind::LtEq, _)  if pointers => Some((Op::IntLtEq, Type::Bool)),
 
         _ => None
     }
+}
+
+fn is_address_computation(op: parse::TokenKind, left: Type, right: Type) -> bool {
+    use parse::TokenKind::*;
+    matches!(op, Add|Sub) && ((left.is_pointer() && right.is_integer()) || (left.is_integer() && right.is_pointer()))
+}
+
+fn is_offset_computation(ctx: &Compiler, op: parse::TokenKind, left: Type, right: Type) -> bool {
+    use parse::TokenKind::*;
+    // See... annoying
+    matches!(op, Sub) && left.is_pointer() && right.is_pointer() && ctx.types.annoying_deep_eq(left, right)
 }
 
 fn convert_op(from: Type, to: Type) -> Option<Op> {
@@ -1393,6 +1401,72 @@ impl FatGen {
         }
     }
 
+    fn compute_address(&mut self, ctx: &mut Compiler, base: &ExprResult, index: &ExprResult) -> Location {
+        let base_type = ctx.types.base_type(base.ty);
+        let element_size = ctx.types.info(base_type).size;
+        let addr = match index.value {
+            Some(value) => {
+                let index = unsafe { value.sint };
+                let offset = index * element_size as isize;
+                if base.ty.is_pointer() {
+                    // mostly the same code as below
+                    let offset_reg = self.constant(offset.into());
+                    let (old_base_reg, old_offset) = if base.addr.kind == LocationKind::Based {
+                        (base.addr.base, base.addr.offset)
+                    } else {
+                        (self.register(&base), 0)
+                    };
+                    let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                    Location::based(base_reg, old_offset, base.addr.is_mutable)
+                } else {
+                    base.addr.offset_by(offset)
+                }
+            }
+            None => {
+                // This has a transposition where, if accessing an array member of a
+                // pointer, we update the base pointer, but leave the offset intact.
+                // In other words, we compute
+                //      a.b[i]
+                // as
+                //      (a +   i*sizeof(b[0])).b
+                //       ^ base                ^ offset
+                // instead of
+                //      (a.b + i*sizeof(b[0]))
+                //       ^base                 ^ offset (0)
+                // So we can keep accumulating static offsets without emitting code.
+                let size_reg = self.constant(element_size.into());
+                let index_reg = self.register(&index);
+                let offset_reg = self.put3_inc(Op::IntMul, index_reg, size_reg);
+                // TODO: probably fold these 3 cases together and just decay arrays to pointers like an animal
+                if base.ty.is_pointer() {
+                    let (old_base_reg, old_offset) = if base.addr.kind == LocationKind::Based {
+                        (base.addr.base, base.addr.offset)
+                    } else {
+                        (self.register(&base), 0)
+                    };
+                    let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                    Location::based(base_reg, old_offset, true)
+                } else {
+                    match base.addr.kind {
+                        LocationKind::Stack => {
+                            let old_base_reg = self.put_inc(Op::LoadStackAddress, base.addr.offset.into());
+                            let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                            Location { base: base_reg, offset: 0, kind: LocationKind::Based, ..base.addr }
+                        }
+                        LocationKind::Based => {
+                            let old_base_reg = base.addr.base;
+                            let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                            Location { base: base_reg, ..base.addr }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        };
+        assert!(addr.is_place == true);
+        addr
+    }
+
     fn constant_expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprResult {
         // This is kind of a hack to keep constant and non-constant expressions
         // totally unified while things are still incomplete
@@ -1509,7 +1583,10 @@ impl FatGen {
                     let ty = ctx.types.base_type(left.ty);
                     if let Some(item) = ctx.types.item_info(ty, field) {
                         match left.value {
-                            Some(lv) => result.value = Some(unsafe { lv.int + item.offset }.into()),
+                            Some(lv) => {
+                                result.addr.is_place = true;
+                                result.value = Some(unsafe { lv.int + item.offset }.into());
+                            }
                             None => {
                                 let base = self.register(&left);
                                 result.addr = Location::based(base, item.offset as isize, true);
@@ -1525,6 +1602,7 @@ impl FatGen {
                     }
                 } else if let Some(item) = ctx.types.item_info(left.ty, field) {
                     debug_assert_implies!(self.error.is_none(), matches!(left.addr.kind, LocationKind::Stack|LocationKind::Based));
+                    debug_assert_implies!(self.error.is_none(), left.addr.is_place);
                     result.addr = left.addr;
                     result.addr.offset += item.offset as isize;
                     result.ty = item.ty;
@@ -1535,72 +1613,10 @@ impl FatGen {
             ExprData::Index(left_expr, index_expr) => {
                 let left = self.expr(ctx, left_expr);
                 if matches!(ctx.types.info(left.ty).kind, TypeKind::Array|TypeKind::Pointer) {
-                    let base_type = ctx.types.base_type(left.ty);
                     let index = self.expr(ctx, index_expr);
                     if index.ty.is_integer() {
-                        let element_size = ctx.types.info(base_type).size;
-                        let addr = match index.value {
-                            Some(value) => {
-                                let index = unsafe { value.sint };
-                                let offset = index * element_size as isize;
-                                if left.ty.is_pointer() {
-                                    // mostly the same code as below
-                                    let offset_reg = self.constant(offset.into());
-                                    let (old_base_reg, old_offset) = if left.addr.kind == LocationKind::Based {
-                                        (left.addr.base, left.addr.offset)
-                                    } else {
-                                        (self.register(&left), 0)
-                                    };
-                                    let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
-                                    Location::based(base, old_offset, left.addr.is_mutable)
-                                } else {
-                                    left.addr.offset_by(offset)
-                                }
-                            }
-                            None => {
-                                // This has a transposition where, if accessing an array member of a
-                                // pointer, we update the base pointer, but leave the offset intact.
-                                // In other words, we compute
-                                //      a.b[i]
-                                // as
-                                //      (a +   i*sizeof(b[0])).b
-                                //       ^ base                ^ offset
-                                // instead of
-                                //      (a.b + i*sizeof(b[0]))
-                                //       ^base                 ^ offset (0)
-                                // So we can keep accumulating static offsets without emitting code.
-                                let size_reg = self.constant(element_size.into());
-                                let index_reg = self.register(&index);
-                                let offset_reg = self.put3_inc(Op::IntMul, index_reg, size_reg);
-                                // TODO: probably fold these 3 cases together and just decay arrays to pointers like an animal
-                                if left.ty.is_pointer() {
-                                    let (old_base_reg, old_offset) = if left.addr.kind == LocationKind::Based {
-                                        (left.addr.base, left.addr.offset)
-                                    } else {
-                                        (self.register(&left), 0)
-                                    };
-                                    let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
-                                    Location::based(base, old_offset, true)
-                                } else {
-                                    match left.addr.kind {
-                                        LocationKind::Stack => {
-                                            let old_base_reg = self.put_inc(Op::LoadStackAddress, left.addr.offset.into());
-                                            let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
-                                            Location { base, offset: 0, kind: LocationKind::Based, ..left.addr }
-                                        }
-                                        LocationKind::Based => {
-                                            let old_base_reg = left.addr.base;
-                                            let base = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
-                                            Location { base, ..left.addr }
-                                        }
-                                        _ => unreachable!(),
-                                    }
-                                }
-                            }
-                        };
-                        assert!(addr.is_place == true);
-                        result.addr = addr;
-                        result.ty = base_type;
+                        result.addr = self.compute_address(ctx, &left, &index);
+                        result.ty = ctx.types.base_type(left.ty);
                         if left.ty.is_immutable_pointer() {
                             result.addr.is_mutable = false;
                             result.ty = ctx.types.immutable(result.ty);
@@ -1622,24 +1638,28 @@ impl FatGen {
                 use parse::TokenKind::*;
                 match op_token {
                     BitAnd => {
-                        match right.addr.kind {
-                            LocationKind::None|LocationKind::Return =>
-                                error!(self, ctx.ast.expr_source_position(right_expr), "cannot take address of this expression"),
-                            LocationKind::Register if !right.addr.is_place =>
-                                error!(self, ctx.ast.expr_source_position(right_expr), "cannot take address of this expression"),
-                            LocationKind::Register|LocationKind::Stack => {
-                                let base = right.addr.offset;
-                                // todo: seems weird to be setting these with kind == None
-                                result.addr.is_mutable = right.addr.is_mutable;
-                                result.addr.is_place = right.addr.is_place;
-                                result.value = Some(base.into());
+                        if right.addr.is_place {
+                            match right.addr.kind {
+                                LocationKind::None|LocationKind::Return =>
+                                    // This happens when doing offset-of type address calculations off of constant 0 pointers
+                                    result = right,
+                                LocationKind::Register|LocationKind::Stack => {
+                                    let base = right.addr.offset;
+                                    // todo: seems weird to be setting these with kind == None
+                                    result.addr.is_mutable = right.addr.is_mutable;
+                                    result.addr.is_place = right.addr.is_place;
+                                    result.value = Some(base.into());
+                                }
+                                LocationKind::Based => {
+                                    assert!(right.addr.is_place);
+                                    result.addr = Location::register(self.location_register(&right.addr));
+                                }
                             }
-                            LocationKind::Based => {
-                                result.addr = Location::register(self.location_register(&right.addr));
-                            }
+                            result.addr.is_mutable = right.addr.is_mutable;
+                            result.ty = ctx.types.pointer(right.ty);
+                        } else {
+                            error!(self, ctx.ast.expr_source_position(right_expr), "cannot take address of this expression");
                         }
-                        result.addr.is_mutable = right.addr.is_mutable;
-                        result.ty = ctx.types.pointer(right.ty);
                     }
                     Mul => {
                         if right.ty.is_pointer() {
@@ -1710,7 +1730,7 @@ impl FatGen {
                 if control.is_none() { self.patch(exit); }
                 if let Some((op, result_ty)) = binary_op(op_token, left.ty, right.ty) {
                     match (left.value, right.value) {
-                        (Some(lv), Some(rv)) if !left.ty.is_pointer() && !right.ty.is_pointer() => result.value = Some(apply_binary_op(op, lv, rv)),
+                        (Some(lv), Some(rv)) => result.value = Some(apply_binary_op(op, lv, rv)),
                         _ => {
                             let left_register = self.register(&left);
                             let right_register = self.register(&right);
@@ -1719,8 +1739,25 @@ impl FatGen {
                         }
                     }
                     result.ty = result_ty;
-                // } else if is_address_computation(op_token, left.ty, right.ty) {
-
+                } else if is_address_computation(op_token, left.ty, right.ty) {
+                    let (ptr, offset) = if left.ty.is_pointer() { assert!(right.ty.is_integer()); (&left, &right) } else { assert!(left.ty.is_integer()); (&right, &left) };
+                    let where_u_at = self.compute_address(ctx, ptr, offset);
+                    result.addr = Location::register(self.location_register(&where_u_at));
+                    result.ty = ptr.ty;
+                } else if is_offset_computation(ctx, op_token, left.ty, right.ty) {
+                    let size = ctx.types.info(ctx.types.base_type(left.ty)).size;
+                    match (left.value, right.value) {
+                        (Some(lv), Some(rv)) => result.value = Some(unsafe { (lv.sint - rv.sint) / size as isize }.into()),
+                        _ => {
+                            let left_register = self.register(&left);
+                            let right_register = self.register(&right);
+                            let size_register = self.constant(size.into());
+                            let diff_bytes_register = self.put3_inc(Op::IntSub, left_register, right_register);
+                            let result_register = self.put3_inc(Op::IntDiv, diff_bytes_register, size_register);
+                            result.addr = Location::register(result_register);
+                            result.ty = Type::Int;
+                        }
+                    }
                 } else {
                     error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types ({} {} {})", ctx.type_str(left.ty), op_token, ctx.type_str(right.ty));
                 }
@@ -1869,9 +1906,14 @@ impl FatGen {
                 }
             }
         };
-        debug_assert_implies!(self.error.is_none() && result.addr.offset == Location::BAD_LOCATION, result.addr.kind == LocationKind::None);
-        debug_assert_implies!(self.error.is_none() && result.addr.offset != Location::BAD_LOCATION, result.addr.kind != LocationKind::None);
-        debug_assert_implies!(self.error.is_none() && result.addr.base != Location::BAD_LOCATION, result.addr.kind == LocationKind::Based);
+
+        #[cfg(debug_assertions)]
+        if self.error.is_none() {
+            debug_assert_implies!(result.addr.offset == Location::BAD_LOCATION, result.addr.kind == LocationKind::None);
+            debug_assert_implies!(result.addr.offset != Location::BAD_LOCATION, result.addr.kind != LocationKind::None);
+            debug_assert_implies!(result.addr.base != Location::BAD_LOCATION, result.addr.kind == LocationKind::Based);
+            debug_assert_implies!(result.ty != Type::None, result.value.is_some() || result.addr.kind != LocationKind::None);
+        }
 
         if destination_type != Type::None {
             let result_info = ctx.types.info(result.ty);
@@ -2659,18 +2701,20 @@ fn repl() {
 fn main() {
 
     let ok = [
-(r#"
-proc main(): int {
-    a := 1:bool;
-    b := 1:bool;
-    c := 1:bool;
-    d := 0:bool;
-    while (!(a && b && c && d)) {
-        d = 1:bool;
-    }
-    return d:int;
-}
-"#, Value::Int(0)),
+        (r#"
+        proc main(): int {
+            arr := {}:arr u8 [8];
+            for (p := &arr[0]; p != &arr[8]; p = p + 1) {
+                *p =  (p - &arr[0]):u8;
+            }
+            arrp := &arr[0];
+            acc := 0;
+            for (i := 0; i < 8; i = i + 1) {
+                acc = acc + arrp[i];
+            }
+            return acc;
+        }
+        "#, Value::Int(0+1+2+3+4+5+6+7)),
 ];
     for test in ok.iter() {
         let str = test.0;
@@ -3424,6 +3468,20 @@ proc main(): int {
     return acc;
 }
 "#, Value::Int(8)),
+ (r#"
+proc main(): int {
+    arr := {}:arr u16 [8];
+    for (p := &arr[0]; p != &arr[8]; p = p + 1) {
+        *p = (p - &arr[0]):u16;
+    }
+    arrp := &arr[0];
+    acc := 0;
+    for (i := 0; i < 8; i = i + 1) {
+        acc = acc + *(arrp + (&arrp[i] - arrp));
+    }
+    return acc;
+}
+"#, Value::Int(0+1+2+3+4+5+6+7)),
 (r#"
 struct Buf {
     buf: ptr u8,
@@ -3471,6 +3529,12 @@ proc main(): int {
 "#, Value::Int(-1)),
 (r#"
 struct V2 { x: i32, y: i32 }
+proc main(): int {
+    return &(0:ptr V2).y:ptr - 0:ptr;
+}
+"#, Value::Int(4)),
+(r#"
+struct V2 { x: i32, y: i32 }
 proc rot2(vv: ptr (ptr V2)) {
     vv[0].x = -1;
     // **vv = { (-vv[0].y):i32, vv[0].x };
@@ -3512,6 +3576,18 @@ proc main(): int {
     v: V2 = {0,1};
     rot(&v);
     return v.x;
+}
+"#, r#"
+proc main(): int {
+    pp := 0:ptr u8;
+    pq := 0:ptr u16;
+    a := pq - pp;
+    return 0;
+}
+"#, r#"
+proc main(): int {
+    a := &3;
+    return 0;
 }
 "#];
     for test in ok.iter() {

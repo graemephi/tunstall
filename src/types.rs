@@ -11,7 +11,7 @@ use crate::smallvec::*;
 
 pub fn builtins(ctx: &mut Compiler) {
     let builtins = [
-        ("_",    TypeKind::None, 0),
+        ("_",    TypeKind::None, 1),
         ("int",  TypeKind::Int,  8),
         ("i8",   TypeKind::I8,   1),
         ("i16",  TypeKind::I16,  2),
