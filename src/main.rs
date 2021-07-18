@@ -309,9 +309,9 @@ struct Instr {
 #[derive(Clone, Copy, Debug)]
 struct FatInstr {
     op: Op,
-    dest: u32,
-    left: u32,
-    right: u32,
+    dest: i32,
+    left: i32,
+    right: i32,
 }
 
 impl FatInstr {
@@ -391,9 +391,9 @@ impl From<i32> for RegValue {
     }
 }
 
-impl From<(u32, u32)> for RegValue {
-    fn from(value: (u32, u32)) -> Self {
-        RegValue { int32: value }
+impl From<(i32, i32)> for RegValue {
+    fn from(value: (i32, i32)) -> Self {
+        RegValue { sint32: value }
     }
 }
 
@@ -892,6 +892,10 @@ struct ExprResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Label(usize);
 
+impl Label {
+    const BAD: Label = Label(!0);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InstrLocation(usize);
 
@@ -909,6 +913,10 @@ struct Control {
 }
 
 impl Control {
+    fn branch(true_to: Label, false_to: Label) -> Control {
+        Control { true_to, false_to, fallthrough_to: Label::BAD }
+    }
+
     fn fall_left(true_to: Label, false_to: Label) -> Control {
         Control { true_to, false_to, fallthrough_to: true_to }
     }
@@ -988,9 +996,9 @@ impl FatGen {
 
     fn put3(&mut self, op: Op, dest: isize, left: isize, right: isize) {
         if self.constant == false {
-            let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 }) as u32;
-            let left = i32::try_from(left).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 }) as u32;
-            let right = i32::try_from(right).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 }) as u32;
+            let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 });
+            let left = i32::try_from(left).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 });
+            let right = i32::try_from(right).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 });
             self.code.push(FatInstr { op, dest, left, right });
         } else {
             // todo: expr position
@@ -1000,8 +1008,8 @@ impl FatGen {
 
     fn put(&mut self, op: Op, dest: isize, data: RegValue) {
         if self.constant == false {
-            let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 }) as u32;
-            self.code.push(FatInstr { op, dest, left: unsafe { data.int32.0 }, right: unsafe { data.int32.1 }});
+            let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 });
+            self.code.push(FatInstr { op, dest, left: unsafe { data.sint32.0 }, right: unsafe { data.sint32.1 }});
         } else {
             // todo: expr position
             error!(self, 0, "non-constant expression");
@@ -1193,11 +1201,12 @@ impl FatGen {
     }
 
     fn copy_to_stack(&mut self, ctx: &Compiler, src: &ExprResult) -> Location {
-        let info = ctx.types.info(src.ty);
-        let offset = self.inc_bytes(info.size, info.alignment);
-        let result = if src.ty.is_pointer() {
-            Location::register(offset)
+        let result = if src.ty.is_basic() {
+            let reg = self.inc_reg();
+            Location::register(reg)
         } else {
+            let info = ctx.types.info(src.ty);
+            let offset = self.inc_bytes(info.size, info.alignment);
             Location::stack(offset)
         };
         self.copy(ctx, src.ty, &result, &src);
@@ -1265,9 +1274,9 @@ impl FatGen {
             for &(Label(label), InstrLocation(from)) in self.patches.iter() {
                 let InstrLocation(to) = self.labels[label];
                 assert!(to != !0);
-                assert!(self.code[from].is_jump() && self.code[from].left == label as u32);
+                assert!(self.code[from].is_jump() && self.code[from].left == label as i32);
                 let offset = (to as isize) - (from as isize) - 1;
-                let offset = i32::try_from(offset).expect("function too large") as u32;
+                let offset = i32::try_from(offset).expect("function too large");
                 self.code[from].left = offset;
             }
         }
@@ -1708,34 +1717,46 @@ impl FatGen {
                 }
             }
             ExprData::Binary(op_token, left_expr, right_expr) => {
-                let next = self.label();
-                let exit;
-                let left;
-                match op_token {
-                    parse::TokenKind::LogicAnd => {
-                        exit = control.map(|c| c.false_to).unwrap_or_else(|| self.label());
-                        left = self.expr_with_control(ctx, left_expr, Control::fall_left(next, exit));
+                let (left, right, emit);
+                if let Some(c) = control {
+                    match op_token {
+                        parse::TokenKind::LogicAnd => {
+                            let next = self.label();
+                            left = self.expr_with_control(ctx, left_expr, Control::fall_left(next, c.false_to));
+                            self.patch(next);
+                            right = self.expr_with_control(ctx, right_expr, Control::branch(c.true_to, c.false_to));
+                            emit = false;
+                        }
+                        parse::TokenKind::LogicOr  => {
+                            let next = self.label();
+                            left = self.expr_with_control(ctx, left_expr, Control::fall_right(c.true_to, next));
+                            self.patch(next);
+                            right = self.expr_with_control(ctx, right_expr, Control::branch(c.true_to, c.false_to));
+                            emit = false;
+                        }
+                        _ => {
+                            left = self.expr(ctx, left_expr);
+                            right = self.expr(ctx, right_expr);
+                            emit = true;
+                        }
                     }
-                    parse::TokenKind::LogicOr  => {
-                        exit = control.map(|c| c.true_to).unwrap_or_else(|| self.label());
-                        left = self.expr_with_control(ctx, left_expr, Control::fall_right(exit, next));
-                    }
-                    _ => {
-                        exit = self.label();
-                        left = self.expr(ctx, left_expr);
-                    }
-                };
-                self.patch(next);
-                let right = self.expr(ctx, right_expr);
-                if control.is_none() { self.patch(exit); }
+                } else {
+                    left = self.expr(ctx, left_expr);
+                    right = self.expr(ctx, right_expr);
+                    emit = true;
+                }
                 if let Some((op, result_ty)) = binary_op(op_token, left.ty, right.ty) {
                     match (left.value, right.value) {
                         (Some(lv), Some(rv)) => result.value = Some(apply_binary_op(op, lv, rv)),
                         _ => {
-                            let left_register = self.register(&left);
-                            let right_register = self.register(&right);
-                            let result_register = self.put3_inc(op, left_register, right_register);
-                            result.addr = Location::register(result_register);
+                            if emit {
+                                let left_register = self.register(&left);
+                                let right_register = self.register(&right);
+                                let result_register = self.put3_inc(op, left_register, right_register);
+                                result.addr = Location::register(result_register);
+                            } else {
+                                result.value = Some(0.into());
+                            }
                         }
                     }
                     result.ty = result_ty;
@@ -1957,14 +1978,21 @@ impl FatGen {
                         }
                     }
                     None => {
-                        let cond_register = self.register(&result);
-                        if control.true_to != control.fallthrough_to {
-                            self.put_jump_nonzero(cond_register, control.true_to);
-                        } else if control.false_to != control.fallthrough_to {
-                            self.put_jump_zero(cond_register, control.false_to);
+                        if control.fallthrough_to != Label::BAD {
+                            if control.true_to != control.fallthrough_to {
+                                let cond_register = self.register(&result);
+                                self.put_jump_nonzero(cond_register, control.true_to);
+                            } else if control.false_to != control.fallthrough_to {
+                                let cond_register = self.register(&result);
+                                self.put_jump_zero(cond_register, control.false_to);
+                            } else {
+                                assert!(control.true_to == control.false_to);
+                                self.put_jump(control.fallthrough_to);
+                            }
                         } else {
-                            assert!(control.true_to == control.false_to);
-                            self.put_jump(control.fallthrough_to);
+                            let cond_register = self.register(&result);
+                            self.put_jump_zero(cond_register, control.false_to);
+                            self.put_jump(control.true_to);
                         }
                     }
                 }
@@ -1972,7 +2000,6 @@ impl FatGen {
                 // Unconditional jump; if we have a constant value, we need to
                 // emit it. Otherwise, the caller can't place it behind the jump
                 // destination
-                assert!(control.true_to == control.fallthrough_to);
                 result = self.emit_constant(&result);
                 self.put_jump(control.true_to);
             }
@@ -2450,9 +2477,9 @@ impl Compiler {
 
         loop {
             let instr = &code[ip];
-            let dest = sp.wrapping_add(sign_extend(instr.dest));
-            let left = sp.wrapping_add(sign_extend(instr.left));
-            let right = sp.wrapping_add(sign_extend(instr.right));
+            let dest = sp.wrapping_add(instr.dest as usize);
+            let left = sp.wrapping_add(instr.left as usize);
+            let right = sp.wrapping_add(instr.right as usize);
 
             assert_implies!(requires_register_destination(instr.op), (dest & (FatGen::REGISTER_SIZE - 1)) == 0);
 
@@ -2549,9 +2576,9 @@ impl Compiler {
                     Op::StackRelativeZero =>  { for i in 0..instr.left as usize { stack![dest+i] = 0 }}
 
                     Op::Move          => { reg![dest] = reg![left]; }
-                    Op::Jump          => { ip = ip.wrapping_add(sign_extend(instr.left)); }
-                    Op::JumpIfZero    => { if reg![dest].int == 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
-                    Op::JumpIfNotZero => { if reg![dest].int != 0 { ip = ip.wrapping_add(sign_extend(instr.left)); } }
+                    Op::Jump          => { ip = ip.wrapping_add(instr.left as usize); }
+                    Op::JumpIfZero    => { if reg![dest].int == 0 { ip = ip.wrapping_add(instr.left as usize); } }
+                    Op::JumpIfNotZero => { if reg![dest].int != 0 { ip = ip.wrapping_add(instr.left as usize); } }
                     Op::Return        => {
                         let ret = call_stack.pop().expect("Bad bytecode");
                         code = ret.0;
@@ -2663,7 +2690,7 @@ func panic(): int {
     c.check_and_clear_error(str)?;
 
     if let Some(_func) = c.funcs.get(&main) {
-        c.entry_stub[0] = FatInstr { op: Op::Call, dest: 0, left: main.0, right: 0 };
+        c.entry_stub[0] = FatInstr { op: Op::Call, dest: 0, left: main.0 as i32, right: 0 };
     }
     Ok(c)
 }
@@ -2702,19 +2729,19 @@ fn main() {
 
     let ok = [
         (r#"
+        //
         proc main(): int {
-            arr := {}:arr u8 [8];
-            for (p := &arr[0]; p != &arr[8]; p = p + 1) {
-                *p =  (p - &arr[0]):u8;
+            a := 0;
+            b := 0;
+            for (; a < 10; a = a + 1) {
+                if (a > 5) {
+                    continue;
+                }
+                b = a;
             }
-            arrp := &arr[0];
-            acc := 0;
-            for (i := 0; i < 8; i = i + 1) {
-                acc = acc + arrp[i];
-            }
-            return acc;
+            return a + b;
         }
-        "#, Value::Int(0+1+2+3+4+5+6+7)),
+        "#, Value::Int(15)),
 ];
     for test in ok.iter() {
         let str = test.0;
