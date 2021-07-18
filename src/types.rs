@@ -144,6 +144,7 @@ pub struct TypeInfo {
     pub size: usize,
     pub alignment: usize,
     pub items: Vec<Item>,
+    // Types without a base_type are their own base_type
     pub base_type: Type,
     // Two kinds of type can be mutable
     //  pointers: appear as immutable when passed into funcs
@@ -223,6 +224,9 @@ impl Types {
         if result >= Type::POINTER_BIT {
             todo!("Program too big!!");
         }
+        if kind == TypeKind::Pointer {
+            result |= Type::POINTER_BIT;
+        }
         self.types.push(TypeInfo {
             kind: kind,
             name: Intern(0),
@@ -233,9 +237,6 @@ impl Types {
             mutable: true,
             num_array_elements: 0,
         });
-        if kind == TypeKind::Pointer {
-            result |= Type::POINTER_BIT;
-        }
         Type(result)
     }
 
@@ -301,6 +302,7 @@ impl Types {
     }
 
     pub fn pointer(&mut self, base_type: Type) -> Type {
+        let mut result = Type::None;
         let hash = hash(&(TypeKind::Pointer, base_type));
         if let Some(types) = self.type_by_hash.get(&hash) {
             for &ty in types.iter() {
@@ -310,7 +312,6 @@ impl Types {
                 }
             }
         }
-        let mut result = Type::None;
         {
             let ty = self.make(TypeKind::Pointer);
             let ptr = self.info_mut(ty);
@@ -353,7 +354,7 @@ impl Types {
         let left = Type(ty.0 - 1);
         let left_info = self.info(left);
         if left_info.base_type == info.base_type
-             && left_info.kind == TypeKind::Pointer {
+        && left_info.kind == TypeKind::Pointer {
             assert!(left_info.mutable == false);
             assert!(left.is_immutable_pointer());
             return left;
@@ -361,12 +362,47 @@ impl Types {
         let right = Type(ty.0 + 1);
         let right_info = self.info(right);
         if right_info.base_type == info.base_type
-             && right_info.kind == TypeKind::Pointer {
+        && right_info.kind == TypeKind::Pointer {
             assert!(right_info.mutable == false);
             assert!(right.is_immutable_pointer());
             return right;
         }
         unreachable!();
+    }
+
+    pub fn mutable(&self, ty: Type) -> Type {
+        if !ty.is_pointer() {
+            return ty;
+        }
+        let info = self.info(ty);
+        if info.mutable {
+            return ty;
+        }
+        let left = Type(ty.0 - 1);
+        let left_info = self.info(left);
+        if left_info.base_type == info.base_type
+        && left_info.kind == TypeKind::Pointer {
+            assert!(left_info.mutable == true);
+            assert!(!left.is_immutable_pointer());
+            return left;
+        }
+        let right = Type(ty.0 + 1);
+        let right_info = self.info(right);
+        if right_info.base_type == info.base_type
+        && right_info.kind == TypeKind::Pointer {
+            assert!(right_info.mutable == true);
+            assert!(!right.is_immutable_pointer());
+            return right;
+        }
+        unreachable!();
+    }
+
+    pub fn copy_mutability(&self, dest: Type, src: Type) -> Type {
+        if src.is_immutable_pointer() {
+            self.immutable(dest)
+        } else {
+            self.mutable(dest)
+        }
     }
 
     pub fn base_type(&self, ty: Type) -> Type {
