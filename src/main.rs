@@ -17,6 +17,7 @@ use ast::*;
 use smallvec::*;
 use sym::*;
 use types::*;
+use parse::Keytype;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -172,7 +173,12 @@ fn interns() {
 fn new_interns_with_keywords() -> Interns {
     let mut result = Interns::new();
     result.put("");
+    let mut i = 1;
     for k in (1..).scan((), |(), v| parse::Keyword::from_u32(v)) {
+        result.put(k.to_str());
+        i += 1;
+    }
+    for k in (i..).scan((), |(), v| parse::Keytype::from_u32(v)) {
         result.put(k.to_str());
     }
     result
@@ -184,6 +190,10 @@ fn keywords() {
 
     let mut i = Intern(1);
     for k in (1..).scan((), |(), v| parse::Keyword::from_u32(v)) {
+        assert_eq!(interns.put(k.to_str()), i);
+        i.0 += 1;
+    }
+    for k in (i.0..).scan((), |(), v| parse::Keytype::from_u32(v)) {
         assert_eq!(interns.put(k.to_str()), i);
         i.0 += 1;
     }
@@ -1291,7 +1301,7 @@ impl FatGen {
 
     fn type_expr(&mut self, ctx: &mut Compiler, expr: TypeExpr) -> Type {
         let mut result = Type::None;
-        match ctx.ast.type_expr(expr) {
+        match *ctx.ast.type_expr(expr) {
             TypeExprData::Infer => (unreachable!()),
             TypeExprData::Name(name) => {
                 if name == ctx.intern("ptr") {
@@ -1303,14 +1313,15 @@ impl FatGen {
                     self.error = old_error.or(resolve_error);
                 }
             }
-            TypeExprData::Expr(_) => unreachable!(),
+            TypeExprData::Expr(_) => todo!(),
+            TypeExprData::Items(_) => todo!(),
             TypeExprData::List(name, args) => {
                 let mut args = args;
                 if name == ctx.intern("arr") {
                     if let Some(ty_expr) = args.next() {
                         let ty = self.type_expr(ctx, ty_expr);
                         if let Some(len_expr) = args.next() {
-                            if let TypeExprData::Expr(len_expr) = ctx.ast.type_expr(len_expr) {
+                            if let TypeExprData::Expr(len_expr) = *ctx.ast.type_expr(len_expr) {
                                 let len = self.constant_expr(ctx, len_expr);
                                 if len.ty.is_integer() && len.value.is_some() {
                                     // TODO: This convert op is a roundabout way to check for the positive+fits condition
@@ -1343,7 +1354,7 @@ impl FatGen {
                     if let Some(ty_expr) = args.next() {
                         let ty = self.type_expr(ctx, ty_expr);
                         if let Some(bound_expr) = args.next() {
-                            if let TypeExprData::Expr(bound_expr) = ctx.ast.type_expr(bound_expr) {
+                            if let TypeExprData::Expr(bound_expr) = *ctx.ast.type_expr(bound_expr) {
                                 let bound = self.constant_expr(ctx, bound_expr);
                                 if bound.ty.is_integer() {
                                     todo!();
@@ -2258,15 +2269,16 @@ impl FatGen {
         let callable = ctx.ast.callable(decl);
         let body = callable.body;
         let sig = ctx.types.info(signature);
-        self.generating_code_for_func = callable.kind == CallableKind::Function;
+        let kind = ctx.ast.type_expr_keytype(callable.expr).expect("tried to generate code for callable without keytype");
+        let params = ctx.ast.type_expr_index_items(callable.expr, 0).expect("tried to generate code for callable without parameters");
+        self.generating_code_for_func = ctx.ast.type_expr_keytype(callable.expr) == Some(Keytype::Func);
         assert!(self.code.len() == 0);
         assert!(sig.kind == TypeKind::Callable);
-        assert!(callable.params.len() == sig.items.len() - 1, "the last element of a callable's type signature's items must be the return type");
+        assert!(params.len() == sig.items.len() - 1, "the last element of a callable's type signature's items must be the return type");
         self.return_type = sig.items.last().map(|i| i.ty).unwrap();
         assert_implies!(self.generating_code_for_func, self.return_type != Type::None);
-        self.reg_counter = 1 - sig.items.len() as isize;
-        self.reg_counter *= Self::REGISTER_SIZE as isize;
-        let param_names = callable.params.map(|item| ctx.ast.item(item).name);
+        self.reg_counter = (Self::REGISTER_SIZE as isize) * (1 - sig.items.len() as isize);
+        let param_names = params.map(|item| ctx.ast.item(item).name);
         let param_types = sig.items.iter().map(|i| i.ty);
         let top = self.locals.push_scope();
         for (name, ty) in Iterator::zip(param_names, param_types) {
@@ -2293,7 +2305,7 @@ impl FatGen {
         if self.return_type != Type::None {
             if matches!(returned, None) {
                 let callable = ctx.ast.callable(decl);
-                error!(self, callable.pos, "{} {}: not all control paths return a value", callable.kind, ctx.str(callable.name))
+                error!(self, callable.pos, "{} {}: not all control paths return a value", kind, ctx.str(callable.name))
             }
         } else {
             self.put0(Op::Return);
@@ -2464,6 +2476,8 @@ impl Compiler {
         let layout = std::alloc::Layout::array::<RegValue>(8192).unwrap();
         let stack: *mut [u8] = unsafe {
             let ptr = std::alloc::alloc(layout);
+            // Zero the first register so we don't return junk if the entry stub immediately halts
+            *(ptr as *mut usize) = 0;
             std::slice::from_raw_parts_mut(ptr, layout.size())
         };
 
@@ -2626,7 +2640,7 @@ fn compile(str: &str) -> Result<Compiler> {
     let mut c = Compiler::new();
 
     c.ast = parse::parse(&mut c, r#"
-func panic(): int {
+panic: func () int {
     // built-in
 }
 "#);
@@ -2703,7 +2717,7 @@ fn compile_and_run(str: &str) -> Result<Value> {
 }
 
 fn eval_expr(str: &str) -> Result<Value> {
-    compile_and_run(&format!("proc main(): int {{ return {}; }}", str))
+    compile_and_run(&format!("main: proc () int {{ return {}; }}", str))
 }
 
 fn repl() {
@@ -2727,13 +2741,7 @@ fn main() {
 
     let ok = [
         (r#"
-
-        proc main(): int {
-            if (0:bool && 1:bool) {
-                return 1;
-            }
-            return 0;
-        }
+        func: func (func, proc: int) int { return a + b; }
         "#, Value::Int(0)),
 ];
     for test in ok.iter() {
@@ -2821,31 +2829,33 @@ fn stmt() {
         "();"
     ];
     for str in ok.iter() {
-        compile_and_run(&format!("proc main(): int {{ {{ {} }} return 0; }}", str)).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
+        compile_and_run(&format!("main: proc () int {{ {{ {} }} return 0; }}", str)).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
     }
     for str in err.iter() {
         // Not checking it's the right error yet--maybe later
-        compile_and_run(&format!("proc main(): int {{ {{ {} }} return 0; }}", str)).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+        compile_and_run(&format!("main: proc () int {{ {{ {} }} return 0; }}", str)).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
     }
 }
 
 #[test]
 fn decls() {
     let ok = [
-        "func add(a: int, b: int): int { return a + b; }",
-        "func add'(a: int, b: int): int { return a + b; }",
-        "struct V2 { x: f32, y: f32 }",
-        "struct V1 { x: f32 } struct V2 { x: V1, y: V1 }",
+        "add: func (a: int, b: int) int { return a + b; }",
+        "add': func (a: int, b: int) int { return a + b; }",
+        "V2: struct ( x: f32, y: f32 );",
+        "V2: struct ( x, y: f32 );",
+        "func: func (func, proc: int) int { return func + proc; }",
+        "V1: struct ( x: f32 ); V2: struct ( x: V1, y: V1 );",
     ];
     let err = [
-        "func func(a: int, b: int): int { return a + b; }",
-        "func dup_func(a: int, b: int): int { return a + b; } func dup_func(a: int, b: int): int { return a + b; }",
-        "func dup_param(a: int, a: int): int { return a + a; }",
-        "struct empty {}",
-        "struct dup_struct { x: f32 } struct dup_struct { x: f32 }",
-        "struct dup_field { x: f32, x: f32 }",
-        "struct circular { x: circular }",
-        "struct circular1 { x: circular2 } struct circular2 { x: circular1 }"
+        "dup_func: func (a: int, b: int) int { return a + b; } dup_func: func (a: int, b: int) int { return a + b; }",
+        "dup_param: func (a: int, a: int) int { return a + a; }",
+        "empty: struct ();",
+        "dup: struct ( x: f32 ); dup: struct ( y: f32 );",
+        "dup_: struct{: struct (: f32 ) dup_: struct{: struct (: f32 );",
+        "dup_field: struct ( x: f32, x: f32 );",
+        "circular: struct ( x: circular );",
+        "circular1: struct ( x: circular2 ); circular2: struct ( x: circular1 );"
     ];
     for str in ok.iter() {
         compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
@@ -2859,16 +2869,16 @@ fn decls() {
 #[test]
 fn control_paths() {
     let ok = [
-        "func control_paths(a: int, b: int, c: bool): int { if (c) { return a + b; } else { return a - b; } }",
-        "func control_paths(a: int, b: int, c: bool): int { while (c) { return a; } }",
-        "func control_paths(a: int, b: int, c: bool): int { return a; while (c) { if (c) { return a; } } }",
+        "control_paths: func (a: int, b: int, c: bool) int { if (c) { return a + b; } else { return a - b; } }",
+        "control_paths: func (a: int, b: int, c: bool) int { while (c) { return a; } }",
+        "control_paths: func (a: int, b: int, c: bool) int { return a; while (c) { if (c) { return a; } } }",
     ];
     let err = [
-        "func control_paths(a: int) {}",
-        "func control_paths(a: int, b: int, c: bool): int { if (c) { return a + b; } }",
-        "func control_paths(a: int, b: int, c: bool): int { if (c) { return a + b; } else { } }",
-        "func control_paths(a: int, b: int, c: bool): int { if (c) {} else { return a - b; } }",
-        "func control_paths(a: int, b: int, c: bool): int { while (c) { if (c) { return a; } } }",
+        "control_paths: func (a: int) {}",
+        "control_paths: func (a: int, b: int, c: bool) int { if (c) { return a + b; } }",
+        "control_paths: func (a: int, b: int, c: bool) int { if (c) { return a + b; } else { } }",
+        "control_paths: func (a: int, b: int, c: bool) int { if (c) {} else { return a - b; } }",
+        "control_paths: func (a: int, b: int, c: bool) int { while (c) { if (c) { return a; } } }",
     ];
     for str in ok.iter() {
         compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
@@ -2882,15 +2892,15 @@ fn control_paths() {
 #[test]
 fn int_promotion() {
     let ok = [
-        "func pro(): int { a: u8 = 1; b: u8 = 2; return a + b; }",
-        "func pro(): int { a: u8 = 1; b: u16 = 2; return a + b; }",
-        "func pro(): int { a: u8 = 1; b: i16 = 2; return a + b; }",
-        "func pro(): int { a: u8 = 255:i16:u8; return a; }",
-        "func pro(): int { a: u8 = 256:i16:u8; return a; }",
+        "pro: func () int { a: u8 = 1; b: u8 = 2; return a + b; }",
+        "pro: func () int { a: u8 = 1; b: u16 = 2; return a + b; }",
+        "pro: func () int { a: u8 = 1; b: i16 = 2; return a + b; }",
+        "pro: func () int { a: u8 = 255:i16:u8; return a; }",
+        "pro: func () int { a: u8 = 256:i16:u8; return a; }",
     ];
     let err = [
-        "func pro(): u8 { a: u8 = 1; b: u8 = 2; return a + b; }",
-        "func pro(): int { a: u16 = 256:i16:u8; return a; }",
+        "pro: func () u8 { a: u8 = 1; b: u8 = 2; return a + b; }",
+        "pro: func () int { a: u16 = 256:i16:u8; return a; }",
     ];
     for str in ok.iter() {
         compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
@@ -2904,14 +2914,14 @@ fn int_promotion() {
 #[test]
 fn fits() {
     let err = [
-        "func fits(): int { a: u8 = -1; return a; }",
-        "func fits(): int { a: i8 = 128; return a; }",
-        "func fits(): int { a: u8 = 256; return a; }",
-        "func fits(): int { a: i16 = 32768; return a; }",
-        "func fits(): int { a: u16 = 65536; return a; }",
-        "func fits(): int { a: i32 = 2147483648; return a; }",
-        "func fits(): int { a: u32 = 4294967296; return a; }",
-        "func fits(): int { a := 18446744073709551616; return a; }",
+        "fits: func () int { a: u8 = -1; return a; }",
+        "fits: func () int { a: i8 = 128; return a; }",
+        "fits: func () int { a: u8 = 256; return a; }",
+        "fits: func () int { a: i16 = 32768; return a; }",
+        "fits: func () int { a: u16 = 65536; return a; }",
+        "fits: func () int { a: i32 = 2147483648; return a; }",
+        "fits: func () int { a: u32 = 4294967296; return a; }",
+        "fits: func () int { a := 18446744073709551616; return a; }",
     ];
     for str in err.iter() {
         // Not checking it's the right error yet--maybe later
@@ -2923,16 +2933,16 @@ fn fits() {
 fn func() {
     let ok = [
 (r#"
-func madd(a: int, b: int, c: int): int {
+madd: func (a: int, b: int, c: int) int {
     return a * b + c;
 }
 
-proc main(): int {
+main: proc () int {
     return madd(1, 2, 3);
 }
 "#, Value::Int(5)),
 (r#"
-func fib(n: int): int {
+fib: func (n: int) int {
     if (n <= 1) {
         return n;
     }
@@ -2940,63 +2950,63 @@ func fib(n: int): int {
     return fib(n - 2) + fib(n - 1);
 }
 
-proc main(): int {
+main: proc () int {
     return fib(6);
 }
 "#, Value::Int(8)),
 (r#"
-func even(n: int): bool {
+even: func (n: int) bool {
     return n == 0 ? 1:bool :: odd(n - 1);
 }
 
-func odd(n: int): bool {
+odd: func (n: int) bool {
     return n == 0 ? 0:bool :: even(n - 1);
 }
 
-proc main(): int {
+main: proc () int {
     return even(10):int;
 }
 "#, Value::Int(1)),
 (r#"
-struct V2 { x: f32, y: f32 }
+V2: struct ( x: f32, y: f32 );
 
-func dot(a: V2, b: V2): f32 {
+dot: func (a: V2, b: V2) f32 {
     return a.x*b.x + a.y*b.y;
 }
 
-proc main(): int {
+main: proc () int {
     return dot({ 1.0, 2.0 }, { 3.0, 4.0 }):i32;
 }
 "#, Value::Int(3+8)),
 (r#"
-struct V2 { x: i32, y: i32 }
+V2: struct ( x, y: i32 );
 
-func add(a: V2, b: V2): V2 {
+add: func (a: V2, b: V2) V2 {
     return { (a.x + b.x):i32, (a.y + b.y):i32 };
 }
 
-proc main(): int {
+main: proc () int {
     v := add({1, 2}, {3, 4});
     return v.y;
 }
 "#, Value::Int(2+4)),
 (r#"
 // identical codegen
-func sum(a: arr i32 [3]): int {
+sum: func (a: arr i32 [3]) int {
     acc := 0;
     for (i := 0; i < 3; i = i + 1) {
         acc = acc + a[i];
     }
     return acc;
 }
-func sum2(a: ptr (arr i32 [3])): int {
+sum2: func (a: ptr (arr i32 [3])) int {
     acc := 0;
     for (i := 0; i < 3; i = i + 1) {
         acc = acc + (*a)[i];
     }
     return acc;
 }
-func sum3(a: ptr i32): int {
+sum3: func (a: ptr i32) int {
     acc := 0;
     for (i := 0; i < 3; i = i + 1) {
         acc = acc + a[i];
@@ -3004,12 +3014,12 @@ func sum3(a: ptr i32): int {
     return acc;
 }
 
-proc main(): int {
+main: proc () int {
     return sum({2,3,1}) + sum2(&{2,3,1}) + sum3({2,3,1}:arr i32 [3]);
 }
 "#, Value::Int(18)),
 (r#"
-proc does_something_without_return_value(a: ptr i32) {
+does_something_without_return_value: proc (a: ptr i32) {
     if (*a == 0) {
         *a = 1;
         return;
@@ -3018,7 +3028,7 @@ proc does_something_without_return_value(a: ptr i32) {
     *a = 2;
 }
 
-proc main(): int {
+main: proc () int {
     a: i32 = 1;
     does_something_without_return_value(&a);
     return a;
@@ -3026,15 +3036,15 @@ proc main(): int {
 "#, Value::Int(2)),
     ];
     let err = [r#"
-proc even(n: int): bool {
+even: proc (n: int) bool {
     return n == 0 ? 1:bool :: odd(n - 1);
 }
 
-func odd(n: int): bool {
+odd: func (n: int) bool {
     return n == 0 ? 0:bool :: even(n - 1);
 }
 
-proc main(): int {
+main: proc () int {
     return even(10):int;
 }
 "#];
@@ -3055,7 +3065,7 @@ proc main(): int {
 fn control_structures() {
     let ok = [
 (r#"
-proc main(): int {
+main: proc () int {
     a := 0;
     for (i := 0; i < 10; i = i + 1) {
         a = a + 1;
@@ -3064,14 +3074,14 @@ proc main(): int {
 }
 "#, Value::Int(10)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 0;
     for (; a < 10; a = a + 2) {}
     return a;
 }
 "#, Value::Int(10)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 1:bool;
     b := 1:bool;
     c := 1:bool;
@@ -3083,7 +3093,7 @@ proc main(): int {
 }
 "#, Value::Int(1)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 0;
     for (;;) {
         a = a + 1;
@@ -3097,7 +3107,7 @@ proc main(): int {
 "#, Value::Int(10)),
 (r#"
 //
-proc main(): int {
+main: proc () int {
     a := 0;
     b := 0;
     for (; a < 10; a = a + 1) {
@@ -3110,7 +3120,7 @@ proc main(): int {
 }
 "#, Value::Int(15)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 10;
     switch (a) {
         1 {}
@@ -3125,7 +3135,7 @@ proc main(): int {
 }
 "#, Value::Int(100)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 3.0;
     b := 0;
     switch (a) {
@@ -3146,7 +3156,7 @@ proc main(): int {
 }
 "#, Value::Int(1)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 3.0;
     b := 0;
     switch (a) {
@@ -3167,7 +3177,7 @@ proc main(): int {
 }
 "#, Value::Int(4)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 1;
     do {
         if (a > 2) {
@@ -3179,7 +3189,7 @@ proc main(): int {
     return a;
 }"#, Value::Int(14)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 1;
     b := 2;
     c := 3;
@@ -3187,11 +3197,11 @@ proc main(): int {
     return b;
 }"#, Value::Int(4)),
 (r#"
-proc inc(p: ptr int): bool {
+inc: proc (p: ptr int) bool {
     *p = *p + 2;
     return 0;
 }
-proc main(): int {
+main: proc () int {
     t := !!1;
     f := !!0;
     v := 1;
@@ -3217,26 +3227,27 @@ proc main(): int {
 fn structs() {
     let ok = [
 (r#"
-struct i32x4 {
+i32x4: struct (
     a: i32,
     b: i32,
     c: i32,
     d: i32,
-}
-proc main(): int {
+);
+
+main: proc () int {
     a := {-1,-1,-1,-1}:i32x4;
     return a.d:int;
 }
 "#, Value::Int(-1)),
 (r#"
-struct RGBA {
+RGBA: struct (
     r: i8,
     g: i8,
     b: i8,
     a: i8,
-}
+);
 
-proc main(): int {
+main: proc () int {
     c := { r = 1, g = 2, b = 3, a = 4 }:RGBA;
     d := { g = 5, r = 6, a = 7, b = 8, }:RGBA;
     e: RGBA = { 9, 10, 11, 12 };
@@ -3245,16 +3256,16 @@ proc main(): int {
 }
 "#, Value::Int(0x01050B00)),
 (r#"
-struct Outer {
+Outer: struct (
     inner: Inner
-}
+);
 
-struct Inner {
+Inner: struct (
     ignored: i32,
     value: i32
-}
+);
 
-proc main(): int {
+main: proc () int {
     a: Outer = { inner = { value = -1234 }};
     b: Outer = { inner = { value = -1234 }:Inner };
     c := { inner = { value = a.inner.value }:Inner }:Outer;
@@ -3282,33 +3293,33 @@ proc main(): int {
 }
 "#, Value::Int(-1234)),
 (r#"
-struct V2 {
+V2: struct (
     x: i32,
     y: i32
-}
+);
 
-func fn(): i32 {
+fn: func () i32 {
     a := { x = 2 }:V2;
     b := { x = 3 }:V2;
     a = b;
     return b.x;
 }
 
-proc main(): int {
+main: proc () int {
     a := 0;
     b := 0;
     return fn():int;
 }
 "#, Value::Int(3)),
 (r#"
-struct V2 {
+V2: struct (
     x: i32,
     y: i32,
     z: i32,
     w: i32,
-}
+);
 
-proc main(): int {
+main: proc () int {
     a := ({ x = -1 }:V2).x;
     b := (a == -1) ? { w = 3 }:V2 :: { w = 4 }:V2;
     return b.w:int;
@@ -3316,25 +3327,25 @@ proc main(): int {
 "#, Value::Int(3)),
 ];
     let err = [r#"
-proc main(): int {
+main: proc () int {
     v := {0}:int;
     return v;
 }
 "#, r#"
-struct V2 { x: int, y: int }
-proc main(): int {
+V2: struct ( x: int, y: int );
+main: proc () int {
     v := {}:V2;
     v.a = 0;
     return v.x:int;
 }
 "#, r#"
-struct V2 { x: int, y: int }
-proc main(): int {
+V2: struct ( x: int, y: int );
+main: proc () int {
     v := { a = 0 }:V2;
     return v.a;
 },
-struct V2 { x: int, y: int }
-proc main(): int {
+V2: struct ( x: int, y: int );
+main: proc () int {
     v := { x = 0, 1 }:V2;
     return v.a;
 }
@@ -3357,10 +3368,10 @@ proc main(): int {
 fn arr() {
     let ok = [
 (r#"
-struct asdf {
+asdf: struct (
     arr: arr int [4],
-}
-proc main(): int {
+);
+main: proc () int {
     asdf := {}:asdf;
     arr: arr int [4:i8] = {};
     asdf.arr[0] = 1;
@@ -3376,7 +3387,7 @@ proc main(): int {
 }
 "#, Value::Int(321)),
 (r#"
-proc main(): int {
+main: proc () int {
     arr := {}:arr u8 [8];
     for (i := 0; i != 8; i = i + 1) {
         arr[i] = 1;
@@ -3389,9 +3400,9 @@ proc main(): int {
 }
 "#, Value::Int(8)),
 (r#"
-struct V4 { padding: i16, c: arr i32 [4] }
-struct M4 { padding: i16, r: arr V4 [4] }
-proc main(): int {
+V4: struct ( padding: i16, c: arr i32 [4] );
+M4: struct ( padding: i16, r: arr V4 [4] );
+main: proc () int {
     a: M4 = {
         r = {
             { c = { 1, 2, 3, 4}},
@@ -3407,18 +3418,18 @@ proc main(): int {
 "#, Value::Int(15)),
 ];
     let err = ["r#
-proc main(): int {
+main: proc () int {
     a := 2;
     arr: arr int [a] = {};
     return arr[0];
 }
 #",r#"
-proc main(): int {
+main: proc () int {
     arr: arr int [1] = { 0 = 1 };
     return arr[0];
 }
 "#, r#"
-proc main(): int {
+main: proc () int {
     arr: arr int [4.0] = {};
     return arr[0];
 }
@@ -3440,7 +3451,7 @@ proc main(): int {
 fn ptr() {
     let ok = [
 (r#"
-proc main(): int {
+main: proc () int {
     a := 1;
     b := &a;
     *b = 2;
@@ -3448,7 +3459,7 @@ proc main(): int {
 }
 "#, Value::Int(2)),
 (r#"
-proc main(): int {
+main: proc () int {
     a := 1;
     *&a = 2;
     b := &a:int;
@@ -3456,8 +3467,8 @@ proc main(): int {
 }
 "#, Value::Int(2)),
 (r#"
-struct V2 { x: i32, y: i32 }
-proc main(): int {
+V2: struct (x: i32, y: i32);
+main: proc () int {
     aa := {1, 2}:V2;
     bb := aa;
     a := &aa;
@@ -3475,7 +3486,7 @@ proc main(): int {
 }
 "#, Value::Int(3)),
 (r#"
-proc main(): int {
+main: proc () int {
     arr := {}:arr u8 [8];
     for (p := &arr[0]; p != &arr[8]; p = p + 1) {
         *p = 1;
@@ -3489,7 +3500,7 @@ proc main(): int {
 }
 "#, Value::Int(8)),
  (r#"
-proc main(): int {
+main: proc () int {
     arr := {}:arr u16 [8];
     for (p := &arr[0]; p != &arr[8]; p = p + 1) {
         *p = (p - &arr[0]):u16;
@@ -3503,11 +3514,11 @@ proc main(): int {
 }
 "#, Value::Int(0+1+2+3+4+5+6+7)),
 (r#"
-struct Buf {
+Buf: struct (
     buf: ptr u8,
     len: int
-}
-proc main(): int {
+);
+main: proc () int {
     arr := {}:arr u8 [8];
     arr[1] = 1;
     buf: Buf = { &arr[0], 8 };
@@ -3515,19 +3526,19 @@ proc main(): int {
 }
 "#, Value::Int(1)),
 (r#"
-struct A {
+A: struct (
     padding: arr i16 [9],
     b: ptr B
-}
-struct B {
+);
+B: struct (
     padding: arr i16 [3],
     c: ptr C
-}
-struct C {
+);
+C: struct (
     padding: i16,
     d: ptr i32
-}
-proc main(): int {
+);
+main: proc () int {
     d := -1234;
     c: C = {d=&d:ptr(i32)};
     b: B = {c=&c};
@@ -3536,34 +3547,34 @@ proc main(): int {
 }
 "#, Value::Int(-1234)),
 (r#"
-struct V2 { x: i32, y: i32 }
-proc rot(v: ptr V2): int {
+V2: struct (x: i32, y: i32);
+rot: proc(v: ptr V2)int {
     *v = { (-v.y):i32, v.x };
     return 0;
 }
-proc main(): int {
+main: proc () int {
     v: V2 = {0,1};
     rot(&v);
     return v.x;
 }
 "#, Value::Int(-1)),
 (r#"
-struct V2 { x: i32, y: i32 }
-proc main(): int {
+V2: struct (x: i32, y: i32);
+main: proc () int {
     return &(0:ptr V2).y:ptr - 0:ptr;
 }
 "#, Value::Int(4)),
 (r#"
-struct V2 { x: i32, y: i32 }
-proc rot2(vv: ptr (ptr V2)) {
+V2: struct (x: i32, y: i32);
+rot2: proc(vv: ptr (ptr V2)) {
     vv[0].x = -1;
     // **vv = { (-vv[0].y):i32, vv[0].x };
 }
-proc rot1(v: ptr V2) {
+rot1: proc(v: ptr V2) {
     vv := &v;
     rot2(vv);
 }
-proc main(): int {
+main: proc () int {
     v: V2 = {0,1};
     rot1(&v);
     return v.x;
@@ -3571,41 +3582,41 @@ proc main(): int {
 "#, Value::Int(-1)),
 ];
     let err = [r#""
-proc main(): int {
+main: proc () int {
     a := 1;
     return *a;
 }
 "#,r#"
-proc main(): int {
+main: proc () int {
     a := &-1:u8;
     return *a;
 }
 "#,r#"
-proc main(): int {
+main: proc () int {
     a := -1;
     b := &a:f32;
     return *b;
 }
 "#,r#"
-struct V2 { x: i32, y: i32 }
-func rot(v: ptr V2): int {
+V2: struct (x: i32, y: i32);
+rot: func (v: ptr V2) int {
     *v = { (-v.y):i32, v.x };
     return 0;
 }
-proc main(): int {
+main: proc () int {
     v: V2 = {0,1};
     rot(&v);
     return v.x;
 }
 "#, r#"
-proc main(): int {
+main: proc () int {
     pp := 0:ptr u8;
     pq := 0:ptr u16;
     a := pq - pp;
     return 0;
 }
 "#, r#"
-proc main(): int {
+main: proc () int {
     a := &3;
     return 0;
 }

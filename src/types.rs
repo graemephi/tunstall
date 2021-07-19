@@ -471,44 +471,44 @@ impl Types {
 #[test]
 fn types() {
     let code = r#"
-struct V2 {
+V2: struct (
     x: f32,
     y: f32
-}
+);
 
-struct Rect {
+Rect: struct (
     top_left: V2,
     bottom_right: V2
-}
+);
 
-struct Rect2 {
+Rect2: struct (
     verts: arr f32 [4],
     value: f32
-}
+);
 
-struct Arr {
+Arr: struct (
     arr1: arr (arr i32 [3]) [7],
     arr2: arr (arr i32 [3]) [7]
-}
+);
 
-struct Padding {
+Padding: struct (
     a: i16,
     b: i32,
     c: i64,
     d: i8
-}
+);
 
-struct Padding2 {
+Padding2: struct (
     a: i16,
     b: Padding,
     c: i16,
-}
+);
 
-struct Ptr {
+Ptr: struct (
     a: ptr,
     b: ptr u8,
     c: ptr int
-}
+);
     "#;
 
     let mut c = crate::compile(&code).unwrap();

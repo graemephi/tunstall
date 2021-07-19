@@ -4,6 +4,7 @@ use std::fmt::Display;
 
 use crate::Intern;
 use crate::parse::TokenKind;
+use crate::parse::Keytype;
 
 macro_rules! define_node_list {
     ($Node: ident, $List: ident, $ListIter: ident) => {
@@ -126,6 +127,7 @@ pub enum TypeExprData {
     Name(Intern),
     Expr(Expr),
     List(Intern, TypeExprList),
+    Items(ItemList)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -160,21 +162,6 @@ pub enum StmtData {
     VarDecl(TypeExpr, Expr, Expr)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallableKind {
-    Function,
-    Procedure
-}
-
-impl Display for CallableKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            CallableKind::Function => write!(f, "func"),
-            CallableKind::Procedure => write!(f, "proc"),
-        }
-    }
-}
-
 /// A named declaration of a type, as in function parameters and
 /// struct fields.
 #[derive(Clone, Copy, Debug, Default)]
@@ -195,9 +182,7 @@ define_node_list!(Decl, DeclList, DeclListIter);
 pub struct CallableDecl {
     pub pos: usize,
     pub name: Intern,
-    pub params: ItemList,
-    pub kind: CallableKind,
-    pub returns: Option<TypeExpr>,
+    pub expr: TypeExpr,
     pub body: StmtList
 }
 
@@ -205,13 +190,22 @@ pub struct CallableDecl {
 pub struct StructDecl {
     pub pos: usize,
     pub name: Intern,
-    pub fields: ItemList,
+    pub expr: TypeExpr,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VarDecl {
+    pub pos: usize,
+    pub name: Intern,
+    pub expr: TypeExpr,
+    pub value: Expr
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum DeclData {
     Callable(CallableDecl),
-    Struct(StructDecl)
+    Struct(StructDecl),
+    Var(VarDecl)
 }
 
 impl DeclData {
@@ -219,6 +213,7 @@ impl DeclData {
         match &self {
             DeclData::Callable(decl) => decl.name,
             DeclData::Struct(decl) => decl.name,
+            DeclData::Var(decl) => decl.name,
         }
     }
 
@@ -226,14 +221,15 @@ impl DeclData {
         match &self {
             DeclData::Callable(decl) => decl.pos,
             DeclData::Struct(decl) => decl.pos,
+            DeclData::Var(decl) => decl.pos,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn items(&self) -> ItemList {
+    pub fn expr(&self) -> TypeExpr {
         match &self {
-            DeclData::Callable(decl) => decl.params,
-            DeclData::Struct(decl) => decl.fields,
+            DeclData::Callable(decl) => decl.expr,
+            DeclData::Struct(decl) => decl.expr,
+            DeclData::Var(decl) => decl.expr,
         }
     }
 }
@@ -241,8 +237,10 @@ impl DeclData {
 impl Display for DeclData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            DeclData::Callable(c) => c.kind.fmt(f),
+            // todo: func/proc
+            DeclData::Callable(_) => write!(f, "callable"),
             DeclData::Struct(_) => write!(f, "struct"),
+            DeclData::Var(_) => write!(f, "var"),
         }
     }
 }
@@ -459,12 +457,16 @@ impl Ast {
         }
     }
 
-    pub fn push_callable_decl(&mut self, decl: CallableDecl) -> Option<Decl> {
+    pub fn push_decl_callable(&mut self, decl: CallableDecl) -> Option<Decl> {
         self.push_decl(DeclData::Callable(decl))
     }
 
-    pub fn push_struct_decl(&mut self, decl: StructDecl) -> Option<Decl> {
+    pub fn push_decl_struct(&mut self, decl: StructDecl) -> Option<Decl> {
         self.push_decl(DeclData::Struct(decl))
+    }
+
+    pub fn push_decl_var(&mut self, decl: VarDecl) -> Option<Decl> {
+        self.push_decl(DeclData::Var(decl))
     }
 
     pub fn lookup_decl(&self, name: Intern) -> Option<Decl> {
@@ -504,8 +506,32 @@ impl Ast {
         TypeExpr(result)
     }
 
-    pub fn type_expr(&self, expr: TypeExpr) -> TypeExprData {
-        self.type_exprs[expr.0 as usize]
+    pub fn type_expr(&self, expr: TypeExpr) -> &TypeExprData {
+        &self.type_exprs[expr.0 as usize]
+    }
+
+    pub fn type_expr_keytype(&self, expr: TypeExpr) -> Option<Keytype> {
+        match self.type_expr(expr) {
+            TypeExprData::Name(key) => Keytype::from_intern(*key),
+            TypeExprData::List(key, _) => Keytype::from_intern(*key),
+            _ => None
+        }
+    }
+
+    pub fn type_expr_index(&self, expr: TypeExpr, index: usize) -> Option<TypeExpr> {
+        match self.type_expr(expr) {
+            TypeExprData::List(_, list) => { let mut list = *list; list.nth(index) },
+            _ => None
+        }
+    }
+
+    pub fn type_expr_index_items(&self, expr: TypeExpr, index: usize) -> Option<ItemList> {
+        self.type_expr_index(expr, index).and_then(|expr| {
+            match self.type_expr(expr) {
+                TypeExprData::Items(list) => Some(*list),
+                _ => None
+            }
+        })
     }
 
     pub fn pop_type_expr(&mut self, expr: TypeExpr) -> TypeExprData {

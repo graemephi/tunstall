@@ -9,6 +9,7 @@ use crate::error;
 
 use crate::ast::*;
 use crate::smallvec::*;
+use crate::parse::Keytype;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -48,22 +49,38 @@ fn check_duplicate_items(ast: &Ast, items: ItemList) -> Option<Intern> {
 
 fn resolve_callable(ctx: &mut Compiler, decl: Decl, data: &CallableDecl) -> Symbol {
     let mut decl_types = SmallVec::new();
-    for param in data.params {
-        let item = ctx.ast.item(param);
-        let ty = eval_type(ctx, item.expr);
-        decl_types.push(ty);
-    }
-    if let Some(returns) = data.returns {
-        let return_type = eval_type(ctx, returns);
-        decl_types.push(return_type);
-    } else {
-        decl_types.push(Type::None);
-    }
-    let ty = ctx.types.anonymous(TypeKind::Callable, &decl_types, data.kind == CallableKind::Procedure);
     let name = data.name;
-    if let Some(dup) = check_duplicate_items(&ctx.ast, data.params) {
-        error!(ctx, data.pos, "duplicate parameter name {} in func {}", ctx.str(dup), ctx.str(name));
+    let kind = ctx.ast.type_expr_keytype(data.expr);
+    let params = ctx.ast.type_expr_index_items(data.expr, 0);
+    let returns = ctx.ast.type_expr_index(data.expr, 1);
+    if let Some(Keytype::Func)|Some(Keytype::Proc) = kind {
+        if let Some(params) = params {
+            for param in params {
+                let item = ctx.ast.item(param);
+                let ty = eval_type(ctx, item.expr);
+                decl_types.push(ty);
+            }
+
+            if let Some(returns) = returns {
+                let return_type = eval_type(ctx, returns);
+                decl_types.push(return_type);
+            } else {
+                decl_types.push(Type::None);
+
+                if let Some(Keytype::Func) = kind {
+                    error!(ctx, data.pos, "func without return type");
+                }
+            }
+            if let Some(dup) = check_duplicate_items(&ctx.ast, params) {
+                error!(ctx, data.pos, "duplicate parameter name {} in func {}", ctx.str(dup), ctx.str(name));
+            }
+        } else {
+            error!(ctx, data.pos, "{} without parameter list", kind.unwrap())
+        }
+    } else {
+        panic!("non-callable type in callable decl");
     }
+    let ty = ctx.types.anonymous(TypeKind::Callable, &decl_types, kind == Some(Keytype::Proc));
     Symbol { kind: Kind::Constant, state: State::Resolved, decl, ty, name }
 }
 
@@ -73,25 +90,30 @@ fn resolve_struct(ctx: &mut Compiler, decl: Decl, data: &StructDecl) -> Symbol {
     let resolving = Symbol { kind: Kind::Type, state: State::Resolving, decl, ty, name };
     let existing_symbol = ctx.symbols.insert(name, resolving);
     assert!(matches!(existing_symbol, None));
-    for field in data.fields {
-        let item = ctx.ast.item(field);
-        let item_type = eval_type(ctx, item.expr);
-        ctx.types.add_item_to_type(ty, item.name, item_type);
-    }
-    ctx.types.complete_type(ty);
-    if data.fields.len() == 0 {
+    if let Some(fields) = ctx.ast.type_expr_index_items(data.expr, 0) {
+        for field in fields {
+            let item = ctx.ast.item(field);
+            let item_type = eval_type(ctx, item.expr);
+            ctx.types.add_item_to_type(ty, item.name, item_type);
+        }
+        if fields.len() == 0 {
+            error!(ctx, data.pos, "struct {} has no fields", ctx.str(data.name));
+        }
+        if let Some(dup) = check_duplicate_items(&ctx.ast, fields) {
+            error!(ctx, data.pos, "{} has already been defined on struct {}", ctx.str(dup), ctx.str(data.name));
+        }
+    } else {
         error!(ctx, data.pos, "struct {} has no fields", ctx.str(data.name));
     }
-    if let Some(dup) = check_duplicate_items(&ctx.ast, data.fields) {
-        error!(ctx, data.pos, "{} has already been defined on struct {}", ctx.str(dup), ctx.str(data.name));
-    }
+    ctx.types.complete_type(ty);
     Symbol { state: State::Resolved, ..resolving }
 }
 
 fn resolve_decl(ctx: &mut Compiler, decl: Decl) -> Symbol {
     let result = match *ctx.ast.decl(decl) {
         DeclData::Callable(func) => resolve_callable(ctx, decl, &func),
-        DeclData::Struct(data) => resolve_struct(ctx, decl, &data)
+        DeclData::Struct(data) => resolve_struct(ctx, decl, &data),
+        DeclData::Var(_) => unreachable!(),
     };
     let name = ctx.ast.decl(decl).name();
     ctx.symbols.insert(name, result);

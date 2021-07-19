@@ -33,6 +33,10 @@ func syntax(a: int, b: int): int
 g := 0;
 h := 0;
 
+some_constant: constant (arr i32 [8]) = {
+
+}
+
 e: enum i32 {
 
 }

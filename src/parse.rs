@@ -153,7 +153,7 @@ impl std::fmt::Display for Token<'_> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Keyword {
-    Return,
+    Return = 1,
     Break,
     Continue,
     If,
@@ -162,9 +162,6 @@ pub enum Keyword {
     For,
     Do,
     Switch,
-    Func,
-    Proc,
-    Struct
 }
 
 impl Keyword {
@@ -179,9 +176,6 @@ impl Keyword {
             7  => Some(Keyword::For),
             8  => Some(Keyword::Do),
             9  => Some(Keyword::Switch),
-            10 => Some(Keyword::Func),
-            11 => Some(Keyword::Proc),
-            12 => Some(Keyword::Struct),
             _  => None,
         }
     }
@@ -197,9 +191,6 @@ impl Keyword {
             Keyword::For => "for",
             Keyword::Do => "do",
             Keyword::Switch => "switch",
-            Keyword::Func => "func",
-            Keyword::Proc => "proc",
-            Keyword::Struct => "struct"
         }
     }
 }
@@ -209,6 +200,45 @@ impl std::fmt::Display for Keyword {
         self.to_str().fmt(f)
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keytype {
+    Func = Keyword::Switch as isize + 1,
+    Proc,
+    Struct,
+    Ptr
+}
+
+impl Keytype {
+    pub const fn from_u32(v: u32) -> Option<Keytype> {
+        match v {
+            10 => Some(Keytype::Func),
+            11 => Some(Keytype::Proc),
+            12 => Some(Keytype::Struct),
+            _  => None,
+        }
+    }
+
+    pub const fn from_intern(v: Intern) -> Option<Keytype> {
+        Keytype::from_u32(v.0)
+    }
+
+    pub const fn to_str(self) -> &'static str {
+        match self {
+            Keytype::Func => "func",
+            Keytype::Proc => "proc",
+            Keytype::Struct => "struct",
+            Keytype::Ptr => "ptr"
+        }
+    }
+}
+
+impl std::fmt::Display for Keytype {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.to_str().fmt(f)
+    }
+}
+
 
 /// The index of `substr` within `str`. `str` and `substr` must point to the same allocation.
 unsafe fn offset_from(str: &str, substr: &str) -> usize {
@@ -416,34 +446,59 @@ impl<'c, 'a> Parser<'_, '_> {
         result
     }
 
+    fn type_expr_inner(&mut self, name: Intern) -> TypeExpr {
+        use TokenKind::*;
+        let mut list = SmallVecN::<_, 8>::new();
+        loop {
+            match self.token.kind {
+                Name => {
+                    let name = self.name();
+                    list.push(TypeExprData::Name(name))
+                }
+                LBracket => {
+                    self.token(LBracket);
+                    let expr = self.expr();
+                    self.token(RBracket);
+                    list.push(TypeExprData::Expr(expr))
+                }
+                LParen => {
+                    self.token(LParen);
+                    let (p, token) = (self.p, self.token);
+                    if self.not(RParen) {
+                        let name = self.name();
+                        if matches!(self.token.kind, Comma|Colon) {
+                            // Roll back one token. This is to avoid having two
+                            // items() or special-casing it or have you rather than
+                            // an aspect of the grammar proper
+                            self.p = p;
+                            self.token = token;
+                            let items = self.items();
+                            list.push(TypeExprData::Items(items));
+                        } else if matches!(self.token.kind, RParen) {
+                            list.push(TypeExprData::Name(name))
+                        } else {
+                            let expr = self.type_expr_inner(name);
+                            list.push(self.ast.pop_type_expr(expr));
+                        }
+                    } else {
+                        // parse () as an empty item list. We don't have any other interpretation for this, yet?
+                        list.push(TypeExprData::Items(ItemList::empty()));
+                    }
+                    self.token(RParen);
+                }
+                _ => break
+            }
+        }
+
+        self.ast.push_type_expr_list(name, &list)
+    }
+
     fn type_expr(&mut self) -> TypeExpr {
         let name = self.name();
 
         use TokenKind::*;
-        if matches!(self.token.kind, Name|LBracket|LParen) {
-            let mut list = SmallVecN::<_, 8>::new();
-            loop {
-                match self.token.kind {
-                    Name => {
-                        let name = self.name();
-                        list.push(TypeExprData::Name(name))
-                    }
-                    LBracket => {
-                        self.token(LBracket);
-                        let expr = self.expr();
-                        self.token(RBracket);
-                        list.push(TypeExprData::Expr(expr))
-                    }
-                    LParen => {
-                        self.token(LParen);
-                        let expr = self.type_expr();
-                        self.token(RParen);
-                        list.push(self.ast.pop_type_expr(expr))
-                    }
-                    _ => break
-                }
-            }
-            self.ast.push_type_expr_list(name, &list)
+        if matches!(self.token.kind, Name|LBracket|LParen|LBrace) {
+            self.type_expr_inner(name)
         } else {
             self.ast.push_type_expr_name(name)
         }
@@ -859,68 +914,53 @@ impl<'c, 'a> Parser<'_, '_> {
     fn items(&mut self) -> ItemList {
         let mut items = SmallVec::new();
         while self.token.kind == TokenKind::Name {
-            let name = self.name();
+            let top = items.len();
+            items.push(ItemData { name: self.name(), expr: TypeExpr(0) });
+            while self.try_token(TokenKind::Comma).is_some() {
+                items.push(ItemData { name: self.name(), expr: TypeExpr(0) });
+            }
             self.token(TokenKind::Colon);
             let expr = self.type_expr();
-            items.push(ItemData { name, expr });
+            for item in &mut items[top..] {
+                item.expr = expr;
+            }
             self.try_token(TokenKind::Comma);
         }
         self.ast.push_items(&items)
     }
 
-    fn func_decl(&mut self) {
-        let kind = CallableKind::Function;
+    fn decl(&mut self) {
         let pos = self.pos();
-        self.keyword(Keyword::Func);
         let name = self.name();
-        self.token(TokenKind::LParen);
-        let params;
-        if let None = self.try_token(TokenKind::RParen) {
-            params = self.items();
-            self.token(TokenKind::RParen);
+        let decl = if self.try_token(TokenKind::Colon).is_some() {
+            let expr = self.type_expr();
+            match self.ast.type_expr(expr) {
+                TypeExprData::List(id, _) if id.0 == Keytype::Func as u32 || id.0 == Keytype::Proc as u32 => {
+                    let body = self.stmt_block();
+                    self.ast.push_decl_callable(CallableDecl { pos, name, expr, body })
+                }
+                TypeExprData::List(id, _) if id.0 == Keytype::Struct as u32 => {
+                    // todo: declare global variable on =
+                    self.token(TokenKind::Semicolon);
+                    self.ast.push_decl_struct(StructDecl { pos, name, expr })
+                }
+                _ => {
+                    self.token(TokenKind::Assign);
+                    let value = self.expr();
+                    self.token(TokenKind::Semicolon);
+                    self.ast.push_decl_var(VarDecl { pos, name, expr, value })
+                }
+            }
+        } else if self.try_token(TokenKind::ColonAssign).is_some() {
+            let value = self.expr();
+            self.token(TokenKind::Semicolon);
+            self.ast.push_decl_var(VarDecl { pos, name, expr: TypeExpr::Infer, value })
         } else {
-            params = ItemList::empty();
+            parse_error!(self, "expected : or :=, found {}", self.token)
+        };
+        if let None = decl {
+            parse_error!(self, "{} has already been defined", self.ctx.str(name))
         }
-        self.token(TokenKind::Colon);
-        let returns = Some(self.type_expr());
-        let body = self.stmt_block();
-        self.ast.push_callable_decl(CallableDecl { kind, pos, name, params, returns, body })
-            .unwrap_or_else(|| parse_error!(self, "{} has already been defined", self.ctx.str(name)));
-    }
-
-    fn proc_decl(&mut self) {
-        let kind = CallableKind::Procedure;
-        let pos = self.pos();
-        self.keyword(Keyword::Proc);
-        let name = self.name();
-        self.token(TokenKind::LParen);
-        let params;
-        if let None = self.try_token(TokenKind::RParen) {
-            params = self.items();
-            self.token(TokenKind::RParen);
-        } else {
-            params = ItemList::empty();
-        }
-        let returns;
-        if let Some(_) = self.try_token(TokenKind::Colon) {
-            returns = Some(self.type_expr());
-        } else {
-            returns = None;
-        }
-        let body = self.stmt_block();
-        self.ast.push_callable_decl(CallableDecl { kind, pos, name, params, returns, body })
-            .unwrap_or_else(|| parse_error!(self, "{} has already been defined", self.ctx.str(name)));
-    }
-
-    fn struct_decl(&mut self) {
-        let pos = self.pos();
-        self.keyword(Keyword::Struct);
-        let name = self.name();
-        self.token(TokenKind::LBrace);
-        let fields = self.items();
-        self.token(TokenKind::RBrace);
-        self.ast.push_struct_decl(StructDecl { pos, name, fields })
-            .unwrap_or_else(|| parse_error!(self, "{} has already been defined", self.ctx.str(name)));
     }
 }
 
@@ -928,13 +968,7 @@ pub fn parse(ctx: &mut Compiler, str: &str) -> Ast {
     let mut parser = Parser::new(ctx, str);
     while !parser.is_eof() {
         parser.comment();
-        match parser.token.keyword {
-            Some(Keyword::Func) => parser.func_decl(),
-            Some(Keyword::Proc) => parser.proc_decl(),
-            Some(Keyword::Struct) => parser.struct_decl(),
-            Some(keyword) => parse_error!(parser, "Unexpected keyword '{}'", keyword),
-            None => parse_error!(parser, "Unexpected {}", parser.token)
-        }
+        parser.decl();
     }
     parser.ast
 }
