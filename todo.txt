@@ -30,7 +30,19 @@ func syntax(a: int, b: int): int
     return r;
 }
 
-struct Buf {
+g := 0;
+h := 0;
+
+e: enum i32 {
+
+}
+
+f: func (a: u32, b: u32) u32 {
+
+}
+
+
+Buf: struct {
     buf: ptr u8 [cap],
     len: int,
     cap: int

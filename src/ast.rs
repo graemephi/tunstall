@@ -134,7 +134,7 @@ define_node_list!(SwitchCase, SwitchCaseList, SwitchCaseListIter);
 
 #[derive(Clone, Copy, Debug)]
 pub enum SwitchCaseData {
-    Cases(ExprList, StmtList),
+    Cases(StmtList, ExprList),
     Else(StmtList),
 }
 

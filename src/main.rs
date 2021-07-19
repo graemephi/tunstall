@@ -836,6 +836,7 @@ fn expr_integer_compatible_with_destination(value: &ExprResult, dest_ty: Type, d
 #[repr(u8)]
 pub enum LocationKind {
     None,
+    Control,
     Return,
     Register,
     Stack,
@@ -852,22 +853,26 @@ pub struct Location {
 }
 
 impl Location {
-    const BAD_LOCATION: isize = isize::MAX;
+    const BAD: isize = isize::MAX;
 
     fn none() -> Location {
-        Location { base: Self::BAD_LOCATION, offset: Self::BAD_LOCATION, kind: LocationKind::None, is_mutable: false, is_place: false }
+        Location { base: Self::BAD, offset: Self::BAD, kind: LocationKind::None, is_mutable: false, is_place: false }
+    }
+
+    fn control() -> Location {
+        Location { base: Self::BAD, offset: Self::BAD, kind: LocationKind::Control, is_mutable: false, is_place: false }
     }
 
     fn register(value: isize) -> Location {
-        Location { base: Self::BAD_LOCATION, offset: value, kind: LocationKind::Register, is_mutable: false, is_place: false }
+        Location { base: Self::BAD, offset: value, kind: LocationKind::Register, is_mutable: false, is_place: false }
     }
 
     fn ret() -> Location {
-        Location { base: Self::BAD_LOCATION, offset: 0, kind: LocationKind::Return, is_mutable: false, is_place: false }
+        Location { base: Self::BAD, offset: 0, kind: LocationKind::Return, is_mutable: false, is_place: false }
     }
 
     fn stack(offset: isize) -> Location {
-        Location { base: Self::BAD_LOCATION, offset: offset, kind: LocationKind::Stack, is_mutable: true, is_place: true }
+        Location { base: Self::BAD, offset: offset, kind: LocationKind::Stack, is_mutable: true, is_place: true }
     }
 
     fn based(base: isize, offset: isize, is_mutable: bool) -> Location {
@@ -886,6 +891,7 @@ impl Location {
 struct ExprResult {
     addr: Location,
     ty: Type,
+    value_is_stack_offset: bool,
     value: Option<RegValue>,
 }
 
@@ -912,22 +918,20 @@ struct Control {
     fallthrough_to: Label,
 }
 
-impl Control {
-    fn branch(true_to: Label, false_to: Label) -> Control {
-        Control { true_to, false_to, fallthrough_to: Label::BAD }
-    }
+fn branch(true_to: Label, false_to: Label) -> Control {
+    Control { true_to, false_to, fallthrough_to: Label::BAD }
+}
 
-    fn fall_left(true_to: Label, false_to: Label) -> Control {
-        Control { true_to, false_to, fallthrough_to: true_to }
-    }
+fn fall_true(true_to: Label, false_to: Label) -> Control {
+    Control { true_to, false_to, fallthrough_to: true_to }
+}
 
-    fn fall_right(true_to: Label, false_to: Label) -> Control {
-        Control { true_to, false_to, fallthrough_to: false_to }
-    }
+fn fall_false(true_to: Label, false_to: Label) -> Control {
+    Control { true_to, false_to, fallthrough_to: false_to }
+}
 
-    fn jump(to: Label) -> Control {
-        Control { true_to: to, false_to: to, fallthrough_to: to }
-    }
+fn jump(to: Label) -> Control {
+    Control { true_to: to, false_to: to, fallthrough_to: to }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1045,10 +1049,11 @@ impl FatGen {
     fn register(&mut self, expr: &ExprResult) -> isize {
         match expr.addr.kind {
             LocationKind::None => match expr.value {
-                Some(v) if expr.ty.is_pointer() => self.put_inc(Op::LoadStackAddress, v),
+                Some(v) if expr.value_is_stack_offset => { assert!(expr.ty.is_pointer()); self.put_inc(Op::LoadStackAddress, v) },
                 Some(v) => self.constant(v),
-                None => Location::BAD_LOCATION
+                None => Location::BAD
             },
+            LocationKind::Control => unreachable!(),
             LocationKind::Return => 0,
             LocationKind::Register => expr.addr.offset,
             LocationKind::Stack => {
@@ -1056,11 +1061,11 @@ impl FatGen {
                     self.put2_inc(op, expr.addr.offset)
                 } else {
                     // todo: overwritable error here. we expect the _next_ error
-                    // will be more informative to the user. BAD_LOCATION can
+                    // will be more informative to the user. BAD can
                     // appear sometimes in non-error cases, so it would be nice
                     // to explicitly enter an error state, and generally keep
-                    // BAD_LOCATION usage to a minimum
-                    Location::BAD_LOCATION
+                    // BAD usage to a minimum
+                    Location::BAD
                 }
             }
             LocationKind::Based => {
@@ -1069,7 +1074,7 @@ impl FatGen {
                     self.put2_inc(op, ptr)
                 } else {
                     // todo: weak (overwritable) error here, as above
-                    Location::BAD_LOCATION
+                    Location::BAD
                 }
             }
         }
@@ -1077,7 +1082,8 @@ impl FatGen {
 
     fn location_register(&mut self, location: &Location) -> isize {
         match location.kind {
-            LocationKind::None => Location::BAD_LOCATION,
+            LocationKind::None => Location::BAD,
+            LocationKind::Control => unreachable!(),
             LocationKind::Return => 0,
             LocationKind::Register => location.offset,
             LocationKind::Stack => {
@@ -1131,8 +1137,7 @@ impl FatGen {
 
     fn zero(&mut self, dest: &Location, size: isize) {
         match dest.kind {
-            LocationKind::None => unreachable!(),
-            LocationKind::Register => unreachable!(),
+            LocationKind::None|LocationKind::Control|LocationKind::Register => unreachable!(),
             LocationKind::Return|LocationKind::Stack => {
                 self.put2(Op::StackRelativeZero, dest.offset, size);
             }
@@ -1149,7 +1154,7 @@ impl FatGen {
         let alignment = ctx.types.info(destination_type).alignment as isize;
         debug_assert_eq!((dest.offset) & (alignment - 1), 0);
         match dest.kind {
-            LocationKind::None => unreachable!(),
+            LocationKind::None|LocationKind::Control => unreachable!(),
             LocationKind::Register => {
                 let result_register = self.register(src);
                 self.put2(Op::Move, dest.offset, result_register);
@@ -1176,7 +1181,7 @@ impl FatGen {
                 let src = &self.emit_constant(src);
 
                 match src.addr.kind {
-                    LocationKind::None|LocationKind::Return => (),
+                    LocationKind::None|LocationKind::Control|LocationKind::Return => unreachable!(),
                     LocationKind::Register => {
                         if let Some(op) = store_op_pointer(destination_type) {
                             let src = self.register(src);
@@ -1278,6 +1283,7 @@ impl FatGen {
                 let offset = (to as isize) - (from as isize) - 1;
                 let offset = i32::try_from(offset).expect("function too large");
                 self.code[from].left = offset;
+                assert!(offset != 0, "zero offset {:?}", self.code[from].op);
             }
         }
         self.patches.clear();
@@ -1492,7 +1498,7 @@ impl FatGen {
         } else {
             debug_assert!(self.code.len() == code_len);
             debug_assert!(self.labels.len() == labels_len);
-            debug_assert!(result.addr.offset == Location::BAD_LOCATION);
+            debug_assert!(result.addr.offset == Location::BAD);
         }
         result
     }
@@ -1519,7 +1525,7 @@ impl FatGen {
 
     fn expr_with_destination_and_optional_control(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type, dest: &Location, control: Option<Control>) -> ExprResult {
         let mut control = control;
-        let mut result = ExprResult { addr: Location::none(), ty: Type::None, value: None };
+        let mut result = ExprResult { addr: Location::none(), ty: Type::None, value_is_stack_offset: false, value: None };
         match ctx.ast.expr(expr) {
             ExprData::Int(value) => {
                 result.value = Some(value.into());
@@ -1652,11 +1658,13 @@ impl FatGen {
                                 LocationKind::None|LocationKind::Return =>
                                     // This happens when doing offset-of type address calculations off of constant 0 pointers
                                     result = right,
+                                LocationKind::Control => unreachable!(),
                                 LocationKind::Register|LocationKind::Stack => {
                                     let base = right.addr.offset;
                                     // todo: seems weird to be setting these with kind == None
                                     result.addr.is_mutable = right.addr.is_mutable;
                                     result.addr.is_place = right.addr.is_place;
+                                    result.value_is_stack_offset = true;
                                     result.value = Some(base.into());
                                 }
                                 LocationKind::Based => {
@@ -1722,16 +1730,16 @@ impl FatGen {
                     match op_token {
                         parse::TokenKind::LogicAnd => {
                             let next = self.label();
-                            left = self.expr_with_control(ctx, left_expr, Control::fall_left(next, c.false_to));
+                            left = self.expr_with_control(ctx, left_expr, fall_true(next, c.false_to));
                             self.patch(next);
-                            right = self.expr_with_control(ctx, right_expr, Control::branch(c.true_to, c.false_to));
+                            right = self.expr_with_control(ctx, right_expr, c);
                             emit = false;
                         }
                         parse::TokenKind::LogicOr  => {
                             let next = self.label();
-                            left = self.expr_with_control(ctx, left_expr, Control::fall_right(c.true_to, next));
+                            left = self.expr_with_control(ctx, left_expr, fall_false(c.true_to, next));
                             self.patch(next);
-                            right = self.expr_with_control(ctx, right_expr, Control::branch(c.true_to, c.false_to));
+                            right = self.expr_with_control(ctx, right_expr, c);
                             emit = false;
                         }
                         _ => {
@@ -1747,16 +1755,13 @@ impl FatGen {
                 }
                 if let Some((op, result_ty)) = binary_op(op_token, left.ty, right.ty) {
                     match (left.value, right.value) {
-                        (Some(lv), Some(rv)) => result.value = Some(apply_binary_op(op, lv, rv)),
+                        _ if !emit => result.addr = Location::control(),
+                        (Some(lv), Some(rv)) => { result.value = Some(apply_binary_op(op, lv, rv)) },
                         _ => {
-                            if emit {
-                                let left_register = self.register(&left);
-                                let right_register = self.register(&right);
-                                let result_register = self.put3_inc(op, left_register, right_register);
-                                result.addr = Location::register(result_register);
-                            } else {
-                                result.value = Some(0.into());
-                            }
+                            let left_register = self.register(&left);
+                            let right_register = self.register(&right);
+                            let result_register = self.put3_inc(op, left_register, right_register);
+                            result.addr = Location::register(result_register);
                         }
                     }
                     result.ty = result_ty;
@@ -1786,36 +1791,19 @@ impl FatGen {
             ExprData::Ternary(cond_expr, left_expr, right_expr) => {
                 let left = self.label();
                 let right = self.label();
-                let cond = self.expr_with_control(ctx, cond_expr, Control::fall_left(left, right));
+                let cond = self.expr_with_control(ctx, cond_expr, fall_true(left, right));
                 if cond.ty == Type::Bool {
-                    if let Some(cv) = cond.value {
-                        // Descend into both branches to type check, then discard the generated code.
-                        {
-                            let top = self.code.len();
-                            self.expr(ctx, left_expr);
-                            self.expr(ctx, right_expr);
-                            self.code.truncate(top);
-                        }
-                        if cv.is_true() {
-                            result = self.expr(ctx, left_expr);
-                        } else {
-                            result = self.expr(ctx, right_expr);
-                        }
-                        self.patch(left);
-                        self.patch(right);
+                    let exit = self.label();
+                    self.patch(left);
+                    let left = self.expr_with_destination_and_control(ctx, left_expr, destination_type, dest, jump(exit));
+                    self.patch(right);
+                    let right = self.expr_with_destination(ctx, right_expr, left.ty, &left.addr);
+                    self.patch(exit);
+                    if left.ty == right.ty {
+                        debug_assert!(left.addr == right.addr);
+                        result = left;
                     } else {
-                        let exit = self.label();
-                        self.patch(left);
-                        let left = self.expr_with_destination_and_control(ctx, left_expr, destination_type, dest, Control::jump(exit));
-                        self.patch(right);
-                        let right = self.expr_with_destination(ctx, right_expr, left.ty, &left.addr);
-                        self.patch(exit);
-                        if left.ty == right.ty {
-                            debug_assert!(left.addr == right.addr);
-                            result = left;
-                        } else {
-                            error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types (... ? {} :: {})", ctx.type_str(left.ty), ctx.type_str(right.ty));
-                        }
+                        error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types (... ? {} :: {})", ctx.type_str(left.ty), ctx.type_str(right.ty));
                     }
                 } else {
                     error!(self, ctx.ast.expr_source_position(cond_expr), "ternary expression requires a boolean condition");
@@ -1930,9 +1918,9 @@ impl FatGen {
 
         #[cfg(debug_assertions)]
         if self.error.is_none() {
-            debug_assert_implies!(result.addr.offset == Location::BAD_LOCATION, result.addr.kind == LocationKind::None);
-            debug_assert_implies!(result.addr.offset != Location::BAD_LOCATION, result.addr.kind != LocationKind::None);
-            debug_assert_implies!(result.addr.base != Location::BAD_LOCATION, result.addr.kind == LocationKind::Based);
+            debug_assert_implies!(result.addr.offset == Location::BAD, matches!(result.addr.kind, LocationKind::None|LocationKind::Control));
+            debug_assert_implies!(result.addr.offset != Location::BAD, result.addr.kind != LocationKind::None);
+            debug_assert_implies!(result.addr.base != Location::BAD, result.addr.kind == LocationKind::Based);
             debug_assert_implies!(result.ty != Type::None, result.value.is_some() || result.addr.kind != LocationKind::None);
         }
 
@@ -1962,46 +1950,53 @@ impl FatGen {
         }
 
         if let Some(control) = control {
-            if result.ty == Type::Bool && control.true_to != control.false_to {
-                // Branching on a test value
-                match result.value {
-                    // We'll jump unconditionally jump over code we generate anyway ?_?
-                    Some(v) => {
-                        if v.is_true() {
-                            if control.true_to != control.fallthrough_to {
-                                self.put_jump(control.true_to);
-                            }
-                        } else {
-                            if control.false_to != control.fallthrough_to {
-                                self.put_jump(control.false_to);
-                             }
-                        }
-                    }
-                    None => {
-                        if control.fallthrough_to != Label::BAD {
-                            if control.true_to != control.fallthrough_to {
-                                let cond_register = self.register(&result);
-                                self.put_jump_nonzero(cond_register, control.true_to);
-                            } else if control.false_to != control.fallthrough_to {
+            if result.addr.kind != LocationKind::Control {
+                if result.ty == Type::Bool && control.true_to != control.false_to {
+                    match result.value {
+                        None => {
+                            if control.true_to == control.fallthrough_to {
                                 let cond_register = self.register(&result);
                                 self.put_jump_zero(cond_register, control.false_to);
-                            } else {
+                            } else if control.false_to == control.fallthrough_to {
+                                let cond_register = self.register(&result);
+                                self.put_jump_nonzero(cond_register, control.true_to);
+                            } else if control.fallthrough_to != Label::BAD {
                                 assert!(control.true_to == control.false_to);
                                 self.put_jump(control.fallthrough_to);
+                            } else {
+                                let cond_register = self.register(&result);
+                                self.put_jump_zero(cond_register, control.false_to);
+                                self.put_jump(control.true_to);
                             }
-                        } else {
-                            let cond_register = self.register(&result);
-                            self.put_jump_zero(cond_register, control.false_to);
-                            self.put_jump(control.true_to);
+                        },
+                        Some(v) => {
+                            if control.true_to == control.fallthrough_to {
+                                if !v.is_true() {
+                                    self.put_jump(control.false_to);
+                                }
+                            } else if control.false_to == control.fallthrough_to {
+                                if v.is_true() {
+                                    self.put_jump(control.true_to);
+                                }
+                            } else if control.fallthrough_to != Label::BAD {
+                                assert!(control.true_to == control.false_to);
+                                self.put_jump(control.fallthrough_to);
+                            } else {
+                                if v.is_true() {
+                                    self.put_jump(control.true_to);
+                                } else {
+                                    self.put_jump(control.false_to);
+                                }
+                            }
                         }
                     }
+                } else if control.true_to == control.false_to {
+                    // Unconditional jump; if we have a constant value, we need to
+                    // emit it. Otherwise, the caller can't place it behind the jump
+                    // destination
+                    result = self.emit_constant(&result);
+                    self.put_jump(control.true_to);
                 }
-            } else if control.true_to == control.false_to {
-                // Unconditional jump; if we have a constant value, we need to
-                // emit it. Otherwise, the caller can't place it behind the jump
-                // destination
-                result = self.emit_constant(&result);
-                self.put_jump(control.true_to);
             }
         }
         result
@@ -2050,12 +2045,12 @@ impl FatGen {
                 let then_branch = self.label();
                 let else_branch = self.label();
                 let exit = self.label();
-                let cond = self.expr_with_control(ctx, cond_expr, Control::fall_left(then_branch, else_branch));
+                let cond = self.expr_with_control(ctx, cond_expr, fall_true(then_branch, else_branch));
                 if cond.ty == Type::Bool {
                     self.patch(then_branch);
                     let then_ret = self.stmts(ctx, then_body);
-                    self.put_jump(exit);
                     if else_body.is_nonempty() {
+                        self.put_jump(exit);
                         self.patch(else_branch);
                         let else_ret = self.stmts(ctx, else_body);
                         return_type = then_ret.and(else_ret);
@@ -2075,7 +2070,7 @@ impl FatGen {
                     self.stmt(ctx, stmt);
                 }
                 if let Some(expr) = cond_expr {
-                    let pre_cond = self.expr_with_control(ctx, expr, Control::fall_left(body, break_label));
+                    let pre_cond = self.expr_with_control(ctx, expr, fall_true(body, break_label));
                     if pre_cond.ty == Type::Bool {
                         self.patch(body);
                         return_type = self.stmts(ctx, body_stmts);
@@ -2083,7 +2078,7 @@ impl FatGen {
                         if let Some(stmt) = post_stmt {
                             self.stmt(ctx, stmt);
                         }
-                        self.expr_with_control(ctx, expr, Control::fall_right(body, break_label));
+                        self.expr_with_control(ctx, expr, fall_false(body, break_label));
                     } else {
                         error!(self, ctx.ast.expr_source_position(expr), "for statement requires a boolean condition");
                     }
@@ -2102,15 +2097,20 @@ impl FatGen {
             }
             StmtData::While(cond_expr, body_stmts) => {
                 let (break_label, continue_label, gen_ctx) = self.push_loop_context();
-                let body = self.label();
-                let pre_cond = self.expr_with_control(ctx, cond_expr, Control::fall_left(body, break_label));
-                if pre_cond.ty == Type::Bool {
-                    self.patch(body);
-                    return_type = self.stmts(ctx, body_stmts);
-                    self.patch(continue_label);
-                    self.expr_with_control(ctx, cond_expr, Control::fall_right(body, break_label));
+                if body_stmts.is_nonempty() {
+                    let body = self.label();
+                    let pre_cond = self.expr_with_control(ctx, cond_expr, fall_true(body, break_label));
+                    if pre_cond.ty == Type::Bool {
+                        self.patch(body);
+                        return_type = self.stmts(ctx, body_stmts);
+                        self.patch(continue_label);
+                        self.expr_with_control(ctx, cond_expr, fall_false(body, break_label));
+                    } else {
+                        error!(self, ctx.ast.expr_source_position(cond_expr), "while statement requires a boolean condition");
+                    }
                 } else {
-                    error!(self, ctx.ast.expr_source_position(cond_expr), "while statement requires a boolean condition");
+                    let cond = self.label_here();
+                    self.expr_with_control(ctx, cond_expr, fall_false(cond, break_label));
                 }
                 self.patch(break_label);
                 self.restore(gen_ctx);
@@ -2126,7 +2126,7 @@ impl FatGen {
                 for case in cases {
                     let block_label = self.label();
                     labels.push(block_label);
-                    if let SwitchCaseData::Cases(exprs, _) = ctx.ast.switch_case(case) {
+                    if let SwitchCaseData::Cases(_, exprs) = ctx.ast.switch_case(case) {
                         for case_expr in exprs {
                             let expr = self.expr(ctx, case_expr);
                             if let Some(_ev) = expr.value {
@@ -2151,14 +2151,16 @@ impl FatGen {
                 }
                 let mut first_block = true;
                 for (i, case) in cases.enumerate() {
+                    if !first_block {
+                        self.put_jump(break_label);
+                    }
                     let block = match ctx.ast.switch_case(case) {
-                        SwitchCaseData::Cases(_, block) => block,
+                        SwitchCaseData::Cases(block, _) => block,
                         SwitchCaseData::Else(block) => block
                     };
                     let block_label = labels[i];
                     self.patch(block_label);
                     let ret = self.stmts(ctx, block);
-                    self.put_jump(break_label);
                     if first_block {
                         return_type = ret;
                         first_block = false;
@@ -2174,7 +2176,7 @@ impl FatGen {
                 let body = self.label_here();
                 return_type = self.stmts(ctx, body_stmts);
                 self.patch(continue_label);
-                let post_cond = self.expr_with_control(ctx, cond_expr, Control::fall_right(body, break_label));
+                let post_cond = self.expr_with_control(ctx, cond_expr, fall_false(body, break_label));
                 if post_cond.ty != Type::Bool {
                     error!(self, ctx.ast.expr_source_position(cond_expr), "do statement requires a boolean condition");
                 }
@@ -2452,7 +2454,7 @@ impl Compiler {
         let mut call_stack = vec![(code, ip, sp, Intern(0))];
 
         // The VM allows taking (real!) pointers to addresses on the VM stack. These are
-        // immediately invalidated by taking a _reference_ to the stack. Solution: never
+        // immediately invalidated by taking a & reference to the stack. Solution: never
         // take a reference to the stack (even one immediately turned into a pointer).
 
         // This just ensures the compiler knows the correct invariants involved, it
@@ -2700,10 +2702,6 @@ fn compile_and_run(str: &str) -> Result<Value> {
     c.run()
 }
 
-fn sign_extend(val: u32) -> usize {
-    val as i32 as usize
-}
-
 fn eval_expr(str: &str) -> Result<Value> {
     compile_and_run(&format!("proc main(): int {{ return {}; }}", str))
 }
@@ -2729,19 +2727,14 @@ fn main() {
 
     let ok = [
         (r#"
-        //
+
         proc main(): int {
-            a := 0;
-            b := 0;
-            for (; a < 10; a = a + 1) {
-                if (a > 5) {
-                    continue;
-                }
-                b = a;
+            if (0:bool && 1:bool) {
+                return 1;
             }
-            return a + b;
+            return 0;
         }
-        "#, Value::Int(15)),
+        "#, Value::Int(0)),
 ];
     for test in ok.iter() {
         let str = test.0;

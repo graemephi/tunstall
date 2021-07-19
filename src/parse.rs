@@ -842,7 +842,7 @@ impl<'c, 'a> Parser<'_, '_> {
                     } else {
                         let exprs = self.expr_list();
                         let block = self.stmt_block();
-                        cases.push(SwitchCaseData::Cases(exprs, block));
+                        cases.push(SwitchCaseData::Cases(block, exprs));
                     }
                 }
                 self.token(RBrace);
