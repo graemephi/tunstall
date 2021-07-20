@@ -240,7 +240,7 @@ impl Types {
         Type(result)
     }
 
-    pub fn anonymous(&mut self, kind: TypeKind, items: &[Type], mutable: bool) -> Type {
+    pub fn signature(&mut self, kind: TypeKind, items: &[Type], mutable: bool) -> Type {
         let hash = hash(&(kind, items, mutable));
         if let Some(types) = self.type_by_hash.get(&hash) {
             for &ty in types.iter() {
@@ -255,7 +255,27 @@ impl Types {
         for &item in items {
             self.add_item_to_type(ty, Intern(0), item);
         }
+        self.complete_type(ty);
         self.info_mut(ty).mutable = mutable;
+        self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
+        ty
+    }
+
+    pub fn tuple(&mut self, kind: TypeKind, items: &[(Intern, Type)]) -> Type {
+        let hash = hash(&(kind, items));
+        if let Some(types) = self.type_by_hash.get(&hash) {
+            for &ty in types.iter() {
+                let info = self.info(ty);
+                if items.iter().copied().eq(info.items.iter().map(|item| (item.name, item.ty))) {
+                    return ty;
+                }
+            }
+        }
+        let ty = self.make(kind);
+        for &(name, item_ty) in items {
+            self.add_item_to_type(ty, name, item_ty);
+        }
+        self.complete_type(ty);
         self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
         ty
     }
@@ -522,7 +542,7 @@ Ptr: struct (
 
     let int_ptr = c.types.pointer(Type::Int);
 
-    let get = |name: Intern| c.symbols.get(&name).map(|sym| c.types.info(sym.ty)).unwrap();
+    let get = |name: Intern| sym::lookup_type(&c, name).map(|sym| c.types.info(sym.ty)).unwrap();
     let v2 = get(v2);
     let rect = get(rect);
     let rect2 = get(rect2);

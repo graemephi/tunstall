@@ -112,7 +112,7 @@ pub struct ExprAux {
     pos: usize
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TypeExpr(pub u32);
 define_node_list!(TypeExpr, TypeExprList, TypeExprListIter);
 
@@ -126,8 +126,8 @@ pub enum TypeExprData {
     Infer,
     Name(Intern),
     Expr(Expr),
-    List(Intern, TypeExprList),
-    Items(ItemList)
+    Items(ItemList),
+    List(TypeExprList),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -495,14 +495,14 @@ impl Ast {
         }
     }
 
-    pub fn push_type_expr_name(&mut self, name: Intern) -> TypeExpr {
-        let result = push_data(&mut self.type_exprs, TypeExprData::Name(name));
+    pub fn push_type_expr(&mut self, data: TypeExprData) -> TypeExpr {
+        let result = push_data(&mut self.type_exprs, data);
         TypeExpr(result)
     }
 
-    pub fn push_type_expr_list(&mut self, name: Intern, list: &[TypeExprData]) -> TypeExpr {
+    pub fn push_type_expr_list(&mut self, list: &[TypeExprData]) -> TypeExpr {
         let slice = push_slice(&mut self.type_exprs, list);
-        let result = push_data(&mut self.type_exprs, TypeExprData::List(name, TypeExprList { begin: slice.0, end: slice.1 }));
+        let result = push_data(&mut self.type_exprs, TypeExprData::List(TypeExprList { begin: slice.0, end: slice.1 }));
         TypeExpr(result)
     }
 
@@ -510,28 +510,59 @@ impl Ast {
         &self.type_exprs[expr.0 as usize]
     }
 
+    // I wonder what the codegen looks like for these
+
+    fn type_expr_index(&self, expr: TypeExpr, index: usize) -> Option<TypeExpr> {
+        match self.type_expr(expr) {
+            TypeExprData::List(list) => { let mut list = *list; list.nth(index) },
+            _ => None
+        }
+    }
+
+    fn type_expr_has_keytype(&self, expr: TypeExpr) -> bool {
+        match self.type_expr(expr) {
+            TypeExprData::Name(key) => Keytype::from_intern(*key).is_some(),
+            TypeExprData::List(_) => self.type_expr_index(expr, 0).map(|t| match self.type_expr(t) {
+                TypeExprData::Name(key) => Keytype::from_intern(*key).is_some(),
+                _ => false
+            }).unwrap_or(false),
+            _ => false
+        }
+    }
+
     pub fn type_expr_keytype(&self, expr: TypeExpr) -> Option<Keytype> {
         match self.type_expr(expr) {
             TypeExprData::Name(key) => Keytype::from_intern(*key),
-            TypeExprData::List(key, _) => Keytype::from_intern(*key),
-            _ => None
-        }
-    }
-
-    pub fn type_expr_index(&self, expr: TypeExpr, index: usize) -> Option<TypeExpr> {
-        match self.type_expr(expr) {
-            TypeExprData::List(_, list) => { let mut list = *list; list.nth(index) },
-            _ => None
-        }
-    }
-
-    pub fn type_expr_index_items(&self, expr: TypeExpr, index: usize) -> Option<ItemList> {
-        self.type_expr_index(expr, index).and_then(|expr| {
-            match self.type_expr(expr) {
-                TypeExprData::Items(list) => Some(*list),
+            TypeExprData::Items(_) => Some(Keytype::Struct),
+            TypeExprData::List(list) => self.type_expr_index(expr, 0).and_then(|t| match self.type_expr(t) {
+                TypeExprData::Name(key) => Keytype::from_intern(*key),
+                TypeExprData::Items(_) => if list.len() == 2 { Some(Keytype::Func) } else { None },
                 _ => None
+            }),
+            _ => None
+        }
+    }
+
+    pub fn type_expr_items(&self, expr: TypeExpr) -> Option<ItemList> {
+        match self.type_expr(expr) {
+            TypeExprData::Items(items) => Some(*items),
+            TypeExprData::List(_) => {
+                let index = self.type_expr_has_keytype(expr) as usize;
+                self.type_expr_index(expr, index).and_then(|t| match self.type_expr(t) {
+                    TypeExprData::Items(items) => Some(*items),
+                    _ => None
+                })
             }
-        })
+            _ => None,
+        }
+    }
+
+    pub fn type_expr_returns(&self, expr: TypeExpr) -> Option<TypeExpr> {
+        let index = if self.type_expr_has_keytype(expr) { 2 } else { 1 };
+        match self.type_expr(expr) {
+            TypeExprData::List(_) => self.type_expr_index(expr, index),
+            _ => None,
+        }
     }
 
     pub fn pop_type_expr(&mut self, expr: TypeExpr) -> TypeExprData {

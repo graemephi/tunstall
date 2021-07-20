@@ -48,6 +48,7 @@ pub enum TokenKind {
     Assign,
     Dot,
     Comma,
+    Arrow,
     ColonAssign,
     Colon,
     ColonColon,
@@ -74,6 +75,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::GtEq => ">=",
             TokenKind::LShift => "<<",
             TokenKind::RShift => ">>",
+            TokenKind::Arrow => "->",
             TokenKind::ColonAssign => ":=",
             TokenKind::Comment => "//",
             TokenKind::LParen => "(",
@@ -206,7 +208,8 @@ pub enum Keytype {
     Func = Keyword::Switch as isize + 1,
     Proc,
     Struct,
-    Ptr
+    Arr,
+    Ptr,
 }
 
 impl Keytype {
@@ -215,6 +218,8 @@ impl Keytype {
             10 => Some(Keytype::Func),
             11 => Some(Keytype::Proc),
             12 => Some(Keytype::Struct),
+            13 => Some(Keytype::Arr),
+            14 => Some(Keytype::Ptr),
             _  => None,
         }
     }
@@ -228,6 +233,7 @@ impl Keytype {
             Keytype::Func => "func",
             Keytype::Proc => "proc",
             Keytype::Struct => "struct",
+            Keytype::Arr => "arr",
             Keytype::Ptr => "ptr"
         }
     }
@@ -238,7 +244,6 @@ impl std::fmt::Display for Keytype {
         self.to_str().fmt(f)
     }
 }
-
 
 /// The index of `substr` within `str`. `str` and `substr` must point to the same allocation.
 unsafe fn offset_from(str: &str, substr: &str) -> usize {
@@ -298,6 +303,7 @@ impl<'c, 'a> Parser<'_, '_> {
             [b'>', b'=', ..] => { result.kind = TokenKind::GtEq; 2 }
             [b'<', b'<', ..] => { result.kind = TokenKind::LShift; 2 }
             [b'>', b'>', ..] => { result.kind = TokenKind::RShift; 2 }
+            [b'-', b'>', ..] => { result.kind = TokenKind::Arrow; 2 }
             [b':', b':', ..] => { result.kind = TokenKind::ColonColon; 2 }
             [b':', b'=', ..] => { result.kind = TokenKind::ColonAssign; 2 }
             [b'/', b'/', ..] => { result.kind = TokenKind::Comment; one_after_escaped_position(p, b'\n') }
@@ -446,24 +452,26 @@ impl<'c, 'a> Parser<'_, '_> {
         result
     }
 
-    fn type_expr_inner(&mut self, name: Intern) -> TypeExpr {
+    fn type_expr(&mut self) -> TypeExpr {
         use TokenKind::*;
         let mut list = SmallVecN::<_, 8>::new();
-        loop {
-            match self.token.kind {
+        while matches!(self.token.kind, Name|LBracket|LParen|Arrow) {
+            use TokenKind::*;
+            let expr = match self.token.kind {
                 Name => {
                     let name = self.name();
-                    list.push(TypeExprData::Name(name))
+                    self.ast.push_type_expr(TypeExprData::Name(name))
                 }
                 LBracket => {
                     self.token(LBracket);
                     let expr = self.expr();
                     self.token(RBracket);
-                    list.push(TypeExprData::Expr(expr))
+                    self.ast.push_type_expr(TypeExprData::Expr(expr))
                 }
                 LParen => {
                     self.token(LParen);
                     let (p, token) = (self.p, self.token);
+                    let expr;
                     if self.not(RParen) {
                         let name = self.name();
                         if matches!(self.token.kind, Comma|Colon) {
@@ -473,34 +481,33 @@ impl<'c, 'a> Parser<'_, '_> {
                             self.p = p;
                             self.token = token;
                             let items = self.items();
-                            list.push(TypeExprData::Items(items));
+                            expr = self.ast.push_type_expr(TypeExprData::Items(items));
                         } else if matches!(self.token.kind, RParen) {
-                            list.push(TypeExprData::Name(name))
+                            expr = self.ast.push_type_expr(TypeExprData::Name(name));
                         } else {
-                            let expr = self.type_expr_inner(name);
-                            list.push(self.ast.pop_type_expr(expr));
+                            self.p = p;
+                            self.token = token;
+                            expr = self.type_expr();
                         }
                     } else {
                         // parse () as an empty item list. We don't have any other interpretation for this, yet?
-                        list.push(TypeExprData::Items(ItemList::empty()));
+                        expr = self.ast.push_type_expr(TypeExprData::Items(ItemList::empty()));
                     }
                     self.token(RParen);
+                    expr
                 }
-                _ => break
-            }
+                Arrow => {
+                    self.token(Arrow);
+                    self.type_expr()
+                }
+                _ => parse_error!(self, "in type expression, expected name, ( or [, found {}", self.token)
+            };
+            list.push(self.ast.pop_type_expr(expr));
         }
-
-        self.ast.push_type_expr_list(name, &list)
-    }
-
-    fn type_expr(&mut self) -> TypeExpr {
-        let name = self.name();
-
-        use TokenKind::*;
-        if matches!(self.token.kind, Name|LBracket|LParen|LBrace) {
-            self.type_expr_inner(name)
-        } else {
-            self.ast.push_type_expr_name(name)
+        match list.len() {
+            0 => parse_error!(self, "empty type expression"),
+            1 => self.ast.push_type_expr(list[0]),
+            _ => self.ast.push_type_expr_list(&list)
         }
     }
 
@@ -934,12 +941,12 @@ impl<'c, 'a> Parser<'_, '_> {
         let name = self.name();
         let decl = if self.try_token(TokenKind::Colon).is_some() {
             let expr = self.type_expr();
-            match self.ast.type_expr(expr) {
-                TypeExprData::List(id, _) if id.0 == Keytype::Func as u32 || id.0 == Keytype::Proc as u32 => {
+            match self.ast.type_expr_keytype(expr) {
+                Some(Keytype::Func)|Some(Keytype::Proc) => {
                     let body = self.stmt_block();
                     self.ast.push_decl_callable(CallableDecl { pos, name, expr, body })
                 }
-                TypeExprData::List(id, _) if id.0 == Keytype::Struct as u32 => {
+                Some(Keytype::Struct) => {
                     // todo: declare global variable on =
                     self.token(TokenKind::Semicolon);
                     self.ast.push_decl_struct(StructDecl { pos, name, expr })

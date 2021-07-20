@@ -484,7 +484,7 @@ fn unary_op(op: parse::TokenKind, ty: Type) -> Option<(Op, Type)> {
     match (op, integer_promote(ty)) {
         (TokenKind::Sub,    Type::Int) => Some((Op::IntNeg, Type::Int)),
         (TokenKind::BitNeg, Type::Int) => Some((Op::BitNeg, Type::Int)),
-        (TokenKind::Not,    _        ) => Some((Op::Not,    Type::Bool)),
+        (TokenKind::Not,    _       ) => Some((Op::Not,    Type::Bool)),
         (TokenKind::Sub,    Type::F32) => Some((Op::F32Neg, Type::F32)),
         (TokenKind::Sub,    Type::F64) => Some((Op::F64Neg, Type::F64)),
         _ => None
@@ -1304,78 +1304,91 @@ impl FatGen {
         match *ctx.ast.type_expr(expr) {
             TypeExprData::Infer => (unreachable!()),
             TypeExprData::Name(name) => {
-                if name == ctx.intern("ptr") {
+                if name.0 == Keytype::Ptr as u32 {
                     result = Type::VoidPtr;
                 } else {
-                    result = sym::resolve_type(ctx, name).ty;
-                    let resolve_error = std::mem::take(&mut ctx.error);
-                    let old_error = std::mem::take(&mut self.error);
-                    self.error = old_error.or(resolve_error);
+                    result = sym::resolve_type(ctx, name);
                 }
             }
             TypeExprData::Expr(_) => todo!(),
-            TypeExprData::Items(_) => todo!(),
-            TypeExprData::List(name, args) => {
+            TypeExprData::Items(items) => result = sym::resolve_anonymous_struct(ctx, items),
+            TypeExprData::List(args) => {
                 let mut args = args;
-                if name == ctx.intern("arr") {
-                    if let Some(ty_expr) = args.next() {
-                        let ty = self.type_expr(ctx, ty_expr);
-                        if let Some(len_expr) = args.next() {
-                            if let TypeExprData::Expr(len_expr) = *ctx.ast.type_expr(len_expr) {
-                                let len = self.constant_expr(ctx, len_expr);
-                                if len.ty.is_integer() && len.value.is_some() {
-                                    // TODO: This convert op is a roundabout way to check for the positive+fits condition
-                                    // but should be more direct/less subtle
-                                    if let Some(op) = convert_op(len.ty, Type::Int) {
-                                        let value = apply_unary_op(op, len.value.unwrap());
-                                        if unsafe { value.sint } > 0 {
-                                            result = ctx.types.array(ty, unsafe { value.sint } as usize);
+                if let Some(name) = args.next() {
+                    match ctx.ast.type_expr_keytype(name) {
+                        Some(Keytype::Arr) => {
+                            if let Some(ty_expr) = args.next() {
+                                let ty = self.type_expr(ctx, ty_expr);
+                                if let Some(len_expr) = args.next() {
+                                    if let TypeExprData::Expr(len_expr) = *ctx.ast.type_expr(len_expr) {
+                                        let len = self.constant_expr(ctx, len_expr);
+                                        if len.ty.is_integer() && len.value.is_some() {
+                                            // TODO: This convert op is a roundabout way to check for the positive+fits condition
+                                            // but should be more direct/less subtle
+                                            if let Some(op) = convert_op(len.ty, Type::Int) {
+                                                let value = apply_unary_op(op, len.value.unwrap());
+                                                if unsafe { value.sint } > 0 {
+                                                    result = ctx.types.array(ty, unsafe { value.sint } as usize);
+                                                } else {
+                                                    error!(self, 0, "arr length must be a positive integer and fit in a signed integer");
+                                                }
+                                            } else {
+                                                unreachable!();
+                                            }
                                         } else {
-                                            error!(self, 0, "arr length must be a positive integer and fit in a signed integer");
+                                            // todo: type expr location
+                                            error!(self, 0, "arr length must be a constant integer")
                                         }
                                     } else {
-                                        unreachable!();
+                                        error!(self, 0, "argument 2 of arr type must be a value expression")
                                     }
-                                } else {
-                                    // todo: type expr location
-                                    error!(self, 0, "arr length must be a constant integer")
-                                }
-                            } else {
-                                error!(self, 0, "argument 2 of arr type must be a value expression")
-                            }
-                        } else /* Some(len_expr) != args.next() */ {
-                            // infer?
-                            todo!();
-                        }
-                    } else {
-                        error!(self, 0, "type arr takes 2 arguments, base type and [length]")
-                    }
-                } else if name == ctx.intern("ptr") {
-                    if let Some(ty_expr) = args.next() {
-                        let ty = self.type_expr(ctx, ty_expr);
-                        if let Some(bound_expr) = args.next() {
-                            if let TypeExprData::Expr(bound_expr) = *ctx.ast.type_expr(bound_expr) {
-                                let bound = self.constant_expr(ctx, bound_expr);
-                                if bound.ty.is_integer() {
+                                } else /* Some(len_expr) != args.next() */ {
+                                    // infer?
                                     todo!();
-                                } else {
-                                    // todo: type expr location
-                                    error!(self, 0, "ptr bound must be an integer place")
                                 }
                             } else {
-                                error!(self, 0, "argument 2 of ptr type must be a value expression")
+                                error!(self, 0, "type arr takes 2 arguments, base type and [length]")
                             }
-                        } else /* Some(len_expr) != args.next() */ {
-                            // unbounded
-                            result = ctx.types.pointer(ty);
                         }
-                    } else {
-                        // untyped
-                        result = Type::VoidPtr;
+                        Some(Keytype::Ptr) => {
+                            if let Some(ty_expr) = args.next() {
+                                let ty = self.type_expr(ctx, ty_expr);
+                                if let Some(bound_expr) = args.next() {
+                                    if let TypeExprData::Expr(bound_expr) = *ctx.ast.type_expr(bound_expr) {
+                                        let bound = self.constant_expr(ctx, bound_expr);
+                                        if bound.ty.is_integer() {
+                                            todo!();
+                                        } else {
+                                            // todo: type expr location
+                                            error!(self, 0, "ptr bound must be an integer place")
+                                        }
+                                    } else {
+                                        error!(self, 0, "argument 2 of ptr type must be a value expression")
+                                    }
+                                } else /* Some(len_expr) != args.next() */ {
+                                    // unbounded
+                                    result = ctx.types.pointer(ty);
+                                }
+                            } else {
+                                // untyped
+                                result = Type::VoidPtr;
+                            }
+                        }
+                        Some(Keytype::Struct) => {
+                            if let Some(items) = ctx.ast.type_expr_items(expr) {
+                                result = sym::resolve_anonymous_struct(ctx, items);
+                            } else {
+                                error!(self, 0, "missing fields in struct declaration");
+                            }
+                        }
+                        _ => error!(self, 0, "expected keytype (one of func, proc, struct, arr, ptr)")
                     }
                 }
             }
         }
+        let resolve_error = std::mem::take(&mut ctx.error);
+        let old_error = std::mem::take(&mut self.error);
+        self.error = old_error.or(resolve_error);
         result
     }
 
@@ -2270,10 +2283,10 @@ impl FatGen {
         let body = callable.body;
         let sig = ctx.types.info(signature);
         let kind = ctx.ast.type_expr_keytype(callable.expr).expect("tried to generate code for callable without keytype");
-        let params = ctx.ast.type_expr_index_items(callable.expr, 0).expect("tried to generate code for callable without parameters");
+        let params = ctx.ast.type_expr_items(callable.expr).expect("tried to generate code for callable without parameters");
         self.generating_code_for_func = ctx.ast.type_expr_keytype(callable.expr) == Some(Keytype::Func);
         assert!(self.code.len() == 0);
-        assert!(sig.kind == TypeKind::Callable);
+        assert_eq!(sig.kind, TypeKind::Callable, "sig.kind == TypeKind::Callable");
         assert!(params.len() == sig.items.len() - 1, "the last element of a callable's type signature's items must be the return type");
         self.return_type = sig.items.last().map(|i| i.ty).unwrap();
         assert_implies!(self.generating_code_for_func, self.return_type != Type::None);
@@ -2386,10 +2399,11 @@ impl Display for TypeStrFormatter<'_> {
         let base_type = self.ctx.types.base_type(self.ty);
         let needs_parens = self.ctx.types.base_type(base_type) != base_type;
         match info.kind {
-            // todo: string of func signature
+            // todo: string of func signature, anonymous structs
             TypeKind::Callable if have_name   => write!(f, "{} {}", if info.mutable { "proc" } else { "func" }, self.ctx.str(self.callable_name)),
             TypeKind::Callable                => write!(f, "{}", if info.mutable { "proc" } else { "func" }),
-            TypeKind::Struct                  => write!(f, "{}", self.ctx.str(info.name)),
+            TypeKind::Struct if have_name     => write!(f, "{}", self.ctx.str(info.name)),
+            TypeKind::Struct                  => write!(f, "anonymous struct"),
             TypeKind::Array if needs_parens   => write!(f, "arr ({}) [{}]", self.ctx.type_str(info.base_type), info.num_array_elements),
             TypeKind::Array                   => write!(f, "arr {} [{}]", self.ctx.type_str(info.base_type), info.num_array_elements),
             TypeKind::Pointer if needs_parens => write!(f, "ptr ({})", self.ctx.type_str(info.base_type)),
@@ -2402,7 +2416,7 @@ impl Display for TypeStrFormatter<'_> {
 pub struct Compiler {
     interns: Interns,
     types: Types,
-    symbols: HashMap<Intern, Symbol>,
+    symbols: Symbols,
     globals: HashMap<Intern, Global>,
     funcs: HashMap<Intern, Func>,
     error: Option<IncompleteError>,
@@ -2415,7 +2429,7 @@ impl Compiler {
         let mut result = Compiler {
             interns: new_interns_with_keywords(),
             types: Types::new(),
-            symbols: HashMap::new(),
+            symbols: Default::default(),
             globals: HashMap::new(),
             funcs: HashMap::new(),
             error: None,
@@ -2435,7 +2449,7 @@ impl Compiler {
     }
 
     fn callable_str(&self, name: Intern) -> TypeStrFormatter {
-        TypeStrFormatter { ctx: self, ty: sym::lookup(self, name).map(|sym| sym.ty).unwrap_or(Type::None), callable_name: name }
+        TypeStrFormatter { ctx: self, ty: sym::lookup_value(self, name).map(|sym| sym.ty).unwrap_or(Type::None), callable_name: name }
     }
 
     fn type_str(&self, ty: Type) -> TypeStrFormatter {
@@ -2657,7 +2671,7 @@ panic: func () int {
             let decl_data = c.ast.decl(decl);
             let name = decl_data.name();
             let pos = decl_data.pos();
-            if let Some(sym) = sym::lookup(&c, name) {
+            if let Some(sym) = sym::lookup_value(&c, name) {
                 let ty = sym.ty;
                 match c.globals.entry(name) {
                     std::collections::hash_map::Entry::Occupied(_) => { error!(c, pos, "{} {} has already been defined", c.ast.decl(decl), c.str(name)); }
@@ -2740,9 +2754,16 @@ fn repl() {
 fn main() {
 
     let ok = [
-        (r#"
-        func: func (func, proc: int) int { return a + b; }
-        "#, Value::Int(0)),
+        ("add': func (a: int, b: int) int { return a + b; }", Value::Int(0)),
+        ("add: func (a: int, b: int) -> int { return a + b; }", Value::Int(0)),
+        ("add: (a: int, b: int) -> int { return a + b; }", Value::Int(0)),
+        ("V2: struct (x: f32, y: f32);", Value::Int(0)),
+        ("V2: struct (x, y: f32);", Value::Int(0)),
+        ("func: func (func, proc: int) int { return func + proc; }", Value::Int(0)),
+        ("V1: struct (x: f32); V2: struct (x: V1, y: V1);", Value::Int(0)),
+        ("struct: struct (struct: struct (struct: int));", Value::Int(0)),
+        ("struct: (struct: (struct: int));", Value::Int(0)),
+        ("int: (int: int) int { return 0; }", Value::Int(0)),
 ];
     for test in ok.iter() {
         let str = test.0;
@@ -2842,20 +2863,29 @@ fn decls() {
     let ok = [
         "add: func (a: int, b: int) int { return a + b; }",
         "add': func (a: int, b: int) int { return a + b; }",
-        "V2: struct ( x: f32, y: f32 );",
-        "V2: struct ( x, y: f32 );",
+        "add: func (a: int, b: int) -> int { return a + b; }",
+        "add: (a: int, b: int) -> int { return a + b; }",
+        "V2: struct (x: f32, y: f32);",
+        "V2: struct (x, y: f32);",
         "func: func (func, proc: int) int { return func + proc; }",
-        "V1: struct ( x: f32 ); V2: struct ( x: V1, y: V1 );",
+        "V1: struct (x: f32); V2: struct (x: V1, y: V1);",
+        "struct: struct (struct: struct (struct: int));",
+        "struct: (struct: (struct: int));",
+        "int: (int: int) int { return int; }"
     ];
     let err = [
         "dup_func: func (a: int, b: int) int { return a + b; } dup_func: func (a: int, b: int) int { return a + b; }",
         "dup_param: func (a: int, a: int) int { return a + a; }",
         "empty: struct ();",
-        "dup: struct ( x: f32 ); dup: struct ( y: f32 );",
-        "dup_: struct{: struct (: f32 ) dup_: struct{: struct (: f32 );",
-        "dup_field: struct ( x: f32, x: f32 );",
-        "circular: struct ( x: circular );",
-        "circular1: struct ( x: circular2 ); circular2: struct ( x: circular1 );"
+        "empty: ();",
+        "dup: struct (x: f32); dup: struct (y: f32);",
+        "dup_: struct{: struct (: f32) dup_: struct{: struct (: f32);",
+        "dup_field: struct (x: f32, x: f32);",
+        "circular: struct (x: circular);",
+        "circular1: struct (x: circular2); circular2: struct (x: circular1);",
+        "struct: struct (struct: struct);",
+        "struct: (struct: (struct: struct));",
+        "struct: (struct: struct) struct {}"
     ];
     for str in ok.iter() {
         compile_and_run(str).map_err(|e| { println!("input: \"{}\"", str); e }).unwrap();
@@ -2968,7 +2998,7 @@ main: proc () int {
 }
 "#, Value::Int(1)),
 (r#"
-V2: struct ( x: f32, y: f32 );
+V2: struct (x: f32, y: f32);
 
 dot: func (a: V2, b: V2) f32 {
     return a.x*b.x + a.y*b.y;
@@ -2979,7 +3009,7 @@ main: proc () int {
 }
 "#, Value::Int(3+8)),
 (r#"
-V2: struct ( x, y: i32 );
+V2: struct (x, y: i32);
 
 add: func (a: V2, b: V2) V2 {
     return { (a.x + b.x):i32, (a.y + b.y):i32 };
@@ -3312,7 +3342,7 @@ main: proc () int {
 }
 "#, Value::Int(3)),
 (r#"
-V2: struct (
+V4: (
     x: i32,
     y: i32,
     z: i32,
@@ -3320,11 +3350,21 @@ V2: struct (
 );
 
 main: proc () int {
-    a := ({ x = -1 }:V2).x;
-    b := (a == -1) ? { w = 3 }:V2 :: { w = 4 }:V2;
+    a := ({ x = -1 }:V4).x;
+    b := (a == -1) ? { w = 3 }:V4 :: { w = 4 }:V4;
     return b.w:int;
 }
 "#, Value::Int(3)),
+(r#"
+add: func (a: struct (x, y: int), b: (x, y: int)) (x, y: int) {
+    return { a.x+b.x, a.y+b.y };
+}
+
+main: proc () int {
+    a := add({1,2},{3,4});
+    return a.x + a.y;
+}
+"#, Value::Int(10)),
 ];
     let err = [r#"
 main: proc () int {
@@ -3332,19 +3372,19 @@ main: proc () int {
     return v;
 }
 "#, r#"
-V2: struct ( x: int, y: int );
+V2: struct (x: int, y: int);
 main: proc () int {
     v := {}:V2;
     v.a = 0;
     return v.x:int;
 }
 "#, r#"
-V2: struct ( x: int, y: int );
+V2: struct (x: int, y: int);
 main: proc () int {
     v := { a = 0 }:V2;
     return v.a;
 },
-V2: struct ( x: int, y: int );
+V2: struct (x: int, y: int);
 main: proc () int {
     v := { x = 0, 1 }:V2;
     return v.a;
@@ -3400,8 +3440,8 @@ main: proc () int {
 }
 "#, Value::Int(8)),
 (r#"
-V4: struct ( padding: i16, c: arr i32 [4] );
-M4: struct ( padding: i16, r: arr V4 [4] );
+V4: struct (padding: i16, c: arr i32 [4]);
+M4: struct (padding: i16, r: arr V4 [4]);
 main: proc () int {
     a: M4 = {
         r = {
@@ -3548,7 +3588,7 @@ main: proc () int {
 "#, Value::Int(-1234)),
 (r#"
 V2: struct (x: i32, y: i32);
-rot: proc(v: ptr V2)int {
+rot:(proc)(v:ptr(V2))(int) {
     *v = { (-v.y):i32, v.x };
     return 0;
 }
@@ -3559,14 +3599,14 @@ main: proc () int {
 }
 "#, Value::Int(-1)),
 (r#"
-V2: struct (x: i32, y: i32);
-main: proc () int {
+V2:(struct (x: i32, y: i32));
+main: (proc () int) {
     return &(0:ptr V2).y:ptr - 0:ptr;
 }
 "#, Value::Int(4)),
 (r#"
 V2: struct (x: i32, y: i32);
-rot2: proc(vv: ptr (ptr V2)) {
+rot2: proc(vv: ptr -> ptr V2) {
     vv[0].x = -1;
     // **vv = { (-vv[0].y):i32, vv[0].x };
 }
@@ -3587,7 +3627,7 @@ main: proc () int {
     return *a;
 }
 "#,r#"
-main: proc () int {
+main: proc () -> int {
     a := &-1:u8;
     return *a;
 }
@@ -3599,7 +3639,7 @@ main: proc () int {
 }
 "#,r#"
 V2: struct (x: i32, y: i32);
-rot: func (v: ptr V2) int {
+rot: (v: ptr V2) int {
     *v = { (-v.y):i32, v.x };
     return 0;
 }
