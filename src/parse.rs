@@ -254,7 +254,6 @@ unsafe fn offset_from(str: &str, substr: &str) -> usize {
 }
 
 struct Parser<'c, 'a> {
-    ast: Ast,
     ctx: &'c mut Compiler,
     str: &'a str,
     p: &'a str,
@@ -275,7 +274,7 @@ fn is_valid_identifier_character(c: char) -> bool {
 
 impl<'c, 'a> Parser<'_, '_> {
     fn new(ctx: &'c mut Compiler, str: &'a str) -> Parser<'c, 'a> {
-        let mut result = Parser { ast: Ast::new(), ctx: ctx, str: str, p: str, token: Token::eof() };
+        let mut result = Parser { ctx: ctx, str: str, p: str, token: Token::eof() };
         result.next_token();
         result
     }
@@ -460,13 +459,13 @@ impl<'c, 'a> Parser<'_, '_> {
             let expr = match self.token.kind {
                 Name => {
                     let name = self.name();
-                    self.ast.push_type_expr(TypeExprData::Name(name))
+                    self.ctx.ast.push_type_expr(TypeExprData::Name(name))
                 }
                 LBracket => {
                     self.token(LBracket);
                     let expr = self.expr();
                     self.token(RBracket);
-                    self.ast.push_type_expr(TypeExprData::Expr(expr))
+                    self.ctx.ast.push_type_expr(TypeExprData::Expr(expr))
                 }
                 LParen => {
                     self.token(LParen);
@@ -481,9 +480,9 @@ impl<'c, 'a> Parser<'_, '_> {
                             self.p = p;
                             self.token = token;
                             let items = self.items();
-                            expr = self.ast.push_type_expr(TypeExprData::Items(items));
+                            expr = self.ctx.ast.push_type_expr(TypeExprData::Items(items));
                         } else if matches!(self.token.kind, RParen) {
-                            expr = self.ast.push_type_expr(TypeExprData::Name(name));
+                            expr = self.ctx.ast.push_type_expr(TypeExprData::Name(name));
                         } else {
                             self.p = p;
                             self.token = token;
@@ -491,7 +490,7 @@ impl<'c, 'a> Parser<'_, '_> {
                         }
                     } else {
                         // parse () as an empty item list. We don't have any other interpretation for this, yet?
-                        expr = self.ast.push_type_expr(TypeExprData::Items(ItemList::empty()));
+                        expr = self.ctx.ast.push_type_expr(TypeExprData::Items(ItemList::empty()));
                     }
                     self.token(RParen);
                     expr
@@ -502,12 +501,12 @@ impl<'c, 'a> Parser<'_, '_> {
                 }
                 _ => parse_error!(self, "in type expression, expected name, ( or [, found {}", self.token)
             };
-            list.push(self.ast.pop_type_expr(expr));
+            list.push(self.ctx.ast.pop_type_expr(expr));
         }
         match list.len() {
             0 => parse_error!(self, "empty type expression"),
-            1 => self.ast.push_type_expr(list[0]),
-            _ => self.ast.push_type_expr_list(&list)
+            1 => self.ctx.ast.push_type_expr(list[0]),
+            _ => self.ctx.ast.push_type_expr_list(&list)
         }
     }
 
@@ -521,12 +520,12 @@ impl<'c, 'a> Parser<'_, '_> {
     fn expr_list(&mut self) -> ExprList {
         let mut list = SmallVec::new();
         let expr = self.expr();
-        list.push(self.ast.pop_expr(expr));
+        list.push(self.ctx.ast.pop_expr(expr));
         while self.try_token(TokenKind::Comma).is_some() {
             let expr = self.expr();
-            list.push(self.ast.pop_expr(expr));
+            list.push(self.ctx.ast.pop_expr(expr));
         }
-        self.ast.push_exprs(&list)
+        self.ctx.ast.push_exprs(&list)
     }
 
     fn base_expr(&mut self) -> Expr {
@@ -539,23 +538,23 @@ impl<'c, 'a> Parser<'_, '_> {
                 let token = self.token;
                 self.token(Int);
                 let value: usize = token.str.parse().unwrap_or_else(|err| { parse_error!(self, "{}", err) });
-                self.ast.push_expr_int(token.source_index, value)
+                self.ctx.ast.push_expr_int(token.source_index, value)
             },
             Float => {
                 let token = self.token;
                 self.token(Float);
                 if token.suffix == Some(b'd') {
                     let value: f64 = token.str.parse().unwrap_or_else(|err| { parse_error!(self, "{}", err) });
-                    self.ast.push_expr_float64(token.source_index, value)
+                    self.ctx.ast.push_expr_float64(token.source_index, value)
                 } else {
                     let value: f32 = token.str.parse().unwrap_or_else(|err| { parse_error!(self, "{}", err) });
-                    self.ast.push_expr_float32(token.source_index, value)
+                    self.ctx.ast.push_expr_float32(token.source_index, value)
                 }
             },
             Name => {
                 let index = self.token.source_index;
                 let name = self.name();
-                self.ast.push_expr_name(index, name)
+                self.ctx.ast.push_expr_name(index, name)
             },
             LBrace => {
                 let pos = self.pos();
@@ -593,7 +592,7 @@ impl<'c, 'a> Parser<'_, '_> {
                     }
                 }
                 self.token(RBrace);
-                self.ast.push_expr_compound(pos, &fields)
+                self.ctx.ast.push_expr_compound(pos, &fields)
             }
             _ => {
                 parse_error!(self, "Unexpected {}", self.token)
@@ -610,18 +609,18 @@ impl<'c, 'a> Parser<'_, '_> {
                         ExprList::empty()
                     };
                     self.token(RParen);
-                    result = self.ast.push_expr_call(pos, result, args);
+                    result = self.ctx.ast.push_expr_call(pos, result, args);
                 }
                 LBracket => {
                     let pos = self.token(LBracket).source_index;
                     let index = self.expr();
                     self.token(RBracket);
-                    result = self.ast.push_expr_index(pos, result, index);
+                    result = self.ctx.ast.push_expr_index(pos, result, index);
                 }
                 Dot => {
                     let pos = self.token(Dot).source_index;
                     let field = self.name();
-                    result = self.ast.push_expr_field(pos, result, field);
+                    result = self.ctx.ast.push_expr_field(pos, result, field);
                 }
                 _ => break
             }
@@ -637,31 +636,31 @@ impl<'c, 'a> Parser<'_, '_> {
                 let token = self.token;
                 self.token(Sub);
                 let operand = self.unary_expr();
-                self.ast.push_expr_unary(token.source_index, token.kind, operand)
+                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             BitNeg => {
                 let token = self.token;
                 self.token(BitNeg);
                 let operand = self.unary_expr();
-                self.ast.push_expr_unary(token.source_index, token.kind, operand)
+                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             Not => {
                 let token = self.token;
                 self.token(Not);
                 let operand = self.unary_expr();
-                self.ast.push_expr_unary(token.source_index, token.kind, operand)
+                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             BitAnd => {
                 let token = self.token;
                 self.token(BitAnd);
                 let operand = self.unary_expr();
-                self.ast.push_expr_unary(token.source_index, token.kind, operand)
+                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             Mul => {
                 let token = self.token;
                 self.token(Mul);
                 let operand = self.unary_expr();
-                self.ast.push_expr_unary(token.source_index, token.kind, operand)
+                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
             },
             _ => {
                 self.base_expr()
@@ -669,26 +668,14 @@ impl<'c, 'a> Parser<'_, '_> {
         }
     }
 
-    fn cast_expr(&mut self) -> Expr {
-        let mut result = self.unary_expr();
-
-        while self.try_token(TokenKind::Colon).is_some() {
-            let token = self.token;
-            let ty = self.type_expr();
-            result = self.ast.push_expr_cast(token.source_index, result, ty);
-        }
-
-        result
-    }
-
     fn mul_expr(&mut self) -> Expr {
         use TokenKind::*;
-        let mut result = self.cast_expr();
+        let mut result = self.unary_expr();
         while matches!(self.token.kind, Mul|Div|Mod|BitAnd|LShift|RShift) {
             let token = self.token;
             self.next_token();
-            let right = self.cast_expr();
-            result = self.ast.push_expr_binary(token.source_index, token.kind, result, right);
+            let right = self.unary_expr();
+            result = self.ctx.ast.push_expr_binary(token.source_index, token.kind, result, right);
         }
         result
     }
@@ -700,7 +687,7 @@ impl<'c, 'a> Parser<'_, '_> {
             let token = self.token;
             self.next_token();
             let right = self.mul_expr();
-            result = self.ast.push_expr_binary(token.source_index, token.kind, result, right);
+            result = self.ctx.ast.push_expr_binary(token.source_index, token.kind, result, right);
         }
         result
     }
@@ -712,7 +699,7 @@ impl<'c, 'a> Parser<'_, '_> {
             let token = self.token;
             self.next_token();
             let right = self.add_expr();
-            result = self.ast.push_expr_binary(token.source_index, token.kind, result, right);
+            result = self.ctx.ast.push_expr_binary(token.source_index, token.kind, result, right);
         }
         result
     }
@@ -723,7 +710,7 @@ impl<'c, 'a> Parser<'_, '_> {
             let token = self.token;
             self.next_token();
             let right = self.cmp_expr();
-            result = self.ast.push_expr_binary(token.source_index, token.kind, result, right);
+            result = self.ctx.ast.push_expr_binary(token.source_index, token.kind, result, right);
         }
         result
     }
@@ -734,7 +721,7 @@ impl<'c, 'a> Parser<'_, '_> {
             let token = self.token;
             self.next_token();
             let right = self.and_expr();
-            result = self.ast.push_expr_binary(token.source_index, token.kind, result, right);
+            result = self.ctx.ast.push_expr_binary(token.source_index, token.kind, result, right);
         }
         result
     }
@@ -744,16 +731,28 @@ impl<'c, 'a> Parser<'_, '_> {
         if matches!(self.token.kind, TokenKind::Question) {
             let token = self.token;
             self.token(TokenKind::Question);
-            let left = self.ternary_expr();
+            let left = self.expr();
             self.token(TokenKind::ColonColon);
-            let right = self.ternary_expr();
-            result = self.ast.push_expr_ternary(token.source_index, result, left, right);
+            let right = self.expr();
+            result = self.ctx.ast.push_expr_ternary(token.source_index, result, left, right);
         }
         result
     }
 
+    fn cast_expr(&mut self) -> Expr {
+        let mut result = self.ternary_expr();
+
+        while self.try_token(TokenKind::Colon).is_some() {
+            let token = self.token;
+            let ty = self.type_expr();
+            result = self.ctx.ast.push_expr_cast(token.source_index, result, ty);
+        }
+
+        result
+    }
+
     fn expr(&mut self) -> Expr {
-        self.ternary_expr()
+        self.cast_expr()
     }
 
     fn stmt_block(&mut self) -> StmtList {
@@ -761,9 +760,9 @@ impl<'c, 'a> Parser<'_, '_> {
         let mut list = SmallVec::new();
         while !self.is_eof() && self.try_token(TokenKind::RBrace).is_none() {
             let stmt = self.stmt();
-            list.push(self.ast.pop_stmt(stmt));
+            list.push(self.ctx.ast.pop_stmt(stmt));
         }
-        self.ast.push_stmts(&list)
+        self.ctx.ast.push_stmts(&list)
     }
 
     fn simple_stmt(&mut self) -> Stmt {
@@ -773,7 +772,7 @@ impl<'c, 'a> Parser<'_, '_> {
             ColonAssign => {
                 self.next_token();
                 let right = self.expr();
-                self.ast.push_stmt_vardecl(TypeExpr::Infer, left, right)
+                self.ctx.ast.push_stmt_vardecl(TypeExpr::Infer, left, right)
             }
             Assign => {
                 self.next_token();
@@ -781,20 +780,20 @@ impl<'c, 'a> Parser<'_, '_> {
                 // thing. Take `a: int = 0;`. Conceptually, we expect a `:` after the expr `a`,
                 // but `a: int` parses as Expr::Cast(a, int). We can immediately see this,
                 // and so rewrite it as a variable declaration.
-                match self.ast.expr(left) {
+                match self.ctx.ast.expr(left) {
                     ExprData::Cast(expr, ty) => {
-                        self.ast.pop_expr(left);
+                        self.ctx.ast.pop_expr(left);
                         let right = self.expr();
-                        self.ast.push_stmt_vardecl(ty, expr, right)
+                        self.ctx.ast.push_stmt_vardecl(ty, expr, right)
                     }
                     _ => {
                         let right = self.expr();
-                        self.ast.push_stmt_assign(left, right)
+                        self.ctx.ast.push_stmt_assign(left, right)
                     }
                 }
             }
             _ => {
-                self.ast.push_stmt_expr(left)
+                self.ctx.ast.push_stmt_expr(left)
             }
         };
         result
@@ -813,21 +812,21 @@ impl<'c, 'a> Parser<'_, '_> {
                     self.token(Semicolon);
                     Some(expr)
                 };
-                self.ast.push_stmt_return(expr)
+                self.ctx.ast.push_stmt_return(expr)
             },
             (Keyword, Some(Break)) => {
                 self.token(Keyword);
                 self.token(Semicolon);
-                self.ast.push_stmt_break()
+                self.ctx.ast.push_stmt_break()
             },
             (Keyword, Some(Continue)) => {
                 self.token(Keyword);
                 self.token(Semicolon);
-                self.ast.push_stmt_continue()
+                self.ctx.ast.push_stmt_continue()
             },
             (LBrace, _) => {
                 let list = self.stmt_block();
-                self.ast.push_stmt_block(list)
+                self.ctx.ast.push_stmt_block(list)
             },
             (Keyword, Some(If)) => {
                 self.token(Keyword);
@@ -843,13 +842,13 @@ impl<'c, 'a> Parser<'_, '_> {
                 } else {
                     StmtList::empty()
                 };
-                self.ast.push_stmt_if(expr, then_stmt, else_stmt)
+                self.ctx.ast.push_stmt_if(expr, then_stmt, else_stmt)
             },
             (Keyword, Some(While)) => {
                 self.token(Keyword);
                 let cond = self.paren_expr();
                 let body = self.stmt_block();
-                self.ast.push_stmt_while(cond, body)
+                self.ctx.ast.push_stmt_while(cond, body)
             },
             (Keyword, Some(For)) => {
                 self.token(Keyword);
@@ -873,7 +872,7 @@ impl<'c, 'a> Parser<'_, '_> {
                 };
                 self.token(RParen);
                 let block = self.stmt_block();
-                self.ast.push_stmt_for(pre, cond, post, block)
+                self.ctx.ast.push_stmt_for(pre, cond, post, block)
             },
             (Keyword, Some(Do)) => {
                 self.token(Keyword);
@@ -881,7 +880,7 @@ impl<'c, 'a> Parser<'_, '_> {
                 self.keyword(While);
                 let cond = self.paren_expr();
                 self.token(Semicolon);
-                self.ast.push_stmt_do(cond, body)
+                self.ctx.ast.push_stmt_do(cond, body)
             },
             (Keyword, Some(Switch)) => {
                 self.token(Keyword);
@@ -908,7 +907,7 @@ impl<'c, 'a> Parser<'_, '_> {
                     }
                 }
                 self.token(RBrace);
-                self.ast.push_stmt_switch(control, &cases)
+                self.ctx.ast.push_stmt_switch(control, &cases)
             },
             _ => {
                 let stmt = self.simple_stmt();
@@ -933,7 +932,7 @@ impl<'c, 'a> Parser<'_, '_> {
             }
             self.try_token(TokenKind::Comma);
         }
-        self.ast.push_items(&items)
+        self.ctx.ast.push_items(&items)
     }
 
     fn decl(&mut self) {
@@ -941,27 +940,27 @@ impl<'c, 'a> Parser<'_, '_> {
         let name = self.name();
         let decl = if self.try_token(TokenKind::Colon).is_some() {
             let expr = self.type_expr();
-            match self.ast.type_expr_keytype(expr) {
+            match self.ctx.ast.type_expr_keytype(expr) {
                 Some(Keytype::Func)|Some(Keytype::Proc) => {
                     let body = self.stmt_block();
-                    self.ast.push_decl_callable(CallableDecl { pos, name, expr, body })
+                    self.ctx.ast.push_decl_callable(CallableDecl { pos, name, expr, body })
                 }
                 Some(Keytype::Struct) => {
                     // todo: declare global variable on =
                     self.token(TokenKind::Semicolon);
-                    self.ast.push_decl_struct(StructDecl { pos, name, expr })
+                    self.ctx.ast.push_decl_struct(StructDecl { pos, name, expr })
                 }
                 _ => {
                     self.token(TokenKind::Assign);
                     let value = self.expr();
                     self.token(TokenKind::Semicolon);
-                    self.ast.push_decl_var(VarDecl { pos, name, expr, value })
+                    self.ctx.ast.push_decl_var(VarDecl { pos, name, expr, value })
                 }
             }
         } else if self.try_token(TokenKind::ColonAssign).is_some() {
             let value = self.expr();
             self.token(TokenKind::Semicolon);
-            self.ast.push_decl_var(VarDecl { pos, name, expr: TypeExpr::Infer, value })
+            self.ctx.ast.push_decl_var(VarDecl { pos, name, expr: TypeExpr::Infer, value })
         } else {
             parse_error!(self, "expected : or :=, found {}", self.token)
         };
@@ -971,25 +970,10 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 }
 
-pub fn parse(ctx: &mut Compiler, str: &str) -> Ast {
+pub fn parse(ctx: &mut Compiler, str: &str) {
     let mut parser = Parser::new(ctx, str);
     while !parser.is_eof() {
         parser.comment();
         parser.decl();
     }
-    parser.ast
-}
-
-#[allow(dead_code)]
-pub fn parse_stmt(ctx: &mut Compiler, str: &str) -> (Ast, Stmt) {
-    let mut parser = Parser::new(ctx, str);
-    let stmt = parser.stmt();
-    (parser.ast, stmt)
-}
-
-#[allow(dead_code)]
-pub fn parse_expr(ctx: &mut Compiler, str: &str) -> (Ast, Expr) {
-    let mut parser = Parser::new(ctx, str);
-    let expr = parser.expr();
-    (parser.ast, expr)
 }

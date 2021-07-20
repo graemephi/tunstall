@@ -1,4 +1,4 @@
-struct V2 { x: f32, y: f32 }
+V2: (x: f32, y: f32);
 
 func syntax(a: int, b: int): int
 {
@@ -16,16 +16,18 @@ func syntax(a: int, b: int): int
     p: ptr (ptr int) = &n;
 
 
-    // add: func (int, int) int (1,2)          // funcs always have a return type
-    // add2: proc (int, int) () (1, 2)
-                                               // but both will fail to type check (they take 2 args, not 3)
-    r := add: (func (int, int) int)(1, 2)      // cast and call ?
+    n: int = &a:int;
+    m: ptr int = &a:ptr int;
+    o: int = (&a):int;
+    p: v2 = &{}:V2;
 
     v := { x = 0.0, y = 0.0 }:V2;
     v: V2 = { x = 0.0, y = 0.0 };
     v: V2 = { x = 0.0, y = 0.0 }:V2;
 
-    anon := { a = 0, b = 0 }:struct { a: i32, b: i32 };
+    anon := { a = 0, b = 0 }:struct (a: i32, b: i32);
+    anon2 := { a = 0, b = 0 }:(a: i32, b: i32);
+    anon3 := { a = 0, b = 0 }:(a, b: i32);
 
     return r;
 }
@@ -46,11 +48,11 @@ f: func (a: u32, b: u32) u32 {
 }
 
 
-Buf: struct {
+Buf: struct (
     buf: ptr u8 [cap],
     len: int,
     cap: int
-}
+);
 
 proc buf_copy(buf: ptr Buf, dest: ptr u8 [buf.len]) {
     // checks buf.len < buf.cap

@@ -125,12 +125,16 @@ impl Interns {
         }
     }
 
+    pub fn get(&self, str: &str) -> Option<Intern> {
+        self.ids.get(str).copied()
+    }
+
     pub fn to_str(&self, id: Intern) -> Option<&str> {
         self.interns.get(id.0 as usize).copied()
     }
 }
 
-// If the compiler was a library we'd need this. As an application this just
+// If the compiler were a library we'd need this. As an application this just
 // wastes time at exit
 #[cfg(test)]
 impl Drop for Interns {
@@ -2505,6 +2509,17 @@ impl Compiler {
             ($addr:expr) => { *(std::ptr::addr_of_mut!(stack![$addr]) as *mut RegValue) }
         }
 
+        // terrible
+        macro_rules! panic_message {
+            () => {
+                if Some(call_stack[call_stack.len() - 2].3) == self.interns.get("assert") {
+                    format!("assertion failed in {}", self.str(call_stack[call_stack.len() - 3].3))
+                } else {
+                    format!("panic in {}", self.str(call_stack[call_stack.len() - 2].3))
+                }
+            }
+        }
+
         loop {
             let instr = &code[ip];
             let dest = sp.wrapping_add(instr.dest as usize);
@@ -2516,7 +2531,7 @@ impl Compiler {
             unsafe {
                  match instr.op {
                     Op::Halt       => { break; }
-                    Op::Panic      => { return Err(format!("panic in {}", self.str(call_stack[call_stack.len()-2].3)).into()) }
+                    Op::Panic      => { return Err(panic_message!().into()) }
                     Op::Noop       => {}
                     Op::Immediate  => { reg![dest] = RegValue::from((instr.left, instr.right)); }
                     Op::IntNeg     => { reg![dest].sint = -reg![left].sint; }
@@ -2653,15 +2668,20 @@ impl Compiler {
 fn compile(str: &str) -> Result<Compiler> {
     let mut c = Compiler::new();
 
-    c.ast = parse::parse(&mut c, r#"
+    parse::parse(&mut c, r#"
 panic: func () int {
     // built-in
 }
+
+assert: func (condition: bool) int {
+    if (!condition) {
+        panic();
+    }
+    return 0;
+}
 "#);
 
-    resolve_all(&mut c);
-
-    c.ast = parse::parse(&mut c, str);
+    parse::parse(&mut c, str);
 
     c.check_and_clear_error(str)?;
     resolve_all(&mut c);
@@ -2706,7 +2726,7 @@ panic: func () int {
     c.check_and_clear_error(str)?;
 
     let mut gen = FatGen::new();
-    for decl in c.ast.decl_list() {
+    for decl in c.ast.decl_list().skip(1) {
         if c.ast.is_callable(decl) {
             let name = c.ast.decl(decl).name();
             let sig = c.globals.get(&name).unwrap().ty;
@@ -2836,7 +2856,7 @@ fn expr() {
 fn stmt() {
     let ok = [
         "a := 1; do { if (a > 2) { a = (a & 1) == 1 ? a * 2 :: a + 1; } else { a = a + 1; } } while (a < 10);",
-        "a := 1.0; a = a + 1.0d:f32;",
+        "a := 1.0; a = a + (1.0:f32);",
         "a := !165: int;",
         "(!!(2*3)) || !!(3-3);",
         "a := (0: bool);",
@@ -3543,7 +3563,7 @@ main: proc () int {
 main: proc () int {
     arr := {}:arr u16 [8];
     for (p := &arr[0]; p != &arr[8]; p = p + 1) {
-        *p = (p - &arr[0]):u16;
+        *p = p - &arr[0] : u16;
     }
     arrp := &arr[0];
     acc := 0;
@@ -3589,7 +3609,7 @@ main: proc () int {
 (r#"
 V2: struct (x: i32, y: i32);
 rot:(proc)(v:ptr(V2))(int) {
-    *v = { (-v.y):i32, v.x };
+    *v = { -v.y:i32, v.x };
     return 0;
 }
 main: proc () int {
@@ -3601,23 +3621,33 @@ main: proc () int {
 (r#"
 V2:(struct (x: i32, y: i32));
 main: (proc () int) {
-    return &(0:ptr V2).y:ptr - 0:ptr;
+    return (&(0:ptr V2).y:ptr) - (0:ptr);
 }
 "#, Value::Int(4)),
 (r#"
 V2: struct (x: i32, y: i32);
-rot2: proc(vv: ptr -> ptr V2) {
-    vv[0].x = -1;
-    // **vv = { (-vv[0].y):i32, vv[0].x };
+rot22: proc(vv: ptr -> ptr V2) {
+    **vv = { -vv[0].y:i32, vv[0].x };
 }
-rot1: proc(v: ptr V2) {
+rot12: proc(v: ptr V2) {
     vv := &v;
-    rot2(vv);
+    rot22(vv);
+}
+rot21: proc(vv: ptr -> ptr V2) {
+    vv[0].x = -1;
+}
+rot11: proc(v: ptr V2) {
+    vv := &v;
+    rot21(vv);
 }
 main: proc () int {
-    v: V2 = {0,1};
-    rot1(&v);
-    return v.x;
+    v1: V2 = {0,1};
+    v2: V2 = {0,2};
+    rot11(&v1);
+    rot12(&v2);
+    assert(v1.x == -1);
+    assert(v2.x == -2);
+    return v1.x;
 }
 "#, Value::Int(-1)),
 ];
@@ -3640,7 +3670,7 @@ main: proc () int {
 "#,r#"
 V2: struct (x: i32, y: i32);
 rot: (v: ptr V2) int {
-    *v = { (-v.y):i32, v.x };
+    *v = { -v.y:i32, v.x };
     return 0;
 }
 main: proc () int {
