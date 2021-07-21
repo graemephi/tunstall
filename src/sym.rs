@@ -223,6 +223,7 @@ pub fn builtin(ctx: &mut Compiler, name: Intern, ty: Type) {
     ctx.symbols.insert_new(Symbol { kind: Kind::Type, name, state: State::Resolved, expr: TypeExpr::Infer, ty });
 }
 
+#[allow(dead_code)]
 pub fn lookup_type(ctx: &Compiler, name: Intern) -> Option<&Symbol> {
     ctx.symbols.get(Kind::Type, name)
 }

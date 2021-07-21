@@ -451,15 +451,24 @@ impl<'c, 'a> Parser<'_, '_> {
         result
     }
 
-    fn type_expr(&mut self) -> TypeExpr {
+    fn type_expr(&mut self, depth: isize) -> TypeExpr {
         use TokenKind::*;
         let mut list = SmallVecN::<_, 8>::new();
         while matches!(self.token.kind, Name|LBracket|LParen|Arrow) {
             use TokenKind::*;
             let expr = match self.token.kind {
                 Name => {
+                    let (p, token) = (self.p, self.token);
                     let name = self.name();
-                    self.ctx.ast.push_type_expr(TypeExprData::Name(name))
+                    if depth >= 1 && matches!(self.token.kind, Comma|Colon) {
+                        // Roll back one token. Could be done "better" but eh
+                        self.p = p;
+                        self.token = token;
+                        let items = self.items();
+                        self.ctx.ast.push_type_expr(TypeExprData::Items(items))
+                    } else {
+                        self.ctx.ast.push_type_expr(TypeExprData::Name(name))
+                    }
                 }
                 LBracket => {
                     self.token(LBracket);
@@ -469,27 +478,11 @@ impl<'c, 'a> Parser<'_, '_> {
                 }
                 LParen => {
                     self.token(LParen);
-                    let (p, token) = (self.p, self.token);
                     let expr;
                     if self.not(RParen) {
-                        let name = self.name();
-                        if matches!(self.token.kind, Comma|Colon) {
-                            // Roll back one token. This is to avoid having two
-                            // items() or special-casing it or have you rather than
-                            // an aspect of the grammar proper
-                            self.p = p;
-                            self.token = token;
-                            let items = self.items();
-                            expr = self.ctx.ast.push_type_expr(TypeExprData::Items(items));
-                        } else if matches!(self.token.kind, RParen) {
-                            expr = self.ctx.ast.push_type_expr(TypeExprData::Name(name));
-                        } else {
-                            self.p = p;
-                            self.token = token;
-                            expr = self.type_expr();
-                        }
+                        expr = self.type_expr(depth + 1);
                     } else {
-                        // parse () as an empty item list. We don't have any other interpretation for this, yet?
+                        // parse () as an empty item list
                         expr = self.ctx.ast.push_type_expr(TypeExprData::Items(ItemList::empty()));
                     }
                     self.token(RParen);
@@ -497,7 +490,7 @@ impl<'c, 'a> Parser<'_, '_> {
                 }
                 Arrow => {
                     self.token(Arrow);
-                    self.type_expr()
+                    self.type_expr(0)
                 }
                 _ => parse_error!(self, "in type expression, expected name, ( or [, found {}", self.token)
             };
@@ -732,7 +725,7 @@ impl<'c, 'a> Parser<'_, '_> {
             let token = self.token;
             self.token(TokenKind::Question);
             let left = self.expr();
-            self.token(TokenKind::ColonColon);
+            self.token(TokenKind::Comma);
             let right = self.expr();
             result = self.ctx.ast.push_expr_ternary(token.source_index, result, left, right);
         }
@@ -744,7 +737,7 @@ impl<'c, 'a> Parser<'_, '_> {
 
         while self.try_token(TokenKind::Colon).is_some() {
             let token = self.token;
-            let ty = self.type_expr();
+            let ty = self.type_expr(0);
             result = self.ctx.ast.push_expr_cast(token.source_index, result, ty);
         }
 
@@ -926,7 +919,7 @@ impl<'c, 'a> Parser<'_, '_> {
                 items.push(ItemData { name: self.name(), expr: TypeExpr(0) });
             }
             self.token(TokenKind::Colon);
-            let expr = self.type_expr();
+            let expr = self.type_expr(0);
             for item in &mut items[top..] {
                 item.expr = expr;
             }
@@ -939,7 +932,7 @@ impl<'c, 'a> Parser<'_, '_> {
         let pos = self.pos();
         let name = self.name();
         let decl = if self.try_token(TokenKind::Colon).is_some() {
-            let expr = self.type_expr();
+            let expr = self.type_expr(0);
             match self.ctx.ast.type_expr_keytype(expr) {
                 Some(Keytype::Func)|Some(Keytype::Proc) => {
                     let body = self.stmt_block();

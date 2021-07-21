@@ -488,7 +488,7 @@ fn unary_op(op: parse::TokenKind, ty: Type) -> Option<(Op, Type)> {
     match (op, integer_promote(ty)) {
         (TokenKind::Sub,    Type::Int) => Some((Op::IntNeg, Type::Int)),
         (TokenKind::BitNeg, Type::Int) => Some((Op::BitNeg, Type::Int)),
-        (TokenKind::Not,    _       ) => Some((Op::Not,    Type::Bool)),
+        (TokenKind::Not,    _       )  => Some((Op::Not,    Type::Bool)),
         (TokenKind::Sub,    Type::F32) => Some((Op::F32Neg, Type::F32)),
         (TokenKind::Sub,    Type::F64) => Some((Op::F64Neg, Type::F64)),
         _ => None
@@ -930,10 +930,6 @@ struct Control {
     true_to: Label,
     false_to: Label,
     fallthrough_to: Label,
-}
-
-fn branch(true_to: Label, false_to: Label) -> Control {
-    Control { true_to, false_to, fallthrough_to: Label::BAD }
 }
 
 fn fall_true(true_to: Label, false_to: Label) -> Control {
@@ -1385,7 +1381,8 @@ impl FatGen {
                                 error!(self, 0, "missing fields in struct declaration");
                             }
                         }
-                        _ => error!(self, 0, "expected keytype (one of func, proc, struct, arr, ptr)")
+                        Some(Keytype::Func)|Some(Keytype::Proc) => error!(self, 0, "func/proc pointers are not implemented"),
+                        None => error!(self, 0, "expected keytype (one of func, proc, struct, arr, ptr)")
                     }
                 }
             }
@@ -1831,7 +1828,7 @@ impl FatGen {
                         debug_assert!(left.addr == right.addr);
                         result = left;
                     } else {
-                        error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types (... ? {} :: {})", ctx.type_str(left.ty), ctx.type_str(right.ty));
+                        error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types (... ? {}, {})", ctx.type_str(left.ty), ctx.type_str(right.ty));
                     }
                 } else {
                     error!(self, ctx.ast.expr_source_position(cond_expr), "ternary expression requires a boolean condition");
@@ -1896,7 +1893,7 @@ impl FatGen {
                 } else {
                     self.expr_with_destination_type(ctx, expr, to_ty)
                 };
-                let epxression_transposable = || {
+                let expression_transposable = || {
                     if let ExprData::Unary(parse::TokenKind::BitAnd, inner) = ctx.ast.expr(expr) {
                         if let ExprData::Compound(_) = ctx.ast.expr(inner) {
                             return true;
@@ -1923,7 +1920,7 @@ impl FatGen {
                     } else {
                         result.ty = ctx.types.copy_mutability(to_ty, left.ty);
                     }
-                } else if epxression_transposable() {
+                } else if expression_transposable() {
                     // The cast-on-the-right synax doesn't work great with taking addresses.
                     //
                     // Conceptually, this transposes
@@ -2843,19 +2840,19 @@ fn expr() {
     eval!("256: i8", 0);
     eval!("-1: u8: int", 255);
     eval!("-1: i8: int", -1);
-    eval!("1 == 1 ? 2 :: 3", 2);
-    eval!("0 == 1 ? 2 :: 3", 3);
-    eval!("(43 * 43) > 0 ? (1+1+1) :: (2 << 3)", 3);
-    eval!("!!0 ? (!!1 ? 2 :: 3) :: (!!4 ? 5 :: 6)", 5);
-    eval!("!!0 ?  !!1 ? 2 :: 3  ::  !!4 ? 5 :: 6",  5);
-    eval!("!!1 ? (!!2 ? 3 :: 4) :: (!!5 ? 6 :: 7)", 3);
-    eval!("!!1 ?  !!2 ? 3 :: 4  ::  !!5 ? 6 :: 7",  3);
+    eval!("1 == 1 ? 2, 3", 2);
+    eval!("0 == 1 ? 2, 3", 3);
+    eval!("(43 * 43) > 0 ? (1+1+1), (2 << 3)", 3);
+    eval!("!!0 ? (!!1 ? 2, 3), (!!4 ? 5, 6)", 5);
+    eval!("!!0 ?  !!1 ? 2, 3 ,  !!4 ? 5, 6",  5);
+    eval!("!!1 ? (!!2 ? 3, 4), (!!5 ? 6, 7)", 3);
+    eval!("!!1 ?  !!2 ? 3, 4 ,  !!5 ? 6, 7",  3);
 }
 
 #[test]
 fn stmt() {
     let ok = [
-        "a := 1; do { if (a > 2) { a = (a & 1) == 1 ? a * 2 :: a + 1; } else { a = a + 1; } } while (a < 10);",
+        "a := 1; do { if (a > 2) { a = (a & 1) == 1 ? a * 2, a + 1; } else { a = a + 1; } } while (a < 10);",
         "a := 1.0; a = a + (1.0:f32);",
         "a := !165: int;",
         "(!!(2*3)) || !!(3-3);",
@@ -2983,7 +2980,7 @@ fn fits() {
 fn func() {
     let ok = [
 (r#"
-madd: func (a: int, b: int, c: int) int {
+madd: func ((a: int, b: int, c: int)) int {
     return a * b + c;
 }
 
@@ -3006,11 +3003,11 @@ main: proc () int {
 "#, Value::Int(8)),
 (r#"
 even: func (n: int) bool {
-    return n == 0 ? 1:bool :: odd(n - 1);
+    return n == 0 ? 1:bool, odd(n - 1);
 }
 
 odd: func (n: int) bool {
-    return n == 0 ? 0:bool :: even(n - 1);
+    return n == 0 ? 0:bool, even(n - 1);
 }
 
 main: proc () int {
@@ -3087,11 +3084,11 @@ main: proc () int {
     ];
     let err = [r#"
 even: proc (n: int) bool {
-    return n == 0 ? 1:bool :: odd(n - 1);
+    return n == 0 ? 1:bool, odd(n - 1);
 }
 
 odd: func (n: int) bool {
-    return n == 0 ? 0:bool :: even(n - 1);
+    return n == 0 ? 0:bool, even(n - 1);
 }
 
 main: proc () int {
@@ -3231,7 +3228,7 @@ main: proc () int {
     a := 1;
     do {
         if (a > 2) {
-            a = (a & 1) == 1 ? a * 2 :: a + 1;
+            a = (a & 1) == 1 ? a * 2, a + 1;
         } else {
             a = a + 1;
         }
@@ -3243,7 +3240,7 @@ main: proc () int {
     a := 1;
     b := 2;
     c := 3;
-    (a == 1 ? b :: c) = 4;
+    (a == 1 ? b, c) = 4;
     return b;
 }"#, Value::Int(4)),
 (r#"
@@ -3371,7 +3368,7 @@ V4: (
 
 main: proc () int {
     a := ({ x = -1 }:V4).x;
-    b := (a == -1) ? { w = 3 }:V4 :: { w = 4 }:V4;
+    b := (a == -1) ? { w = 3 }:V4, { w = 4 }:V4;
     return b.w:int;
 }
 "#, Value::Int(3)),
@@ -3625,11 +3622,23 @@ main: (proc () int) {
 }
 "#, Value::Int(4)),
 (r#"
+inc: proc (v: ptr (arr int [1])) {
+    (*v)[0] = (*v)[0] + 1;
+}
+implicit_pointer_arg_ref: proc (v: arr int [1]) int {
+    inc(&v);
+    return v[0];
+}
+main: proc () int {
+    return implicit_pointer_arg_ref({3});
+}
+"#, Value::Int(4)),
+(r#"
 V2: struct (x: i32, y: i32);
 rot22: proc(vv: ptr -> ptr V2) {
     **vv = { -vv[0].y:i32, vv[0].x };
 }
-rot12: proc(v: ptr V2) {
+rot12: proc (v: ptr V2) {
     vv := &v;
     rot22(vv);
 }
@@ -3690,7 +3699,21 @@ main: proc () int {
     a := &3;
     return 0;
 }
-"#];
+"#,r#"
+inc: proc (v: ptr int) {
+    *v = *v + 1;
+}
+main: proc () int {
+    a: proc (v: ptr (arr int [1])) = inc;
+    return 0;
+}"#,r#"
+inc: proc (v: ptr int) {
+    *v = *v + 1;
+}
+main: proc () int {
+    a := &inc;
+    return 0;
+}"#];
     for test in ok.iter() {
         let str = test.0;
         let expect = test.1;
