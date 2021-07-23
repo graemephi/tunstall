@@ -1,3 +1,5 @@
+stick data before code and rip-rel everything in the vm
+
 V2: (x: f32, y: f32);
 
 func syntax(a: int, b: int): int

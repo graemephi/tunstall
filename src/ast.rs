@@ -174,9 +174,13 @@ pub struct ItemData {
     pub expr: TypeExpr,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Decl(u32);
 define_node_list!(Decl, DeclList, DeclListIter);
+
+impl Decl {
+    pub const BUILTIN: Decl = Decl(!0);
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CallableDecl {
@@ -267,7 +271,6 @@ pub struct Ast {
     cases: Vec<SwitchCaseData>,
     items: Vec<ItemData>,
     decls: Vec<DeclData>,
-    decl_by_name: HashMap<Intern, Decl>,
     type_exprs: Vec<TypeExprData>,
 }
 
@@ -445,32 +448,21 @@ impl Ast {
         &self.items[items.as_range()]
     }
 
-    fn push_decl(&mut self, data: DeclData) -> Option<Decl> {
-        use std::collections::hash_map::Entry;
-        match self.decl_by_name.entry(data.name()) {
-            Entry::Occupied(_) => None,
-            Entry::Vacant(entry) => {
-                let result = Decl(push_data(&mut self.decls, data));
-                entry.insert(result);
-                Some(result)
-            }
-        }
+    fn push_decl(&mut self, data: DeclData) -> Decl {
+        let result = push_data(&mut self.decls, data);
+        Decl(result)
     }
 
-    pub fn push_decl_callable(&mut self, decl: CallableDecl) -> Option<Decl> {
+    pub fn push_decl_callable(&mut self, decl: CallableDecl) -> Decl {
         self.push_decl(DeclData::Callable(decl))
     }
 
-    pub fn push_decl_struct(&mut self, decl: StructDecl) -> Option<Decl> {
+    pub fn push_decl_struct(&mut self, decl: StructDecl) -> Decl {
         self.push_decl(DeclData::Struct(decl))
     }
 
-    pub fn push_decl_var(&mut self, decl: VarDecl) -> Option<Decl> {
+    pub fn push_decl_var(&mut self, decl: VarDecl) -> Decl {
         self.push_decl(DeclData::Var(decl))
-    }
-
-    pub fn lookup_decl(&self, name: Intern) -> Option<Decl> {
-        self.decl_by_name.get(&name).copied()
     }
 
     pub fn decl(&self, decl: Decl) -> &DeclData {

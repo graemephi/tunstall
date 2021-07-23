@@ -931,34 +931,32 @@ impl<'c, 'a> Parser<'_, '_> {
     fn decl(&mut self) {
         let pos = self.pos();
         let name = self.name();
-        let decl = if self.try_token(TokenKind::Colon).is_some() {
+        if self.try_token(TokenKind::Colon).is_some() {
             let expr = self.type_expr(0);
             match self.ctx.ast.type_expr_keytype(expr) {
                 Some(Keytype::Func)|Some(Keytype::Proc) => {
                     let body = self.stmt_block();
-                    self.ctx.ast.push_decl_callable(CallableDecl { pos, name, expr, body })
+                    self.ctx.ast.push_decl_callable(CallableDecl { pos, name, expr, body });
                 }
                 Some(Keytype::Struct) => {
-                    // todo: declare global variable on =
-                    self.token(TokenKind::Semicolon);
-                    self.ctx.ast.push_decl_struct(StructDecl { pos, name, expr })
+                    if self.try_token(TokenKind::Assign).is_some() {
+                        let value = self.expr();
+                        self.token(TokenKind::Semicolon);
+                        self.ctx.ast.push_decl_var(VarDecl { pos, name, expr, value });
+                    } else {
+                        self.token(TokenKind::Semicolon);
+                        self.ctx.ast.push_decl_struct(StructDecl { pos, name, expr });
+                    }
                 }
                 _ => {
                     self.token(TokenKind::Assign);
                     let value = self.expr();
                     self.token(TokenKind::Semicolon);
-                    self.ctx.ast.push_decl_var(VarDecl { pos, name, expr, value })
+                    self.ctx.ast.push_decl_var(VarDecl { pos, name, expr, value });
                 }
             }
-        } else if self.try_token(TokenKind::ColonAssign).is_some() {
-            let value = self.expr();
-            self.token(TokenKind::Semicolon);
-            self.ctx.ast.push_decl_var(VarDecl { pos, name, expr: TypeExpr::Infer, value })
         } else {
             parse_error!(self, "expected : or :=, found {}", self.token)
-        };
-        if let None = decl {
-            parse_error!(self, "{} has already been defined", self.ctx.str(name))
         }
     }
 }
