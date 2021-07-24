@@ -267,20 +267,6 @@ pub enum Op {
     MoveAndSignExtendLower8,
     MoveAndSignExtendLower16,
     MoveAndSignExtendLower32,
-    // StackRelativeStore64 is equivalent to Move
-    StackRelativeStore8,
-    StackRelativeStore16,
-    StackRelativeStore32,
-    // StackRelativeLoad64 is equivalent to Move
-    StackRelativeLoad8,
-    StackRelativeLoad16,
-    StackRelativeLoad32,
-    StackRelativeLoadAndSignExtend8,
-    StackRelativeLoadAndSignExtend16,
-    StackRelativeLoadAndSignExtend32,
-    StackRelativeLoadBool,
-    StackRelativeCopy,
-    StackRelativeZero,
     IntToFloat32,
     IntToFloat64,
     Float32ToInt,
@@ -307,16 +293,11 @@ pub enum Op {
     LoadBool,
     Copy,
     Zero,
-    LoadStackAddress,
-    LoadGlobal,
-    LoadGlobalAddress,
-    StoreGlobal,
     Panic
 }
 
 fn requires_register_destination(op: Op) -> bool {
     match op {
-        Op::StackRelativeStore8|Op::StackRelativeStore16|Op::StackRelativeStore32|Op::StackRelativeCopy|Op::StackRelativeZero|
         Op::Store8|Op::Store16|Op::Store32|Op::Copy|Op::Zero => false,
         _ => true
     }
@@ -618,32 +599,6 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
     Some(op)
 }
 
-fn store_op_stack(ty: Type) -> Option<Op> {
-    match ty {
-        Type::I8|Type::U8|Type::Bool            => Some(Op::StackRelativeStore8),
-        Type::I16|Type::U16                     => Some(Op::StackRelativeStore16),
-        Type::I32|Type::U32|Type::F32           => Some(Op::StackRelativeStore32),
-        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Move),
-        _ if ty.is_pointer()                    => Some(Op::Move),
-        _ => None
-    }
-}
-
-fn load_op_stack(ty: Type) -> Option<Op> {
-    match ty {
-        Type::Bool                              => Some(Op::StackRelativeLoadBool),
-        Type::I8                                => Some(Op::StackRelativeLoadAndSignExtend8),
-        Type::I16                               => Some(Op::StackRelativeLoadAndSignExtend16),
-        Type::I32                               => Some(Op::StackRelativeLoadAndSignExtend32),
-        Type::U8                                => Some(Op::StackRelativeLoad8),
-        Type::U16                               => Some(Op::StackRelativeLoad16),
-        Type::U32|Type::F32                     => Some(Op::StackRelativeLoad32),
-        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Move),
-        _ if ty.is_pointer()                    => Some(Op::Move),
-        _ => None
-    }
-}
-
 fn store_op_pointer(ty: Type) -> Option<Op> {
     match ty {
         Type::I8|Type::U8|Type::Bool            => Some(Op::Store8),
@@ -840,7 +795,7 @@ fn expr_integer_compatible_with_destination(value: &ExprResult, dest_ty: Type, d
         }
     }
     if let LocationKind::Register = dest.kind {
-        return value.ty.is_integer() && dest_ty.is_integer();
+        return dest.offset != Location::RETURN_REGISTER && value.ty.is_integer() && dest_ty.is_integer();
     }
     false
 }
@@ -850,11 +805,8 @@ fn expr_integer_compatible_with_destination(value: &ExprResult, dest_ty: Type, d
 pub enum LocationKind {
     None,
     Control,
-    Return,
     Register,
-    Stack,
     Based,
-    Global
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -868,6 +820,11 @@ pub struct Location {
 
 impl Location {
     const BAD: isize = isize::MAX;
+    const RETURN_REGISTER: isize = 0;
+    const RETURN_ADDRESS_REGISTER: isize = 1 * FatGen::REGISTER_SIZE as isize;
+    const FP_REGISTER: isize = 2 * FatGen::REGISTER_SIZE as isize;
+    const SP_REGISTER: isize = 3 * FatGen::REGISTER_SIZE as isize;
+    const IP_REGISTER: isize = 4 * FatGen::REGISTER_SIZE as isize;
 
     fn none() -> Location {
         Location { base: Self::BAD, offset: Self::BAD, kind: LocationKind::None, is_mutable: false, is_place: false }
@@ -881,24 +838,28 @@ impl Location {
         Location { base: Self::BAD, offset: value, kind: LocationKind::Register, is_mutable: false, is_place: false }
     }
 
-    fn ret() -> Location {
-        Location { base: Self::BAD, offset: 0, kind: LocationKind::Return, is_mutable: false, is_place: false }
+    fn ret(is_basic: bool) -> Location {
+        if is_basic {
+            Location { base: Self::BAD, offset: Self::RETURN_REGISTER, kind: LocationKind::Register, is_mutable: false, is_place: false }
+        } else {
+            Location { base: Self::RETURN_REGISTER, offset: 0, kind: LocationKind::Based, is_mutable: false, is_place: false }
+        }
     }
 
     fn stack(offset: isize) -> Location {
-        Location { base: Self::BAD, offset: offset, kind: LocationKind::Stack, is_mutable: true, is_place: true }
-    }
-
-    fn based(base: isize, offset: isize, is_mutable: bool) -> Location {
-        Location { base, offset, kind: LocationKind::Based, is_mutable, is_place: true }
+        Location { base: Self::SP_REGISTER, offset: offset, kind: LocationKind::Based, is_mutable: true, is_place: true }
     }
 
     fn global(offset: isize, is_mutable: bool) -> Location {
-        Location { base: 0, offset, kind: LocationKind::Global, is_mutable, is_place: true }
+        Location { base: Self::IP_REGISTER, offset: offset, kind: LocationKind::Based, is_mutable, is_place: true }
+    }
+
+    fn pointer(base: isize, offset: isize, is_mutable: bool) -> Location {
+        Location { base, offset, kind: LocationKind::Based, is_mutable, is_place: true }
     }
 
     fn offset_by(&self, offset: isize) -> Location {
-        debug_assert_implies!(offset > 0, matches!(self.kind, LocationKind::Stack|LocationKind::Based));
+        debug_assert_implies!(offset > 0, matches!(self.kind, LocationKind::Based));
         let mut result = *self;
         result.offset += offset;
         result
@@ -909,7 +870,7 @@ impl Location {
 struct ExprResult {
     addr: Location,
     ty: Type,
-    value_is_stack_offset: bool,
+    value_is_register: bool,
     value: Option<RegValue>,
 }
 
@@ -1063,37 +1024,20 @@ impl FatGen {
     fn register(&mut self, expr: &ExprResult) -> isize {
         match expr.addr.kind {
             LocationKind::None => match expr.value {
-                Some(v) if expr.value_is_stack_offset => { assert!(expr.ty.is_pointer()); self.put_inc(Op::LoadStackAddress, v) },
+                Some(v) if expr.value_is_register => {
+                    assert!(expr.ty.is_pointer());
+                    let v_register = self.constant(v);
+                    self.put3_inc(Op::IntAdd, Location::SP_REGISTER, v_register)
+                },
                 Some(v) => self.constant(v),
                 None => Location::BAD
             },
             LocationKind::Control => unreachable!(),
-            LocationKind::Return => 0,
             LocationKind::Register => expr.addr.offset,
-            LocationKind::Stack => {
-                if let Some(op) = load_op_stack(expr.ty) {
-                    self.put2_inc(op, expr.addr.offset)
-                } else {
-                    // todo: overwritable error here. we expect the _next_ error
-                    // will be more informative to the user. BAD can
-                    // appear sometimes in non-error cases, so it would be nice
-                    // to explicitly enter an error state, and generally keep
-                    // BAD usage to a minimum
-                    Location::BAD
-                }
-            }
             LocationKind::Based => {
                 if let Some(op) = load_op_pointer(expr.ty) {
                     let ptr = self.location_register(&expr.addr);
                     self.put2_inc(op, ptr)
-                } else {
-                    // todo: weak (overwritable) error here, as above
-                    Location::BAD
-                }
-            }
-            LocationKind::Global => {
-                if expr.ty.is_basic() {
-                    self.put2_inc(Op::LoadGlobal, expr.addr.offset)
                 } else {
                     Location::BAD
                 }
@@ -1105,11 +1049,7 @@ impl FatGen {
         match location.kind {
             LocationKind::None => Location::BAD,
             LocationKind::Control => unreachable!(),
-            LocationKind::Return => 0,
             LocationKind::Register => location.offset,
-            LocationKind::Stack => {
-                self.put_inc(Op::LoadStackAddress, location.offset.into())
-            }
             LocationKind::Based => {
                 if location.offset != 0 {
                     let offset_register = self.constant(location.offset.into());
@@ -1117,9 +1057,6 @@ impl FatGen {
                 } else {
                     location.base
                 }
-            }
-            LocationKind::Global => {
-                self.put_inc(Op::LoadGlobalAddress, location.offset.into())
             }
         }
     }
@@ -1162,10 +1099,7 @@ impl FatGen {
     fn zero(&mut self, dest: &Location, size: isize) {
         match dest.kind {
             LocationKind::None|LocationKind::Control|LocationKind::Register => unreachable!(),
-            LocationKind::Return|LocationKind::Stack => {
-                self.put2(Op::StackRelativeZero, dest.offset, size);
-            }
-            LocationKind::Based|LocationKind::Global => {
+            LocationKind::Based => {
                 let dest_addr_register = self.location_register(dest);
                 let size_register = self.constant(size.into());
                 self.put2(Op::Zero, dest_addr_register, size_register);
@@ -1183,31 +1117,12 @@ impl FatGen {
                 let result_register = self.register(src);
                 self.put2(Op::Move, dest.offset, result_register);
             }
-            LocationKind::Return => {
-                if destination_type.is_basic() {
-                    assert_eq!(dest.offset, 0);
-                    let result_register = self.register(src);
-                    self.put2(Op::Move, 0, result_register);
-                } else {
-                    let src_addr_register = self.location_register(&src.addr);
-                    self.put3(Op::StackRelativeCopy, 0, src_addr_register, size);
-                }
-            },
-            LocationKind::Stack => {
-                if let Some(op) = store_op_stack(destination_type) {
-                    let result_register = self.register(src);
-                    self.put2(op, dest.offset, result_register);
-                } else {
-                    let src_addr_register = self.location_register(&src.addr);
-                    self.put3(Op::StackRelativeCopy, dest.offset, src_addr_register, size);
-                }
-            }
             LocationKind::Based => {
                 let dest_addr_register = self.location_register(dest);
                 let src = &self.emit_constant(src);
 
                 match src.addr.kind {
-                    LocationKind::None|LocationKind::Control|LocationKind::Return => unreachable!(),
+                    LocationKind::None|LocationKind::Control => unreachable!(),
                     LocationKind::Register => {
                         if let Some(op) = store_op_pointer(destination_type) {
                             let src = self.register(src);
@@ -1216,23 +1131,11 @@ impl FatGen {
                             unreachable!();
                         }
                     }
-                    LocationKind::Stack|LocationKind::Based|LocationKind::Global => {
+                    LocationKind::Based => {
                         let src_addr_register = self.location_register(&src.addr);
                         let size_register = self.constant(size.into());
                         self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
                     }
-                }
-            }
-            LocationKind::Global => {
-                if destination_type.is_basic() {
-                    assert_eq!(dest.offset, 0);
-                    let result_register = self.register(src);
-                    self.put2(Op::StoreGlobal, dest.offset, result_register);
-                } else {
-                    let dest_addr_register = self.location_register(dest);
-                    let src_addr_register = self.location_register(&src.addr);
-                    let size_register = self.constant(size.into());
-                    self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
                 }
             }
         }
@@ -1469,15 +1372,10 @@ impl FatGen {
                 let index = unsafe { value.sint };
                 let offset = index * element_size as isize;
                 if base.ty.is_pointer() {
-                    // mostly the same code as below
                     let offset_reg = self.constant(offset.into());
-                    let (old_base_reg, old_offset) = if base.addr.kind == LocationKind::Based {
-                        (base.addr.base, base.addr.offset)
-                    } else {
-                        (self.register(&base), 0)
-                    };
-                    let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
-                    Location::based(base_reg, old_offset, base.addr.is_mutable)
+                    let ptr = self.register(&base);
+                    let base_reg = self.put3_inc(Op::IntAdd, ptr, offset_reg);
+                    Location::pointer(base_reg, 0, base.addr.is_mutable)
                 } else {
                     base.addr.offset_by(offset)
                 }
@@ -1497,25 +1395,16 @@ impl FatGen {
                 let size_reg = self.constant(element_size.into());
                 let index_reg = self.register(&index);
                 let offset_reg = self.put3_inc(Op::IntMul, index_reg, size_reg);
-                // TODO: probably fold these 3 cases together and just decay arrays to pointers like an animal
                 if base.ty.is_pointer() {
-                    let (old_base_reg, old_offset) = if base.addr.kind == LocationKind::Based {
-                        (base.addr.base, base.addr.offset)
-                    } else {
-                        (self.register(&base), 0)
-                    };
-                    let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
-                    Location::based(base_reg, old_offset, true)
+                    let ptr = self.register(&base);
+                    let base_reg = self.put3_inc(Op::IntAdd, ptr, offset_reg);
+                    Location::pointer(base_reg, 0, base.addr.is_mutable)
                 } else {
                     match base.addr.kind {
-                        LocationKind::Stack => {
-                            let old_base_reg = self.put_inc(Op::LoadStackAddress, base.addr.offset.into());
-                            let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
-                            Location { base: base_reg, offset: 0, kind: LocationKind::Based, ..base.addr }
-                        }
                         LocationKind::Based => {
                             let old_base_reg = base.addr.base;
                             let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
+                            // As per comment above, we keep base.addr.offset
                             Location { base: base_reg, ..base.addr }
                         }
                         _ => unreachable!(),
@@ -1570,7 +1459,7 @@ impl FatGen {
 
     fn expr_with_destination_and_optional_control(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type, dest: &Location, control: Option<Control>) -> ExprResult {
         let mut control = control;
-        let mut result = ExprResult { addr: Location::none(), ty: Type::None, value_is_stack_offset: false, value: None };
+        let mut result = ExprResult { addr: Location::none(), ty: Type::None, value_is_register: false, value: None };
         match ctx.ast.expr(expr) {
             ExprData::Int(value) => {
                 result.value = Some(value.into());
@@ -1592,9 +1481,9 @@ impl FatGen {
                     match ctx.types.info(sym.ty).kind {
                         TypeKind::Callable => result.value = Some(sym.name.into()),
                         _ => {
-                            // terrible but easy to get working
-                            let dest = self.put2_inc(Op::LoadGlobalAddress, sym.location);
-                            result.addr = Location::based(dest, 0, true);
+                            let offset = sym.location - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
+                            let ip = self.put2_inc(Op::Move, Location::IP_REGISTER);
+                            result.addr = Location::pointer(ip, offset, true);
                         }
                     }
                     result.ty = sym.ty;
@@ -1656,7 +1545,7 @@ impl FatGen {
                             }
                             None => {
                                 let base = self.register(&left);
-                                result.addr = Location::based(base, item.offset as isize, true);
+                                result.addr = Location::pointer(base, item.offset as isize, true);
                             }
                         }
                         result.ty = item.ty;
@@ -1668,7 +1557,7 @@ impl FatGen {
                         error!(self, ctx.ast.expr_source_position(left_expr), "no field '{}' on type {}", ctx.str(field), ctx.type_str(left.ty));
                     }
                 } else if let Some(item) = ctx.types.item_info(left.ty, field) {
-                    debug_assert_implies!(self.error.is_none(), matches!(left.addr.kind, LocationKind::Stack|LocationKind::Based));
+                    debug_assert_implies!(self.error.is_none(), matches!(left.addr.kind, LocationKind::Based));
                     debug_assert_implies!(self.error.is_none(), left.addr.is_place);
                     result.addr = left.addr;
                     result.addr.offset += item.offset as isize;
@@ -1707,23 +1596,22 @@ impl FatGen {
                     BitAnd => {
                         if right.addr.is_place {
                             match right.addr.kind {
-                                LocationKind::None|LocationKind::Return =>
+                                LocationKind::None =>
                                     // This happens when doing offset-of type address calculations off of constant 0 pointers
                                     result = right,
                                 LocationKind::Control => unreachable!(),
-                                LocationKind::Register|LocationKind::Stack => {
+                                LocationKind::Register => {
                                     let base = right.addr.offset;
+                                    result.value_is_register = true;
+                                    result.value = Some(base.into());
                                     // todo: seems weird to be setting these with kind == None
                                     result.addr.is_mutable = right.addr.is_mutable;
                                     result.addr.is_place = right.addr.is_place;
-                                    result.value_is_stack_offset = true;
-                                    result.value = Some(base.into());
                                 }
                                 LocationKind::Based => {
                                     assert!(right.addr.is_place);
                                     result.addr = Location::register(self.location_register(&right.addr));
                                 }
-                                LocationKind::Global => todo!()
                             }
                             result.addr.is_mutable = right.addr.is_mutable;
                             result.ty = ctx.types.pointer(right.ty);
@@ -1737,7 +1625,7 @@ impl FatGen {
                                 Some(offset) => result.addr = Location::stack(unsafe { offset.sint }),
                                 None => {
                                     let right_register = self.register(&right);
-                                    result.addr = Location::based(right_register, 0, right.addr.is_mutable);
+                                    result.addr = Location::pointer(right_register, 0, right.addr.is_mutable);
                                 }
                             }
                             result.addr.is_mutable = !right.ty.is_immutable_pointer();
@@ -1869,6 +1757,17 @@ impl FatGen {
                     if info.items.len() == args.len() + 1 {
                         if !(self.is_generating_code_for_func && info.mutable) {
                             let return_type = info.items.last().expect("tried to generate code to call a func without return type").ty;
+                            let (dest_location, dest_ptr) = if return_type.is_basic() == false {
+                                let (return_size, return_alignment) = {
+                                    let info = ctx.types.info(return_type);
+                                    (info.size, info.alignment)
+                                };
+                                let dest = self.inc_bytes(return_size, return_alignment);
+                                let location = Location::stack(dest);
+                                (location, self.location_register(&location))
+                            } else {
+                                (Location::none(), 0)
+                            };
                             let mut arg_gens = SmallVec::new();
                             for (i, expr) in args.enumerate() {
                                 let info = ctx.types.info(addr.ty);
@@ -1895,13 +1794,9 @@ impl FatGen {
                                         self.put(Op::Call, dest, func);
                                         Location::register(dest)
                                     } else {
-                                        let (return_size, return_alignment) = {
-                                            let info = ctx.types.info(return_type);
-                                            (info.size, info.alignment)
-                                        };
-                                        let dest = self.inc_bytes(return_size, return_alignment);
+                                        let dest = self.put2_inc(Op::Move, dest_ptr);
                                         self.put(Op::Call, dest, func);
-                                        Location::stack(dest)
+                                        dest_location
                                     }
                                 },
                                 _ => todo!("indirect call")
@@ -1964,7 +1859,6 @@ impl FatGen {
                     //      &a:int       (equivalent to (&a):int)
                     // and
                     //      &(a:int)     (never legal, but would appear if transposed)
-                    debug_assert!(left.value.is_some());
                     debug_assert!(left.ty.is_pointer());
                     result = ExprResult { ty: ctx.types.pointer(to_ty), ..left };
                 } else {
@@ -1977,7 +1871,7 @@ impl FatGen {
         if self.error.is_none() {
             debug_assert_implies!(result.addr.offset == Location::BAD, matches!(result.addr.kind, LocationKind::None|LocationKind::Control));
             debug_assert_implies!(result.addr.offset != Location::BAD, result.addr.kind != LocationKind::None);
-            debug_assert_implies!(result.addr.base != Location::BAD, result.addr.kind == LocationKind::Based || result.addr.kind == LocationKind::Global);
+            debug_assert_implies!(result.addr.base != Location::BAD, result.addr.kind == LocationKind::Based);
             debug_assert_implies!(result.ty != Type::None, result.value.is_some() || result.addr.kind != LocationKind::None);
         }
 
@@ -1987,7 +1881,7 @@ impl FatGen {
             && result_info.kind == TypeKind::Array
             && result_info.base_type == ctx.types.base_type(destination_type) {
                 // Decay array to pointer
-                result.addr = Location::based(self.location_register(&result.addr), 0, result.addr.is_mutable);
+                result.addr = Location::pointer(self.location_register(&result.addr), 0, result.addr.is_mutable);
                 result.ty = destination_type;
             }
         }
@@ -2066,7 +1960,7 @@ impl FatGen {
                 return_type = self.stmts(ctx, body)
             }
             StmtData::Return(Some(expr)) => {
-                let ret_expr = self.expr_with_destination(ctx, expr, self.return_type, &Location::ret());
+                let ret_expr = self.expr_with_destination(ctx, expr, self.return_type, &Location::ret(self.return_type.is_basic()));
                 if ret_expr.ty == self.return_type {
                     self.put0(Op::Return);
                     return_type = Some(ret_expr.ty);
@@ -2332,7 +2226,7 @@ impl FatGen {
             let loc = if ty.is_basic() {
                 Location::register(reg)
             } else {
-                Location::based(reg, 0, false)
+                Location::pointer(reg, 0, false)
             };
             if self.is_generating_code_for_func {
                 let const_ty = ctx.types.immutable(ty);
@@ -2341,12 +2235,12 @@ impl FatGen {
                 self.locals.insert(name, Local::argument(loc, ty));
             }
         }
-        let (return_size, return_alignment) = {
-            let info = ctx.types.info(self.return_type);
-            (info.size, info.alignment)
-        };
-        let return_dest = self.inc_bytes(return_size, return_alignment);
-        assert_eq!(return_dest, 0);
+        let return_reg = self.inc_reg();
+        let _ret = self.inc_reg();
+        let _frame = self.inc_reg();
+        let _stack = self.inc_reg();
+        let _instr = self.inc_reg();
+        assert_eq!(return_reg, 0);
         let returned = self.stmts(ctx, body);
         if self.return_type != Type::None {
             if let Some(returned) = returned {
@@ -2370,10 +2264,18 @@ impl FatGen {
 
     fn global_expr(&mut self, ctx: &mut Compiler, ty: Type, right: Expr, location: isize) {
         self.reg_counter = 0;
-        let expr = self.expr_with_destination(ctx, right, ty, &Location::global(location, true));
+        let _return = self.inc_reg();
+        let _ret = self.inc_reg();
+        let _frame = self.inc_reg();
+        let _stack = self.inc_reg();
+        let _instr = self.inc_reg();
+        let offset = location - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
+        let ip = self.put2_inc(Op::Move, Location::IP_REGISTER);
+        let expr = self.expr_with_destination(ctx, right, ty, &Location::pointer(ip, offset, true));
         if ctx.types.types_match_with_promotion(ty, expr.ty) {
             if value_fits(expr.value, ty) {
-                assert!(expr.addr.offset == location);
+                assert!(expr.addr.base == ip);
+                assert!(expr.addr.offset == offset);
             } else {
                 error!(self, ctx.ast.expr_source_position(right), "constant expression does not fit in {}", ctx.type_str(ty));
             }
@@ -2461,6 +2363,7 @@ pub struct Compiler {
     code: Vec<FatInstr>,
     data: Vec<u8>,
     fgs: Vec<FatGen>,
+    ip_start: usize,
 }
 
 impl Compiler {
@@ -2475,6 +2378,7 @@ impl Compiler {
             code: Vec::new(),
             data: Vec::new(),
             fgs: Vec::new(),
+            ip_start: 0,
         };
         types::builtins(&mut result);
         result
@@ -2517,16 +2421,15 @@ impl Compiler {
         Err(format!("{} errors reported.", self.errors.len()).into())
     }
 
-    fn run(&mut self, ip: usize, sp: usize, data: &mut [u8], stack: &mut [u8]) -> Result<Value> {
-        let mut code = &self.code[..];
+    fn run(&mut self, ip: usize, sp: usize, stack: &mut [u8]) -> Result<Value> {
+        let code = &mut self.code[..];
         let mut sp = sp;
         let mut ip = ip;
-        let mut call_stack = vec![(code, ip, sp, Intern(0))];
 
         let unaligned_stack = stack as *mut [u8];
         let stack = unsafe { stack.align_to_mut::<RegValue>().1 };
         let stack: *mut [u8] = unsafe { std::slice::from_raw_parts_mut(stack.as_mut_ptr() as *mut u8, stack.len() * std::mem::size_of::<RegValue>()) };
-        assert_eq!(unaligned_stack, stack);
+        // assert_eq!(unaligned_stack, stack);
 
         // The VM allows taking (real!) pointers to addresses on the VM stack. These are
         // immediately invalidated by taking a & reference to the stack. Solution: never
@@ -2545,27 +2448,14 @@ impl Compiler {
             ($addr:expr) => { *(std::ptr::addr_of_mut!(stack![$addr]) as *mut RegValue) }
         }
 
-        macro_rules! data {
-            ($addr:expr) => { (*data)[$addr] }
-        }
-
-        macro_rules! data_reg {
-            ($addr:expr) => { *(std::ptr::addr_of_mut!(data![$addr]) as *mut RegValue) }
-        }
-
-        // terrible
-        macro_rules! panic_message {
-            () => {
-                if Some(call_stack[call_stack.len() - 2].3) == self.interns.get("assert") {
-                    format!("assertion failed in {}", self.str(call_stack[call_stack.len() - 3].3))
-                } else {
-                    format!("panic in {}", self.str(call_stack[call_stack.len() - 2].3))
-                }
-            }
+        unsafe {
+            reg![Location::RETURN_ADDRESS_REGISTER as usize].int = ip;
+            reg![Location::FP_REGISTER as usize].int = sp;
+            reg![Location::SP_REGISTER as usize].int = std::ptr::addr_of_mut!(stack![0]) as usize;
         }
 
         loop {
-            let instr = &code[ip];
+            let instr = code[ip];
             let dest = sp.wrapping_add(instr.dest as usize);
             let left = sp.wrapping_add(instr.left as usize);
             let right = sp.wrapping_add(instr.right as usize);
@@ -2573,9 +2463,11 @@ impl Compiler {
             assert_implies!(requires_register_destination(instr.op), (dest & (FatGen::REGISTER_SIZE - 1)) == 0);
 
             unsafe {
+                reg![sp + Location::IP_REGISTER as usize].int = std::ptr::addr_of_mut!(code[ip]) as usize;
+
                  match instr.op {
                     Op::Halt       => { break; }
-                    Op::Panic      => { return Err(panic_message!().into()) }
+                    Op::Panic      => { return Err("panic".into()) } // todo
                     Op::Noop       => {}
                     Op::Immediate  => { reg![dest] = RegValue::from((instr.left, instr.right)); }
                     Op::IntNeg     => { reg![dest].sint = -reg![left].sint; }
@@ -2648,35 +2540,20 @@ impl Compiler {
                     Op::Float64To32              => { reg![dest].float32.0 = reg![left].float64   as f32;
                                                       reg![dest].float32.1 = 0.0; }
 
-                    // dest is aligned, left may not be. The stores are redundant with copy, but convenient; loads ensure high bits of registers are zeroed
-                    Op::StackRelativeStore8  => { stack![dest] = stack![left]; }
-                    Op::StackRelativeStore16 => { (*stack).copy_within(left..left+2, dest) }
-                    Op::StackRelativeStore32 => { (*stack).copy_within(left..left+4, dest) }
-
-                    Op::StackRelativeLoad8  => { reg![dest].int = stack![left] as usize; }
-                    Op::StackRelativeLoad16 => { (*stack).copy_within(left..left+2, dest); reg![dest].int = reg![dest].int16.0 as usize }
-                    Op::StackRelativeLoad32 => { (*stack).copy_within(left..left+4, dest); reg![dest].int = reg![dest].int32.0 as usize; }
-                    Op::StackRelativeLoadAndSignExtend8  => { reg![dest].sint = stack![left] as isize; }
-                    Op::StackRelativeLoadAndSignExtend16 => { (*stack).copy_within(left..left+2, dest); reg![dest].sint = reg![dest].sint16.0 as isize }
-                    Op::StackRelativeLoadAndSignExtend32 => { (*stack).copy_within(left..left+4, dest); reg![dest].sint = reg![dest].sint32.0 as isize }
-                    Op::StackRelativeLoadBool => { reg![dest].int = (stack![left] != 0) as usize }
-
-                    Op::StackRelativeCopy =>  { std::ptr::copy(reg![left].int as *const u8, std::ptr::addr_of_mut!(stack![dest]), instr.right as usize); }
-                    Op::StackRelativeZero =>  { for i in 0..instr.left as usize { stack![dest+i] = 0 }}
-
                     Op::Move          => { reg![dest] = reg![left]; }
                     Op::Jump          => { ip = ip.wrapping_add(instr.left as usize); }
                     Op::JumpIfZero    => { if reg![dest].int == 0 { ip = ip.wrapping_add(instr.left as usize); } }
                     Op::JumpIfNotZero => { if reg![dest].int != 0 { ip = ip.wrapping_add(instr.left as usize); } }
                     Op::Return        => {
-                        let ret = call_stack.pop().expect("Bad bytecode");
-                        code = ret.0;
-                        ip = ret.1;
-                        sp = ret.2;
+                        ip = reg![sp + Location::RETURN_ADDRESS_REGISTER as usize].int;
+                        sp = reg![sp + Location::FP_REGISTER as usize].int;
                     },
-                    Op::Call          => {
+                    Op::Call => {
+                        reg![dest + Location::RETURN_ADDRESS_REGISTER as usize].int = ip;
+                        reg![dest + Location::FP_REGISTER as usize].int = sp;
+                        reg![dest + Location::SP_REGISTER as usize].int = std::ptr::addr_of_mut!(stack![dest]) as usize;
+                        // todo: patch
                         let name = Intern(instr.left as u32);
-                        call_stack.push((code, ip, sp, name));
                         let f = self.funcs.get(&name).expect("Bad bytecode");
                         ip = f.addr.wrapping_sub(1);
                         sp = dest;
@@ -2697,10 +2574,6 @@ impl Compiler {
                     Op::LoadBool => { reg![dest].b8.0 = *(reg![left].int as *const u8) != 0; },
                     Op::Copy => { std::ptr::copy(reg![left].int as *const u8, reg![dest].int as *mut u8, reg![right].int); },
                     Op::Zero => { for b in std::slice::from_raw_parts_mut(reg![dest].int as *mut u8, reg![left].int) { *b = 0 }},
-                    Op::LoadStackAddress => { reg![dest].int = std::ptr::addr_of_mut!(stack![left]) as usize },
-                    Op::LoadGlobalAddress => { reg![dest].int = std::ptr::addr_of_mut!(data![left]) as usize },
-                    Op::LoadGlobal => { reg![dest].int = data_reg![left].int },
-                    Op::StoreGlobal => { data_reg![dest].int = reg![left].int },
                 }
             }
             ip = ip.wrapping_add(1);
@@ -2732,7 +2605,28 @@ assert: func (condition: bool) int {
 
     c.report_errors(str)?;
 
-    let mut gen = FatGen::new(Vec::new());
+    let mut data = std::mem::take(&mut c.data);
+
+    data.reserve(8*1024*1024);
+
+    let aligned = align_up(data.len(), std::mem::align_of::<FatInstr>());
+    data.extend((data.len()..aligned).map(|_| 0));
+
+    // Reinterpret the u8 data vec as a vec of FatInstrs. This is UB if we have
+    // to grow the array while generating code because the layout (element size
+    // + alignment) of the underlying allocation differs, which doesn't seem to
+    // actually matter but whatever. This is just the easiest way to get a
+    // continous allocation for data and code. FatGen needs to dump code into u8
+    // buffers but it does everything with FatInstr-strided indices and I am
+    // going to defer switch it over.
+    let data = unsafe {
+        let mut data = std::mem::ManuallyDrop::new(data);
+        Vec::from_raw_parts(data.as_mut_ptr() as *mut FatInstr, data.len() / std::mem::size_of::<FatInstr>(), data.capacity() / std::mem::size_of::<FatInstr>())
+    };
+
+    c.ip_start = data.len();
+
+    let mut gen = FatGen::new(data);
     for decl in c.ast.decl_list() {
         if let DeclData::Var(VarDecl { value, .. }) = *c.ast.decl(decl) {
             let name = c.ast.decl(decl).name();
@@ -2796,9 +2690,7 @@ assert: func (condition: bool) int {
 fn compile_and_run(str: &str) -> Result<Value> {
     let mut c = compile(str)?;
     let mut stack = vec![0; 8192 * 8];
-    let mut data = std::mem::take(&mut c.data);
-
-    c.run(0, 0, &mut data, &mut stack)
+    c.run(c.ip_start, 0, &mut stack)
 }
 
 fn eval_expr(str: &str) -> Result<Value> {
@@ -2823,54 +2715,6 @@ fn repl() {
 }
 
 fn main() {
-    let ok = [
-(r#"
-V2: struct (x, y: int);
-a: int = 1 + 32;
-b: V2 = { 2, 3 }:V2;
-c: V2 = { 4, 5 };
-d: arr u8 [5] = { 0, 1, 2, 3, 4 };
-main: proc () -> int {
-    assert(a == 33);
-    assert(b.x == 2);
-    assert(b.y == 3);
-    assert(c.x == 4);
-    assert(c.y == 5);
-    assert(d[0] == 0);
-    assert(d[1] == 1);
-    assert(d[2] == 2);
-    assert(d[3] == 3);
-    assert(d[4] == 4);
-    // d[0] = d[0] + d[1] : u8;
-    // assert(d[0] == d[1]);
-    return d[0];
-}"#, Value::Int(1)),
-(r#"
-add: func (a, b: int) int {
-    return a + b;
-}
-madd: func (a, b, c: int) int {
-    return a + b*c;
-}
-A: int = madd(2,3,3);
-main: proc () -> int {
-    assert(A == 11);
-    return A;
-}"#, Value::Int(11))
-];
-    let err = [r#"a
-}"#];
-    for test in ok.iter() {
-        let str = test.0;
-        let expect = test.1;
-        compile_and_run(str)
-            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
-            .map_err(|e| { println!("input: \"{}\"", str); e })
-            .unwrap();
-    }
-    for str in err.iter() {
-        compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
-    }
     repl();
 }
 
@@ -3621,6 +3465,17 @@ main: proc () int {
 }
 "#, Value::Int(2)),
 (r#"
+main: proc () int {
+    a := {}:arr int [2];
+    a0 := &a[0];
+    a0' := &a[0];
+    a1 := &a[1];
+    assert(a0 == a0');
+    assert(a0 + 1 == a1);
+    return *a0;
+}
+"#, Value::Int(0)),
+(r#"
 V2: struct (x: i32, y: i32);
 main: proc () int {
     aa := {1, 2}:V2;
@@ -3679,6 +3534,12 @@ main: proc () int {
     arr := {}:arr u8 [8];
     arr[1] = 1;
     buf: Buf = { &arr[0], 8 };
+    b := buf.buf;
+    i := 1;
+    assert(&arr[0] == buf.buf);
+    assert(arr[1] == buf.buf[i]);
+    assert(arr[1] == b[i]);
+    assert(&arr[1] == &b[i]);
     return buf.buf[1];
 }
 "#, Value::Int(1)),
@@ -3842,7 +3703,7 @@ V2: struct (x, y: int);
 a: int = 1 + 32;
 b: V2 = { 2, 3 }:V2;
 c: V2 = { 4, 5 };
-d: arr u8 [5] = { 0, 1, 2, 3, 4 };
+d: arr u8 [3] = { 0, 1, 2 };
 main: proc () -> int {
     assert(a == 33);
     assert(b.x == 2);
@@ -3852,8 +3713,6 @@ main: proc () -> int {
     assert(d[0] == 0);
     assert(d[1] == 1);
     assert(d[2] == 2);
-    assert(d[3] == 3);
-    assert(d[4] == 4);
     d[0] = d[0] + d[1] : u8;
     assert(d[0] == d[1]);
     return d[1];

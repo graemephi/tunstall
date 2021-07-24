@@ -1,5 +1,4 @@
 use std::convert::TryFrom;
-use std::collections::hash_map::HashMap;
 use std::fmt::Display;
 
 use crate::Intern;
