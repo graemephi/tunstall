@@ -1,4 +1,4 @@
-stick data before code and rip-rel everything in the vm
+split registers and stack for the vm--they can just be two stacks
 
 V2: (x: f32, y: f32);
 

@@ -313,7 +313,6 @@ struct FatInstr {
 
 impl FatInstr {
     const HALT: FatInstr = FatInstr { op: Op::Halt, dest: 0, left: 0, right: 0 };
-    const PANIC: FatInstr = FatInstr { op: Op::Panic, dest: 0, left: 0, right: 0 };
 
     fn is_jump(&self) -> bool {
         use Op::*;
@@ -923,6 +922,19 @@ struct PathContext {
     index: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodeGenTarget {
+    Func,
+    Proc,
+    GlobalExpr
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PanicReason {
+    GlobalNotInitialized,
+    AssertionFailed
+}
+
 struct FatGen {
     code: Vec<FatInstr>,
     locals: Locals,
@@ -932,7 +944,8 @@ struct FatGen {
     patches: Vec<(Label, InstrLocation)>,
     return_type: Type,
     constant: bool,
-    is_generating_code_for_func: bool,
+    target: CodeGenTarget,
+    panic: Label,
     error: Option<Error>,
 }
 
@@ -949,7 +962,8 @@ impl FatGen {
             patches: Vec::new(),
             return_type: Type::None,
             constant: false,
-            is_generating_code_for_func: false,
+            target: CodeGenTarget::Func,
+            panic: Label(0),
             error: None,
         }
     }
@@ -1372,10 +1386,15 @@ impl FatGen {
                 let index = unsafe { value.sint };
                 let offset = index * element_size as isize;
                 if base.ty.is_pointer() {
-                    let offset_reg = self.constant(offset.into());
-                    let ptr = self.register(&base);
-                    let base_reg = self.put3_inc(Op::IntAdd, ptr, offset_reg);
-                    Location::pointer(base_reg, 0, base.addr.is_mutable)
+                    if base.addr.offset == 0 {
+                        let ptr = self.register(&base);
+                        let offset_reg = self.constant(offset.into());
+                        let base_reg = self.put3_inc(Op::IntAdd, ptr, offset_reg);
+                        Location::pointer(base_reg, 0, base.addr.is_mutable)
+                    } else {
+                        let ptr = self.register(&base);
+                        Location::pointer(ptr, offset, base.addr.is_mutable)
+                    }
                 } else {
                     base.addr.offset_by(offset)
                 }
@@ -1478,15 +1497,49 @@ impl FatGen {
                     result.addr = local.loc;
                     result.ty = local.ty;
                 } else if let Some(sym) = sym::lookup_value(ctx, name) {
+                    result.ty = sym.ty;
                     match ctx.types.info(sym.ty).kind {
                         TypeKind::Callable => result.value = Some(sym.name.into()),
                         _ => {
-                            let offset = sym.location - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
+                            let (ty, loc) = (sym.ty, sym.location);
+                            match sym.state {
+                                sym::State::Resolved => {
+                                    assert!(matches!(self.target, CodeGenTarget::GlobalExpr));
+                                    if let DeclData::Var(VarDecl { value, .. }) = *ctx.ast.decl(sym.decl) {
+                                        debug_assert!(self.reg_counter != 0);
+                                        sym::compiling(ctx, name);
+                                        self.global_expr(ctx, ty, value, loc, self.reg_counter);
+                                        sym::compiled(ctx, name);
+                                    } else {
+                                        unreachable!();
+                                    }
+                                }
+                                sym::State::Compiling|sym::State::Circular => {
+                                    error!(self, ctx.ast.expr_source_position(expr), "definition of {} is circular", ctx.str(name));
+                                }
+                                sym::State::Compiled => {
+                                    // Don't have to do anything
+                                },
+                                _ => unreachable!()
+                            }
+
+                            let offset = loc - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
                             let ip = self.put2_inc(Op::Move, Location::IP_REGISTER);
-                            result.addr = Location::pointer(ip, offset, true);
+
+                            if matches!(self.target, CodeGenTarget::Func|CodeGenTarget::Proc) {
+                                // We emit this check every time we access any global, because if the function is called
+                                // in a global expression it may be uninitialised. This is a heavy hammer that lets us
+                                // avoid doing any reachability analysis. It would be nice if only functions that
+                                // were called in global expressions had to pay this cost, but that requires reachability analysis.
+                                let initialized_flag_ptr = self.location_register(&Location::pointer(ip, offset - 4, true));
+                                let initialized_flag = self.put2_inc(Op::Load32, initialized_flag_ptr);
+                                self.put_jump_zero(initialized_flag, self.panic);
+                            }
+
+                            let addr = Location::pointer(ip, offset, true);
+                            result.addr = addr;
                         }
                     }
-                    result.ty = sym.ty;
                 } else {
                     error!(self, ctx.ast.expr_source_position(expr), "unknown identifier '{}'", ctx.str(name));
                 }
@@ -1726,7 +1779,11 @@ impl FatGen {
                         }
                     }
                 } else {
-                    error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types ({} {} {})", ctx.type_str(left.ty), op_token, ctx.type_str(right.ty));
+                    if left.ty != right.ty {
+                        error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types ({} {} {})", ctx.type_str(left.ty), op_token, ctx.type_str(right.ty));
+                    } else {
+                        error!(self, ctx.ast.expr_source_position(left_expr), "cannot use the {} operator with {}", op_token, ctx.type_str(right.ty));
+                    }
                 }
             }
             ExprData::Ternary(cond_expr, left_expr, right_expr) => {
@@ -1755,7 +1812,7 @@ impl FatGen {
                 let info = ctx.types.info(addr.ty);
                 if info.kind == TypeKind::Callable {
                     if info.items.len() == args.len() + 1 {
-                        if !(self.is_generating_code_for_func && info.mutable) {
+                        if !(matches!(self.target, CodeGenTarget::Func) && info.mutable) {
                             let return_type = info.items.last().expect("tried to generate code to call a func without return type").ty;
                             let (dest_location, dest_ptr) = if return_type.is_basic() == false {
                                 let (return_size, return_alignment) = {
@@ -2142,7 +2199,7 @@ impl FatGen {
                         // which will fail with a confusing error message if `name` is not declared,
                         // and be a noop otherwise. We disallow the latter case because it's confusing
                         // and provide a better error message for the former.
-                        error!(self, ctx.ast.expr_source_position(expr), "cannot declare a value without initialising it");
+                        error!(self, ctx.ast.expr_source_position(expr), "cannot declare a value without initializing it");
                     }
                 }
                 self.expr(ctx, expr);
@@ -2181,7 +2238,11 @@ impl FatGen {
                 if lv.addr.is_mutable {
                     let value = self.expr_with_destination(ctx, right, lv.ty, &lv.addr);
                     if lv.ty != value.ty {
-                        error!(self, ctx.ast.expr_source_position(left), "type mismatch between destination ({}) and value ({})", ctx.type_str(lv.ty), ctx.type_str(value.ty))
+                        if value_fits(value.value, lv.ty) {
+                            error!(self, ctx.ast.expr_source_position(left), "type mismatch between destination ({}) and value ({})", ctx.type_str(lv.ty), ctx.type_str(value.ty))
+                        } else {
+                            error!(self, ctx.ast.expr_source_position(left), "constant expression does not fit in {}", ctx.type_str(lv.ty));
+                        }
                     }
                 } else {
                     // todo: terrible error message
@@ -2196,7 +2257,7 @@ impl FatGen {
         let mark = self.locals.push_scope();
         let mut return_type = None;
         for stmt in stmts {
-            if ctx.have_error() {
+            if self.error.is_some() {
                 break;
             }
             return_type = self.stmt(ctx, stmt).or(return_type);
@@ -2205,18 +2266,32 @@ impl FatGen {
         return_type
     }
 
+    fn prolog(&mut self) {
+        // No code is emitted here.
+        let return_reg = self.inc_reg();
+        let _ret = self.inc_reg();
+        let _frame = self.inc_reg();
+        let _stack = self.inc_reg();
+        let _instr = self.inc_reg();
+        assert_eq!(return_reg, 0);
+    }
+
     fn callable(&mut self, ctx: &mut Compiler, signature: Type, decl: Decl) -> Code {
-        let addr = self.code.len();
         let callable = ctx.ast.callable(decl);
         let body = callable.body;
         let sig = ctx.types.info(signature);
         let kind = ctx.ast.type_expr_keytype(callable.expr).expect("tried to generate code for callable without keytype");
         let params = ctx.ast.type_expr_items(callable.expr).expect("tried to generate code for callable without parameters");
-        self.is_generating_code_for_func = ctx.ast.type_expr_keytype(callable.expr) == Some(Keytype::Func);
+        let is_func = ctx.ast.type_expr_keytype(callable.expr) == Some(Keytype::Func);
+        if is_func {
+            self.target = CodeGenTarget::Func;
+        } else {
+            self.target = CodeGenTarget::Proc;
+        }
         assert_eq!(sig.kind, TypeKind::Callable, "sig.kind == TypeKind::Callable");
         assert!(params.len() == sig.items.len() - 1, "the last element of a callable's type signature's items must be the return type");
         self.return_type = sig.items.last().map(|i| i.ty).unwrap();
-        assert_implies!(self.is_generating_code_for_func, self.return_type != Type::None);
+        assert_implies!(is_func, self.return_type != Type::None);
         self.reg_counter = (Self::REGISTER_SIZE as isize) * (1 - sig.items.len() as isize);
         let param_names = params.map(|item| ctx.ast.item(item).name);
         let param_types = sig.items.iter().map(|i| i.ty);
@@ -2228,19 +2303,17 @@ impl FatGen {
             } else {
                 Location::pointer(reg, 0, false)
             };
-            if self.is_generating_code_for_func {
+            if is_func {
                 let const_ty = ctx.types.immutable(ty);
                 self.locals.insert(name, Local::argument(loc, const_ty));
             } else {
                 self.locals.insert(name, Local::argument(loc, ty));
             }
         }
-        let return_reg = self.inc_reg();
-        let _ret = self.inc_reg();
-        let _frame = self.inc_reg();
-        let _stack = self.inc_reg();
-        let _instr = self.inc_reg();
-        assert_eq!(return_reg, 0);
+        self.panic = self.label_here();
+        self.put2(Op::Panic, PanicReason::GlobalNotInitialized as isize, 0);
+        let addr = self.code.len();
+        self.prolog();
         let returned = self.stmts(ctx, body);
         if self.return_type != Type::None {
             if let Some(returned) = returned {
@@ -2262,16 +2335,18 @@ impl FatGen {
         Code { signature, addr }
     }
 
-    fn global_expr(&mut self, ctx: &mut Compiler, ty: Type, right: Expr, location: isize) {
-        self.reg_counter = 0;
-        let _return = self.inc_reg();
-        let _ret = self.inc_reg();
-        let _frame = self.inc_reg();
-        let _stack = self.inc_reg();
-        let _instr = self.inc_reg();
+    fn global_expr(&mut self, ctx: &mut Compiler, ty: Type, right: Expr, location: isize, reg_counter: isize) {
+        self.reg_counter = reg_counter;
+        self.target = CodeGenTarget::GlobalExpr;
+        if reg_counter == 0 {
+            self.prolog();
+        }
         let offset = location - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
         let ip = self.put2_inc(Op::Move, Location::IP_REGISTER);
         let expr = self.expr_with_destination(ctx, right, ty, &Location::pointer(ip, offset, true));
+        let initialized_flag_ptr = self.location_register(&Location::pointer(ip, offset - 4, true));
+        let flag = self.constant(1.into());
+        self.put2(Op::Store32, initialized_flag_ptr, flag);
         if ctx.types.types_match_with_promotion(ty, expr.ty) {
             if value_fits(expr.value, ty) {
                 assert!(expr.addr.base == ip);
@@ -2299,10 +2374,13 @@ pub fn eval_type(ctx: &mut Compiler, ty: TypeExpr) -> Type {
 
 pub fn allocate_global_var(ctx: &mut Compiler, ty: Type) -> isize {
     let top = ctx.data.len();
+    let initialized_flag = align_up(top, std::mem::align_of::<u32>());
+    ctx.data.resize_with(initialized_flag + std::mem::size_of::<u32>(), Default::default);
+
+    let top = ctx.data.len();
     let TypeInfo { size, alignment, .. } = *ctx.types.info(ty);
-    let alignment = alignment.min(std::mem::align_of::<RegValue>());
     let result = align_up(top, alignment);
-    ctx.data.extend((0..result+size).map(|_| 0));
+    ctx.data.resize_with(result+size, Default::default);
     result as isize
 }
 
@@ -2426,10 +2504,8 @@ impl Compiler {
         let mut sp = sp;
         let mut ip = ip;
 
-        let unaligned_stack = stack as *mut [u8];
         let stack = unsafe { stack.align_to_mut::<RegValue>().1 };
         let stack: *mut [u8] = unsafe { std::slice::from_raw_parts_mut(stack.as_mut_ptr() as *mut u8, stack.len() * std::mem::size_of::<RegValue>()) };
-        // assert_eq!(unaligned_stack, stack);
 
         // The VM allows taking (real!) pointers to addresses on the VM stack. These are
         // immediately invalidated by taking a & reference to the stack. Solution: never
@@ -2467,7 +2543,16 @@ impl Compiler {
 
                  match instr.op {
                     Op::Halt       => { break; }
-                    Op::Panic      => { return Err("panic".into()) } // todo
+                    Op::Panic      => {
+                        // terrible
+                        if instr.dest == PanicReason::GlobalNotInitialized as i32 {
+                            // but which one
+                            return Err("global value used before initialization".into())
+                        } else {
+                            // but where
+                            return Err("assertion failed".into())
+                        }
+                    }
                     Op::Noop       => {}
                     Op::Immediate  => { reg![dest] = RegValue::from((instr.left, instr.right)); }
                     Op::IntNeg     => { reg![dest].sint = -reg![left].sint; }
@@ -2587,6 +2672,8 @@ impl Compiler {
 fn compile(str: &str) -> Result<Compiler> {
     let mut c = Compiler::new();
 
+    // We can't parse successive files like this in general beacuse the AST assumes all nodes
+    // come from the same file. This works for now beacuse nothing ever asks where these come from
     parse::parse(&mut c, r#"
 panic: func () int {
     // built-in
@@ -2610,15 +2697,17 @@ assert: func (condition: bool) int {
     data.reserve(8*1024*1024);
 
     let aligned = align_up(data.len(), std::mem::align_of::<FatInstr>());
-    data.extend((data.len()..aligned).map(|_| 0));
+    data.resize_with(aligned, Default::default);
 
     // Reinterpret the u8 data vec as a vec of FatInstrs. This is UB if we have
     // to grow the array while generating code because the layout (element size
     // + alignment) of the underlying allocation differs, which doesn't seem to
     // actually matter but whatever. This is just the easiest way to get a
-    // continous allocation for data and code. FatGen needs to dump code into u8
-    // buffers but it does everything with FatInstr-strided indices and I am
-    // going to defer switch it over.
+    // continous allocation for data and code. To not be UB, FatGen needs to
+    // dump code into u8 buffers but it does everything with FatInstr-strided
+    // indices and I am going to defer switching it over for now, because any
+    // subsequent pass throws a wrench in this anyway. This makes MIRI scream to
+    // high heaven which is unfortunate
     let data = unsafe {
         let mut data = std::mem::ManuallyDrop::new(data);
         Vec::from_raw_parts(data.as_mut_ptr() as *mut FatInstr, data.len() / std::mem::size_of::<FatInstr>(), data.capacity() / std::mem::size_of::<FatInstr>())
@@ -2633,7 +2722,7 @@ assert: func (condition: bool) int {
             let sym = sym::compiling(&mut c, name);
             if sym.state == sym::State::Compiling {
                 let (ty, location) = (sym.ty, sym.location);
-                gen.global_expr(&mut c, ty, value, location);
+                gen.global_expr(&mut c, ty, value, location, 0);
                 sym::compiled(&mut c, name);
             } else {
                 assert!(sym.state == sym::State::Compiled);
@@ -2677,7 +2766,7 @@ assert: func (condition: bool) int {
         let info = c.types.info(panic_def.ty);
         assert!(matches!(info.arguments(), Some(&[])) && matches!(info.return_type(), Some(Type::Int)));
         let addr = gen.code.len();
-        gen.code.push(FatInstr::PANIC);
+        gen.code.push(FatInstr { op: Op::Panic, dest: PanicReason::AssertionFailed as i32, left: 0, right: 0});
         c.funcs.insert(panic, Code { signature: panic_def.ty, addr });
     }
 
@@ -3532,11 +3621,16 @@ Buf: struct (
 );
 main: proc () int {
     arr := {}:arr u8 [8];
+    arr[0] = 255;
     arr[1] = 1;
     buf: Buf = { &arr[0], 8 };
+    a := &arr;
     b := buf.buf;
+    bb := &buf;
     i := 1;
+    assert(bb.buf[0] == (*a)[0]);
     assert(&arr[0] == buf.buf);
+    assert(arr[0] == buf.buf[0]);
     assert(arr[1] == buf.buf[i]);
     assert(arr[1] == b[i]);
     assert(&arr[1] == &b[i]);
@@ -3674,7 +3768,14 @@ inc: proc (v: ptr int) {
 main: proc () int {
     a := &inc;
     return 0;
-}"#];
+}"#,r#"
+main: proc () int {
+    arr := {}:arr u8 [8];
+    a := &arr;
+    assert(a[0] == arr);
+    return 0;
+}
+"#];
     for test in ok.iter() {
         let str = test.0;
         let expect = test.1;
@@ -3728,9 +3829,48 @@ A: int = madd(2,3,3);
 main: proc () -> int {
     assert(A == 11);
     return A;
-}"#, Value::Int(11))
+}"#, Value::Int(11)),
+(r#"
+inc: proc (a: ptr int) int {
+    old := *a;
+    *a = *a + 1;
+    return old;
+}
+a: int = 1;
+b: int = inc(&a);
+main: proc () -> int {
+    assert(b == 1);
+    return a;
+}"#, Value::Int(2)),
+(r#"
+inc: proc (a: ptr int) int {
+    old := *a;
+    *a = *a + 1;
+    return old;
+}
+d: int = a;
+b: int = inc(&c);
+c: int = a;
+a: int = 1;
+main: proc () -> int {
+    assert(d == 1);
+    assert(c == 2);
+    assert(b == 1);
+    assert(a == 1);
+    return a;
+}"#, Value::Int(1)),
 ];
-    let err = [r#"a
+    let err = [r#"
+b: int = a;
+a: int = b;
+}"#,r#"
+g: () int {
+    return a + 1;
+}
+b: int = g();
+a: int = 0;
+main: proc () -> int {
+    return b;
 }"#];
     for test in ok.iter() {
         let str = test.0;
