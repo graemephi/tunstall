@@ -1267,90 +1267,106 @@ impl FatGen {
     }
 
     fn type_expr(&mut self, ctx: &mut Compiler, expr: TypeExpr) -> Type {
+        self.type_expr_(ctx, expr, false)
+    }
+
+    fn type_expr_ptr(&mut self, ctx: &mut Compiler, expr: TypeExpr) -> Type {
+        self.type_expr_(ctx, expr, true)
+    }
+
+    fn type_expr_(&mut self, ctx: &mut Compiler, expr: TypeExpr, ptr: bool) -> Type {
         let mut result = Type::None;
         match *ctx.ast.type_expr(expr) {
             TypeExprData::Infer => unreachable!(),
             TypeExprData::Name(name) => {
                 if name.0 == Keytype::Ptr as u32 {
                     result = Type::VoidPtr;
+                } else if ptr {
+                    result = sym::touch_type(ctx, name).unwrap_or_else(|| {
+                        error!(self, 0, "could not find type '{}'", ctx.str(name)); Type::None
+                    });
                 } else {
                     result = sym::resolve_type(ctx, name);
                 }
             }
             TypeExprData::Expr(_) => todo!(),
             TypeExprData::Items(items) => result = sym::resolve_anonymous_struct(ctx, items),
-            TypeExprData::List(args) => {
-                let mut args = args;
-                if let Some(name) = args.next() {
-                    match ctx.ast.type_expr_keytype(name) {
-                        Some(Keytype::Arr) => {
-                            if let Some(ty_expr) = args.next() {
-                                let ty = self.type_expr(ctx, ty_expr);
-                                if let Some(len_expr) = args.next() {
-                                    if let TypeExprData::Expr(len_expr) = *ctx.ast.type_expr(len_expr) {
-                                        let len = self.constant_expr(ctx, len_expr);
-                                        if len.ty.is_integer() && len.value.is_some() {
-                                            // TODO: This convert op is a roundabout way to check for the positive+fits condition
-                                            // but should be more direct/less subtle
-                                            if let Some(op) = convert_op(len.ty, Type::Int) {
-                                                let value = apply_unary_op(op, len.value.unwrap());
-                                                if unsafe { value.sint } > 0 {
-                                                    result = ctx.types.array(ty, unsafe { value.sint } as usize);
-                                                } else {
-                                                    error!(self, 0, "arr length must be a positive integer and fit in a signed integer");
-                                                }
-                                            } else {
-                                                unreachable!();
-                                            }
+            TypeExprData::List(_) => {
+                match ctx.ast.type_expr_keytype(expr) {
+                    Some(Keytype::Arr) => {
+                        let ty_expr = ctx.ast.type_expr_base_type(expr);
+                        let len_expr = ctx.ast.type_expr_bound(expr);
+                        // todo: infer if ty_expr = None?
+                        if let (Some(ty_expr), Some(len_expr)) = (ty_expr, len_expr) {
+                            let ty = self.type_expr(ctx, ty_expr);
+                            if let TypeExprData::Expr(len_expr) = *ctx.ast.type_expr(len_expr) {
+                                let len = self.constant_expr(ctx, len_expr);
+                                if len.ty.is_integer() && len.value.is_some() {
+                                    // TODO: This convert op is a roundabout way to check for the positive+fits condition
+                                    // but should be more direct/less subtle
+                                    if let Some(op) = convert_op(len.ty, Type::Int) {
+                                        let value = apply_unary_op(op, len.value.unwrap());
+                                        if unsafe { value.sint } > 0 {
+                                            result = ctx.types.array(ty, unsafe { value.sint } as usize);
                                         } else {
-                                            // todo: type expr location
-                                            error!(self, 0, "arr length must be a constant integer")
+                                            error!(self, 0, "arr length must be a positive integer and fit in a signed integer");
                                         }
                                     } else {
-                                        error!(self, 0, "argument 2 of arr type must be a value expression")
+                                        unreachable!();
                                     }
-                                } else /* Some(len_expr) != args.next() */ {
-                                    // infer?
-                                    todo!();
+                                } else {
+                                    // todo: type expr location
+                                    error!(self, 0, "arr length must be a constant integer")
                                 }
                             } else {
-                                error!(self, 0, "type arr takes 2 arguments, base type and [length]")
+                                error!(self, 0, "argument 2 of arr type must be a value expression")
                             }
+                        } else {
+                            error!(self, 0, "type arr takes 2 arguments, base type and [length]")
                         }
-                        Some(Keytype::Ptr) => {
-                            if let Some(ty_expr) = args.next() {
-                                let ty = self.type_expr(ctx, ty_expr);
-                                if let Some(bound_expr) = args.next() {
-                                    if let TypeExprData::Expr(bound_expr) = *ctx.ast.type_expr(bound_expr) {
-                                        let bound = self.constant_expr(ctx, bound_expr);
-                                        if bound.ty.is_integer() {
-                                            todo!();
-                                        } else {
-                                            // todo: type expr location
-                                            error!(self, 0, "ptr bound must be an integer place")
-                                        }
-                                    } else {
-                                        error!(self, 0, "argument 2 of ptr type must be a value expression")
-                                    }
-                                } else /* Some(len_expr) != args.next() */ {
-                                    // unbounded
-                                    result = ctx.types.pointer(ty);
-                                }
-                            } else {
-                                // untyped
-                                result = Type::VoidPtr;
-                            }
+                        if ctx.ast.type_expr_len(expr) >= 4 {
+                            error!(ctx, 0, "type arr takes 2 arguments, base type and [length]");
                         }
-                        Some(Keytype::Struct) => {
-                            if let Some(items) = ctx.ast.type_expr_items(expr) {
-                                result = sym::resolve_anonymous_struct(ctx, items);
-                            } else {
-                                error!(self, 0, "missing fields in struct declaration");
-                            }
-                        }
-                        Some(Keytype::Func)|Some(Keytype::Proc) => error!(self, 0, "func/proc pointers are not implemented"),
-                        None => error!(self, 0, "expected keytype (one of func, proc, struct, arr, ptr)")
                     }
+                    Some(Keytype::Ptr) => {
+                        if let Some(ty_expr) = ctx.ast.type_expr_base_type(expr) {
+                            let ty = self.type_expr_ptr(ctx, ty_expr);
+                            if let Some(bound_expr) = ctx.ast.type_expr_bound(expr) {
+                                if let TypeExprData::Expr(bound_expr) = *ctx.ast.type_expr(bound_expr) {
+                                    let bound = self.constant_expr(ctx, bound_expr);
+                                    if bound.ty.is_integer() {
+                                        todo!();
+                                    } else {
+                                        // todo: type expr location
+                                        error!(self, 0, "ptr bound must be an integer place")
+                                    }
+                                } else {
+                                    error!(self, 0, "argument 2 of ptr type must be a value expression")
+                                }
+                            } else {
+                                // unbounded
+                                result = ctx.types.pointer(ty);
+                            }
+                        } else {
+                            // untyped
+                            result = Type::VoidPtr;
+                        }
+                        if ctx.ast.type_expr_len(expr) >= 4 {
+                            error!(ctx, 0, "too many parameters for keytype ptr");
+                        }
+                    }
+                    Some(Keytype::Struct) => {
+                        if let Some(items) = ctx.ast.type_expr_items(expr) {
+                            result = sym::resolve_anonymous_struct(ctx, items);
+                        } else {
+                            error!(self, 0, "struct has no fields");
+                        }
+                        if ctx.ast.type_expr_len(expr) >= 3 {
+                            error!(ctx, 0, "too many parameters for keytype struct");
+                        }
+                    }
+                    Some(Keytype::Func)|Some(Keytype::Proc) => error!(self, 0, "func/proc pointers are not implemented"),
+                    None => error!(self, 0, "expected keytype (one of func, proc, struct, arr, ptr)")
                 }
             }
         }
@@ -2844,72 +2860,16 @@ fn repl() {
 fn main() {
     let ok = [
         (r#"
-a: (v: int) = {1};
-b: (v: int) = {1};
-main: proc () -> int {
-    assert(b.v == 1);
-    return b.v;
-}"#, Value::Int(1)),
-(r#"
-V2: struct (x, y: int);
-a: int = 1 + 32;
-b: V2 = { 2, 3 }:V2;
-c: V2 = { 4, 5 };
-d: arr u8 [3] = { 0, 1, 2 };
-main: proc () -> int {
-    assert(a == 33);
-    assert(b.x == 2);
-    assert(b.y == 3);
-    assert(c.x == 4);
-    assert(c.y == 6);
-    assert(d[0] == 0);
-    assert(d[1] == 1);
-    assert(d[2] == 2);
-    d[0] = d[0] + d[1] : u8;
-    assert(d[0] == d[1]);
-    return d[1];
-}"#, Value::Int(1)),
-(r#"
-add: func (a, b: int) int {
-    return a + b;
-}
-madd: func (a, b, c: int) int {
-    return add(a, b * c);
-}
-A: int = madd(2,3,3);
-main: proc () -> int {
-    assert(A == 11);
-    return A;
-}"#, Value::Int(11)),
-(r#"
-inc: proc (a: ptr int) int {
-    old := *a;
-    *a = *a + 1;
-    return old;
-}
-a: int = 1;
-b: int = inc(&a);
-main: proc () -> int {
-    assert(b == 1);
-    return a;
-}"#, Value::Int(2)),
-(r#"
-inc: proc (a: ptr int) int {
-    old := *a;
-    *a = *a + 1;
-    return old;
-}
-d: int = a;
-b: int = inc(&c);
-c: int = a;
-a: int = 1;
-main: proc () -> int {
-    assert(d == 1);
-    assert(c == 2);
-    assert(b == 1);
-    assert(a == 1);
-    return a;
-}"#, Value::Int(1)),
+        V2: struct (x: f32, y: f32);
+
+        dot: func (a: V2, b: V2) f32 {
+            return a.x*b.x + a.y*b.y;
+        }
+
+        main: proc () int {
+            return dot({ 1.0, 2.0 }, { 3.0, 4.0 }):i32;
+        }
+"#, Value::Int(1)),
 ];
     let err = [r#"
 b: int = a;
@@ -3026,6 +2986,7 @@ fn decls() {
         "add': func (a: int, b: int) int { return a + b; }",
         "add: func (a: int, b: int) -> int { return a + b; }",
         "add: (a: int, b: int) -> int { return a + b; }",
+        "add: func (a: struct (a: int), b: (b: int)) int { return a.a + b.b; }",
         "V2: struct (x: f32, y: f32);",
         "V2: struct (x, y: f32);",
         "Node: struct (next: ptr Node, value: int);",
@@ -3036,12 +2997,17 @@ fn decls() {
         "int: (int: int) int { return int; }"
     ];
     let err = [
+        "add: func (a: (a: int) a, b: int) int { return a.a + b; }",
+        "add: func (a: struct (a: int) a, b: int) int { return a.a + b; }",
         "dup_func: func (a: int, b: int) int { return a + b; } dup_func: func (a: int, b: int) int { return a + b; }",
         "dup_param: func (a: int, a: int) int { return a + a; }",
         "empty: struct ();",
         "empty: ();",
+        "V2: struct (x: f32, y: f32) a;",
+        "Node: struct (next: ptr Node2, value: int);",
         "dup: struct (x: f32); dup: struct (y: f32);",
         "dup_: struct{: struct (: f32) dup_: struct{: struct (: f32);",
+        "struct: struct (struct: struct (struct: int)) (struct (struct: struct));",
         "dup_field: struct (x: f32, x: f32);",
         "circular: struct (x: circular);",
         "circular1: struct (x: circular2); circular2: struct (x: circular1);",

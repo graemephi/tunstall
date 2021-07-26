@@ -25,6 +25,7 @@ pub enum Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Declared,
+    Touched,
     Resolving,
     Resolved,
     Compiling,
@@ -65,13 +66,31 @@ impl Symbols {
         }
     }
 
-    fn resolving(&mut self, kind: Kind, name: Intern, ty: Type) {
+    fn touched(&mut self, name: Intern, ty: Type) {
+        match self.table.entry((Kind::Type, name)) {
+            Entry::Occupied(mut e) => {
+                let sym = e.get_mut();
+                assert_eq!(sym.state, State::Declared);
+                sym.ty = ty;
+                sym.state = State::Touched;
+            },
+            Entry::Vacant(_) => unreachable!()
+        }
+    }
+
+    // The symbol may or may not have a type assigned to it; assign ty if none has been set. Returns the set type.
+    fn resolving(&mut self, kind: Kind, name: Intern, ty: Type) -> Type {
         match self.table.entry((kind, name)) {
             Entry::Occupied(mut e) => {
                 let sym = e.get_mut();
-                assert!(sym.state == State::Declared);
+                if sym.state == State::Declared {
+                    assert!(sym.ty == Type::None);
+                    sym.ty = ty;
+                } else {
+                    assert!(sym.ty != Type::None);
+                }
                 sym.state = State::Resolving;
-                sym.ty = ty;
+                sym.ty
             },
             Entry::Vacant(_) => unreachable!(),
         }
@@ -158,8 +177,11 @@ fn resolve_var(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
 }
 
 fn resolve_struct(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
-    let ty = ctx.types.strukt(name);
-    ctx.symbols.resolving(Kind::Type, name, ty);
+    let tentative_ty = ctx.types.next();
+    let ty = ctx.symbols.resolving(Kind::Type, name, tentative_ty);
+    if ty == tentative_ty {
+        ctx.types.strukt(name);
+    }
     if let Some(fields) = ctx.ast.type_expr_items(expr) {
         for field in fields {
             let item = ctx.ast.item(field);
@@ -175,6 +197,9 @@ fn resolve_struct(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
         }
     } else {
         error!(ctx, 0, "struct {} has no fields", ctx.str(name));
+    }
+    if ctx.ast.type_expr_len(expr) >= 3 {
+        error!(ctx, 0, "struct {} has too many parameters for keytype struct", ctx.str(name));
     }
     ctx.types.complete_type(ty);
     ctx.symbols.resolved(Kind::Type, name, ty, 0)
@@ -206,7 +231,7 @@ fn resolve(ctx: &mut Compiler, kind: Kind, name: Intern) -> Option<&Symbol> {
     let mut decl_to_resolve = None;
     if let Some(sym) = ctx.symbols.get(kind, name) {
         match sym.state {
-            State::Declared => decl_to_resolve = Some(sym.decl),
+            State::Declared|State::Touched => decl_to_resolve = Some(sym.decl),
             State::Resolving|State::Circular => error!(ctx, 0, "{} is circular", ctx.str(name)),
             State::Resolved|State::Compiling|State::Compiled => {
                 // MIRI don't care so i don't care
@@ -266,6 +291,25 @@ pub fn builtin(ctx: &mut Compiler, name: Intern, ty: Type) {
 #[allow(dead_code)]
 pub fn lookup_type(ctx: &Compiler, name: Intern) -> Option<&Symbol> {
     ctx.symbols.get(Kind::Type, name)
+}
+
+pub fn lookup_type_mut(ctx: &mut Compiler, name: Intern) -> Option<&mut Symbol> {
+    ctx.symbols.get_mut(Kind::Type, name)
+}
+
+pub fn touch_type(ctx: &mut Compiler, name: Intern) -> Option<Type> {
+    lookup_type_mut(ctx, name).map(|sym| (sym.state, sym.ty)).map(|(state, ty)| {
+        if state == State::Declared {
+            // We don't know what this is yet. But we don't have anything it could otherwise be (enum, union, ?).
+            assert!(ty == Type::None);
+            let ty = ctx.types.strukt(name);
+            ctx.symbols.touched(name, ty);
+            ty
+        } else {
+            assert!(ty != Type::None);
+            ty
+        }
+    })
 }
 
 pub fn lookup_value(ctx: &Compiler, name: Intern) -> Option<&Symbol> {

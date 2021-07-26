@@ -219,13 +219,17 @@ impl Types {
         }
     }
 
+    pub fn next(&mut self) -> Type {
+        Type(u32::try_from(self.types.len()).expect("Program too big!!"))
+    }
+
     pub fn make(&mut self, kind: TypeKind) -> Type {
-        let mut result = u32::try_from(self.types.len()).expect("Program too big!!");
-        if result >= Type::POINTER_BIT {
+        let mut result = self.next();
+        if result.0 >= Type::POINTER_BIT {
             todo!("Program too big!!");
         }
         if kind == TypeKind::Pointer {
-            result |= Type::POINTER_BIT;
+            result.0 |= Type::POINTER_BIT;
         }
         self.types.push(TypeInfo {
             kind: kind,
@@ -233,11 +237,11 @@ impl Types {
             size: 0,
             alignment: 1,
             items: Vec::new(),
-            base_type: Type(result),
+            base_type: result,
             mutable: true,
             num_array_elements: 0,
         });
-        Type(result)
+        result
     }
 
     pub fn signature(&mut self, kind: TypeKind, items: &[Type], mutable: bool) -> Type {
@@ -527,7 +531,8 @@ Padding2: struct (
 Ptr: struct (
     a: ptr,
     b: ptr u8,
-    c: ptr int
+    c: ptr int,
+    d: ptr Ptr
 );
     "#;
 
@@ -541,6 +546,7 @@ Ptr: struct (
     let padding2 = c.intern("Padding2");
 
     let int_ptr = c.types.pointer(Type::Int);
+    let ptr_ptr = c.types.pointer(sym::lookup_type(&c, ptr).map(|sym| sym.ty).unwrap());
 
     let get = |name: Intern| sym::lookup_type(&c, name).map(|sym| c.types.info(sym.ty)).unwrap();
     let v2 = get(v2);
@@ -593,11 +599,13 @@ Ptr: struct (
     assert_eq!(aoi.num_array_elements, 3);
 
     assert_eq!(ptr.kind, TypeKind::Struct);
-    assert_eq!(ptr.size, 24);
+    assert_eq!(ptr.size, 32);
     assert_eq!(ptr.alignment, 8);
     assert_eq!(ptr.items[0].ty, Type::VoidPtr);
     assert_eq!(ptr.items[1].ty, Type::U8Ptr);
     assert_eq!(ptr.items[2].ty, int_ptr);
+    assert_eq!(ptr.items[3].ty, ptr_ptr);
+    assert_eq!(c.types.info(c.types.base_type(ptr_ptr)) as *const _, ptr as *const _);
 
     assert_eq!(padding.size, 24);
     assert_eq!(padding.alignment, 8);

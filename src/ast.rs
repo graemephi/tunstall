@@ -510,7 +510,7 @@ impl Ast {
         }
     }
 
-    fn type_expr_has_keytype(&self, expr: TypeExpr) -> bool {
+    fn type_expr_has_explicit_keytype(&self, expr: TypeExpr) -> bool {
         match self.type_expr(expr) {
             TypeExprData::Name(key) => Keytype::from_intern(*key).is_some(),
             TypeExprData::List(_) => self.type_expr_index(expr, 0).map(|t| match self.type_expr(t) {
@@ -520,6 +520,8 @@ impl Ast {
             _ => false
         }
     }
+
+    // All type exprs
 
     pub fn type_expr_keytype(&self, expr: TypeExpr) -> Option<Keytype> {
         match self.type_expr(expr) {
@@ -534,11 +536,22 @@ impl Ast {
         }
     }
 
+    pub fn type_expr_len(&self, expr: TypeExpr) -> usize {
+        let b = if self.type_expr_has_explicit_keytype(expr) { 0 } else { 1 };
+        match self.type_expr(expr) {
+            TypeExprData::List(list) => list.len() + b,
+            _ => 1
+        }
+    }
+
+    // struct, func type exprs
+    // returns nonsense if used on others
+
     pub fn type_expr_items(&self, expr: TypeExpr) -> Option<ItemList> {
         match self.type_expr(expr) {
             TypeExprData::Items(items) => Some(*items),
             TypeExprData::List(_) => {
-                let index = self.type_expr_has_keytype(expr) as usize;
+                let index = if self.type_expr_has_explicit_keytype(expr) { 1 } else { 0 };
                 self.type_expr_index(expr, index).and_then(|t| match self.type_expr(t) {
                     TypeExprData::Items(items) => Some(*items),
                     _ => None
@@ -549,7 +562,26 @@ impl Ast {
     }
 
     pub fn type_expr_returns(&self, expr: TypeExpr) -> Option<TypeExpr> {
-        let index = if self.type_expr_has_keytype(expr) { 2 } else { 1 };
+        let index = if self.type_expr_has_explicit_keytype(expr) { 2 } else { 1 };
+        match self.type_expr(expr) {
+            TypeExprData::List(_) => self.type_expr_index(expr, index),
+            _ => None,
+        }
+    }
+
+    // arr, ptr type exprs
+    // returns nonsense if used on others
+
+    pub fn type_expr_base_type(&self, expr: TypeExpr) -> Option<TypeExpr> {
+        let index = if self.type_expr_has_explicit_keytype(expr) { 1 } else { 0 };
+        match self.type_expr(expr) {
+            TypeExprData::List(_) => self.type_expr_index(expr, index),
+            _ => None,
+        }
+    }
+
+    pub fn type_expr_bound(&self, expr: TypeExpr) -> Option<TypeExpr> {
+        let index = if self.type_expr_has_explicit_keytype(expr) { 2 } else { 1 };
         match self.type_expr(expr) {
             TypeExprData::List(_) => self.type_expr_index(expr, index),
             _ => None,
