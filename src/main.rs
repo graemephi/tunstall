@@ -594,7 +594,7 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
     Some(op)
 }
 
-fn store_op_pointer(ty: Type) -> Option<Op> {
+fn store_op(ty: Type) -> Option<Op> {
     match ty {
         Type::I8|Type::U8|Type::Bool            => Some(Op::Store8),
         Type::I16|Type::U16                     => Some(Op::Store16),
@@ -605,7 +605,7 @@ fn store_op_pointer(ty: Type) -> Option<Op> {
     }
 }
 
-fn load_op_pointer(ty: Type) -> Option<Op> {
+fn load_op(ty: Type) -> Option<Op> {
     match ty {
         Type::Bool                              => Some(Op::LoadBool),
         Type::I8                                => Some(Op::LoadAndSignExtend8),
@@ -1036,30 +1036,6 @@ impl FatGen {
         dest
     }
 
-    fn register(&mut self, expr: &ExprResult) -> isize {
-        match expr.addr.kind {
-            LocationKind::None => match expr.value {
-                Some(v) if expr.value_is_register => {
-                    assert!(expr.ty.is_pointer());
-                    let v_register = self.constant(v);
-                    self.put3_inc(Op::IntAdd, Location::SP_REGISTER, v_register)
-                },
-                Some(v) => self.constant(v),
-                None => Location::BAD
-            },
-            LocationKind::Control => unreachable!(),
-            LocationKind::Register => expr.addr.offset,
-            LocationKind::Based|LocationKind::Rip => {
-                if let Some(op) = load_op_pointer(expr.ty) {
-                    let ptr = self.location_register(&expr.addr);
-                    self.put2_inc(op, ptr)
-                } else {
-                    Location::BAD
-                }
-            }
-        }
-    }
-
     fn location_register(&mut self, location: &Location) -> isize {
         match location.kind {
             LocationKind::None => Location::BAD,
@@ -1074,9 +1050,53 @@ impl FatGen {
                 }
             }
             LocationKind::Rip => {
-                let offset = location.offset - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
+                // Add 1 to include the immediate load. If self.constant ever tracks avaialble constant registers
+                // then this will break
+                let offset = location.offset - ((self.code.len() + 1) * std::mem::size_of::<FatInstr>()) as isize;
                 let offset_register = self.constant(offset.into());
                 self.put3_inc(Op::IntAdd, Location::IP_REGISTER, offset_register)
+            }
+        }
+    }
+
+    #[allow(unreachable_code)]
+    fn location_base_offset(&mut self, location: &Location) -> (isize, isize) {
+        if location.offset > i32::MAX as isize {
+            panic!("untested");
+            return (self.location_register(location), 0);
+        }
+        match location.kind {
+            LocationKind::Based => {
+                (location.base, location.offset)
+            }
+            LocationKind::Rip => {
+                let offset = location.offset - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
+                (Location::IP_REGISTER, offset)
+            }
+            _ => unreachable!()
+        }
+    }
+
+    fn register(&mut self, expr: &ExprResult) -> isize {
+        match expr.addr.kind {
+            LocationKind::None => match expr.value {
+                Some(v) if expr.value_is_register => {
+                    assert!(expr.ty.is_pointer());
+                    let v_register = self.constant(v);
+                    self.put3_inc(Op::IntAdd, Location::SP_REGISTER, v_register)
+                },
+                Some(v) => self.constant(v),
+                None => Location::BAD
+            },
+            LocationKind::Control => unreachable!(),
+            LocationKind::Register => expr.addr.offset,
+            LocationKind::Based|LocationKind::Rip => {
+                if let Some(op) = load_op(expr.ty) {
+                    let (ptr, offset) = self.location_base_offset(&expr.addr);
+                    self.put3_inc(op, ptr, offset)
+                } else {
+                    Location::BAD
+                }
             }
         }
     }
@@ -1138,20 +1158,21 @@ impl FatGen {
                 self.put2(Op::Move, dest.offset, result_register);
             }
             LocationKind::Based|LocationKind::Rip => {
-                let dest_addr_register = self.location_register(dest);
                 let src = &self.emit_constant(src);
 
                 match src.addr.kind {
                     LocationKind::None|LocationKind::Control => unreachable!(),
                     LocationKind::Register => {
-                        if let Some(op) = store_op_pointer(destination_type) {
+                        if let Some(op) = store_op(destination_type) {
+                            let (dest_addr_register, offset) = self.location_base_offset(dest);
                             let src = self.register(src);
-                            self.put2(op, dest_addr_register, src);
+                            self.put3(op, dest_addr_register, src, offset);
                         } else {
                             unreachable!();
                         }
                     }
                     LocationKind::Based|LocationKind::Rip => {
+                        let dest_addr_register = self.location_register(dest);
                         let src_addr_register = self.location_register(&src.addr);
                         let size_register = self.constant(size.into());
                         self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
@@ -1551,8 +1572,8 @@ impl FatGen {
                                 // We emit this check every time we access any global, because if the function is called
                                 // in a global expression it may be uninitialized. This is a heavy hammer that lets us
                                 // avoid doing any reachability analysis.
-                                let initialized_flag_ptr = self.location_register(&Location::rip(loc, true));
-                                let initialized_flag = self.put2_inc(Op::Load32, initialized_flag_ptr);
+                                let (initialized_flag_ptr, offset) = self.location_base_offset(&Location::rip(loc - 4, true));
+                                let initialized_flag = self.put3_inc(Op::Load32, initialized_flag_ptr, offset);
                                 self.put_jump_zero(initialized_flag, self.panic);
                             }
 
@@ -2357,9 +2378,9 @@ impl FatGen {
             self.prolog();
         }
         let expr = self.expr_with_destination(ctx, right, ty, &Location::rip(location, true));
-        let initialized_flag_ptr = self.location_register(&Location::rip(location - 4, true));
         let flag = self.constant(1.into());
-        self.put2(Op::Store32, initialized_flag_ptr, flag);
+        let (ip, offset) = self.location_base_offset(&Location::rip(location - 4, true));
+        self.put3(Op::Store32, ip, flag, offset);
         if ctx.types.types_match_with_promotion(ty, expr.ty) {
             if value_fits(expr.value, ty) {
                 assert!(expr.addr.kind == LocationKind::Rip);
@@ -2655,18 +2676,18 @@ impl Compiler {
                     },
                     Op::CallIndirect  => { todo!() },
 
-                    Op::Store8  => { *(reg![dest].int as *mut u8)  =   stack![left]; },
-                    Op::Store16 => { *(reg![dest].int as *mut u16) = *(stack![left..].as_ptr() as *const u16); },
-                    Op::Store32 => { *(reg![dest].int as *mut u32) = *(stack![left..].as_ptr() as *const u32); },
-                    Op::Store64 => { *(reg![dest].int as *mut u64) = *(stack![left..].as_ptr() as *const u64); },
-                    Op::Load8   => { reg![dest].int = *(reg![left].int as *const u8)  as usize; },
-                    Op::Load16  => { reg![dest].int = *(reg![left].int as *const u16) as usize; },
-                    Op::Load32  => { reg![dest].int = *(reg![left].int as *const u32) as usize; },
-                    Op::Load64  => { reg![dest].int = *(reg![left].int as *const u64) as usize; },
-                    Op::LoadAndSignExtend8  => { reg![dest].sint = *(reg![left].int as *const i8)  as isize; },
-                    Op::LoadAndSignExtend16 => { reg![dest].sint = *(reg![left].int as *const i16) as isize; },
-                    Op::LoadAndSignExtend32 => { reg![dest].sint = *(reg![left].int as *const i32) as isize; },
-                    Op::LoadBool => { reg![dest].b8.0 = *(reg![left].int as *const u8) != 0; },
+                    Op::Store8  => { *(reg![dest].int.wrapping_add(instr.right as usize) as *mut u8)  =   stack![left]; },
+                    Op::Store16 => { *(reg![dest].int.wrapping_add(instr.right as usize) as *mut u16) = *(stack![left..].as_ptr() as *const u16); },
+                    Op::Store32 => { *(reg![dest].int.wrapping_add(instr.right as usize) as *mut u32) = *(stack![left..].as_ptr() as *const u32); },
+                    Op::Store64 => { *(reg![dest].int.wrapping_add(instr.right as usize) as *mut u64) = *(stack![left..].as_ptr() as *const u64); },
+                    Op::Load8   => { reg![dest].int = *(reg![left].int.wrapping_add(instr.right as usize) as *const u8)  as usize; },
+                    Op::Load16  => { reg![dest].int = *(reg![left].int.wrapping_add(instr.right as usize) as *const u16) as usize; },
+                    Op::Load32  => { reg![dest].int = *(reg![left].int.wrapping_add(instr.right as usize) as *const u32) as usize; },
+                    Op::Load64  => { reg![dest].int = *(reg![left].int.wrapping_add(instr.right as usize) as *const u64) as usize; },
+                    Op::LoadAndSignExtend8  => { reg![dest].sint = *(reg![left].int.wrapping_add(instr.right as usize) as *const i8)  as isize; },
+                    Op::LoadAndSignExtend16 => { reg![dest].sint = *(reg![left].int.wrapping_add(instr.right as usize) as *const i16) as isize; },
+                    Op::LoadAndSignExtend32 => { reg![dest].sint = *(reg![left].int.wrapping_add(instr.right as usize) as *const i32) as isize; },
+                    Op::LoadBool => { reg![dest].b8.0 = *(reg![left].int.wrapping_add(instr.right as usize) as *const u8) != 0; },
                     Op::Copy => { std::ptr::copy(reg![left].int as *const u8, reg![dest].int as *mut u8, reg![right].int); },
                     Op::Zero => { for b in std::slice::from_raw_parts_mut(reg![dest].int as *mut u8, reg![left].int) { *b = 0 }},
                 }
