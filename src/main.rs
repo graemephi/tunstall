@@ -132,10 +132,6 @@ impl Interns {
         }
     }
 
-    pub fn get(&self, str: &str) -> Option<Intern> {
-        self.ids.get(str).copied()
-    }
-
     pub fn to_str(&self, id: Intern) -> Option<&str> {
         self.interns.get(id.0 as usize).copied()
     }
@@ -624,7 +620,7 @@ fn load_op_pointer(ty: Type) -> Option<Op> {
     }
 }
 
-// TODO: right now, before calling either apply_unary_op or apply_binary_op, you
+// right now, before calling either apply_unary_op or apply_binary_op, you
 // need to check the type of the value isn't pointer, as the representation of
 // constant pointers is not the same as their run time values (they are stack
 // offsets until then). This sucks a little
@@ -806,6 +802,7 @@ pub enum LocationKind {
     Control,
     Register,
     Based,
+    Rip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -849,8 +846,10 @@ impl Location {
         Location { base: Self::SP_REGISTER, offset: offset, kind: LocationKind::Based, is_mutable: true, is_place: true }
     }
 
-    fn global(offset: isize, is_mutable: bool) -> Location {
-        Location { base: Self::IP_REGISTER, offset: offset, kind: LocationKind::Based, is_mutable, is_place: true }
+    fn rip(location: isize, is_mutable: bool) -> Location {
+        // Morally, base is Self::IP_REGISTER. But offset is interpreted differently for it, and using BAD here will make
+        // things blow up, rather than emit bad loads, if not handled correctly.
+        Location { base: Self::BAD, offset: location, kind: LocationKind::Rip, is_mutable, is_place: true }
     }
 
     fn pointer(base: isize, offset: isize, is_mutable: bool) -> Location {
@@ -858,7 +857,7 @@ impl Location {
     }
 
     fn offset_by(&self, offset: isize) -> Location {
-        debug_assert_implies!(offset > 0, matches!(self.kind, LocationKind::Based));
+        debug_assert_implies!(offset > 0, matches!(self.kind, LocationKind::Based|LocationKind::Rip));
         let mut result = *self;
         result.offset += offset;
         result
@@ -989,6 +988,7 @@ impl FatGen {
 
     fn put3(&mut self, op: Op, dest: isize, left: isize, right: isize) {
         if self.constant == false {
+            assert_implies!(requires_register_destination(op), (dest as usize & (Self::REGISTER_SIZE - 1)) == 0);
             let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 });
             let left = i32::try_from(left).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 });
             let right = i32::try_from(right).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 });
@@ -1001,6 +1001,7 @@ impl FatGen {
 
     fn put(&mut self, op: Op, dest: isize, data: RegValue) {
         if self.constant == false {
+            assert_implies!(requires_register_destination(op), (dest as usize & (Self::REGISTER_SIZE - 1)) == 0);
             let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 });
             self.code.push(FatInstr { op, dest, left: unsafe { data.sint32.0 }, right: unsafe { data.sint32.1 }});
         } else {
@@ -1048,7 +1049,7 @@ impl FatGen {
             },
             LocationKind::Control => unreachable!(),
             LocationKind::Register => expr.addr.offset,
-            LocationKind::Based => {
+            LocationKind::Based|LocationKind::Rip => {
                 if let Some(op) = load_op_pointer(expr.ty) {
                     let ptr = self.location_register(&expr.addr);
                     self.put2_inc(op, ptr)
@@ -1071,6 +1072,11 @@ impl FatGen {
                 } else {
                     location.base
                 }
+            }
+            LocationKind::Rip => {
+                let offset = location.offset - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
+                let offset_register = self.constant(offset.into());
+                self.put3_inc(Op::IntAdd, Location::IP_REGISTER, offset_register)
             }
         }
     }
@@ -1113,7 +1119,7 @@ impl FatGen {
     fn zero(&mut self, dest: &Location, size: isize) {
         match dest.kind {
             LocationKind::None|LocationKind::Control|LocationKind::Register => unreachable!(),
-            LocationKind::Based => {
+            LocationKind::Based|LocationKind::Rip => {
                 let dest_addr_register = self.location_register(dest);
                 let size_register = self.constant(size.into());
                 self.put2(Op::Zero, dest_addr_register, size_register);
@@ -1131,7 +1137,7 @@ impl FatGen {
                 let result_register = self.register(src);
                 self.put2(Op::Move, dest.offset, result_register);
             }
-            LocationKind::Based => {
+            LocationKind::Based|LocationKind::Rip => {
                 let dest_addr_register = self.location_register(dest);
                 let src = &self.emit_constant(src);
 
@@ -1145,7 +1151,7 @@ impl FatGen {
                             unreachable!();
                         }
                     }
-                    LocationKind::Based => {
+                    LocationKind::Based|LocationKind::Rip => {
                         let src_addr_register = self.location_register(&src.addr);
                         let size_register = self.constant(size.into());
                         self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
@@ -1387,6 +1393,7 @@ impl FatGen {
                 let offset = index * element_size as isize;
                 if base.ty.is_pointer() {
                     if base.addr.offset == 0 {
+                        assert!(base.addr.kind == LocationKind::Based);
                         let ptr = self.register(&base);
                         let offset_reg = self.constant(offset.into());
                         let base_reg = self.put3_inc(Op::IntAdd, ptr, offset_reg);
@@ -1425,6 +1432,9 @@ impl FatGen {
                             let base_reg = self.put3_inc(Op::IntAdd, old_base_reg, offset_reg);
                             // As per comment above, we keep base.addr.offset
                             Location { base: base_reg, ..base.addr }
+                        }
+                        LocationKind::Rip => {
+                            todo!();
                         }
                         _ => unreachable!(),
                     }
@@ -1501,6 +1511,20 @@ impl FatGen {
                     match ctx.types.info(sym.ty).kind {
                         TypeKind::Callable => result.value = Some(sym.name.into()),
                         _ => {
+                            // Global variable access. Our strategy for dealing with these is:
+                            // 1) Storage is allocated in the declaration type resolution phase
+                            // 2 a) Code to compute every global variable is dumped out linearly,
+                            //      this emits writes to the allocation for each global.
+                            // 2 b) inside global expressions, if we hit a global variable we
+                            //      haven't generated code for yet, immediately switch to generating
+                            //      code for that.
+                            // 3) Stick a call to main at the end.
+                            // 4) inside functions and procedures, which can be called before main, emit
+                            //    checks that they have been initialized. The downside of this is that
+                            //    indeterminism means illegal accesses can be missed if they are
+                            //    branched over. Instead, this could can be done as a scan over the
+                            //    bytecode. I don't want to implement logic for that until I know the
+                            //    bytecode representation is ok.
                             let (ty, loc) = (sym.ty, sym.location);
                             match sym.state {
                                 sym::State::Resolved => {
@@ -1523,21 +1547,16 @@ impl FatGen {
                                 _ => unreachable!()
                             }
 
-                            let offset = loc - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
-                            let ip = self.put2_inc(Op::Move, Location::IP_REGISTER);
-
                             if matches!(self.target, CodeGenTarget::Func|CodeGenTarget::Proc) {
                                 // We emit this check every time we access any global, because if the function is called
-                                // in a global expression it may be uninitialised. This is a heavy hammer that lets us
-                                // avoid doing any reachability analysis. It would be nice if only functions that
-                                // were called in global expressions had to pay this cost, but that requires reachability analysis.
-                                let initialized_flag_ptr = self.location_register(&Location::pointer(ip, offset - 4, true));
+                                // in a global expression it may be uninitialized. This is a heavy hammer that lets us
+                                // avoid doing any reachability analysis.
+                                let initialized_flag_ptr = self.location_register(&Location::rip(loc, true));
                                 let initialized_flag = self.put2_inc(Op::Load32, initialized_flag_ptr);
                                 self.put_jump_zero(initialized_flag, self.panic);
                             }
 
-                            let addr = Location::pointer(ip, offset, true);
-                            result.addr = addr;
+                            result.addr = Location::rip(loc, true);
                         }
                     }
                 } else {
@@ -1610,7 +1629,7 @@ impl FatGen {
                         error!(self, ctx.ast.expr_source_position(left_expr), "no field '{}' on type {}", ctx.str(field), ctx.type_str(left.ty));
                     }
                 } else if let Some(item) = ctx.types.item_info(left.ty, field) {
-                    debug_assert_implies!(self.error.is_none(), matches!(left.addr.kind, LocationKind::Based));
+                    debug_assert_implies!(self.error.is_none(), matches!(left.addr.kind, LocationKind::Based|LocationKind::Rip));
                     debug_assert_implies!(self.error.is_none(), left.addr.is_place);
                     result.addr = left.addr;
                     result.addr.offset += item.offset as isize;
@@ -1661,8 +1680,8 @@ impl FatGen {
                                     result.addr.is_mutable = right.addr.is_mutable;
                                     result.addr.is_place = right.addr.is_place;
                                 }
-                                LocationKind::Based => {
-                                    assert!(right.addr.is_place);
+                                LocationKind::Based|LocationKind::Rip => {
+                                    debug_assert!(right.addr.is_place);
                                     result.addr = Location::register(self.location_register(&right.addr));
                                 }
                             }
@@ -1928,7 +1947,7 @@ impl FatGen {
         if self.error.is_none() {
             debug_assert_implies!(result.addr.offset == Location::BAD, matches!(result.addr.kind, LocationKind::None|LocationKind::Control));
             debug_assert_implies!(result.addr.offset != Location::BAD, result.addr.kind != LocationKind::None);
-            debug_assert_implies!(result.addr.base != Location::BAD, result.addr.kind == LocationKind::Based);
+            debug_assert_implies!(result.addr.base != Location::BAD, matches!(result.addr.kind, LocationKind::Based|LocationKind::Rip));
             debug_assert_implies!(result.ty != Type::None, result.value.is_some() || result.addr.kind != LocationKind::None);
         }
 
@@ -2283,11 +2302,7 @@ impl FatGen {
         let kind = ctx.ast.type_expr_keytype(callable.expr).expect("tried to generate code for callable without keytype");
         let params = ctx.ast.type_expr_items(callable.expr).expect("tried to generate code for callable without parameters");
         let is_func = ctx.ast.type_expr_keytype(callable.expr) == Some(Keytype::Func);
-        if is_func {
-            self.target = CodeGenTarget::Func;
-        } else {
-            self.target = CodeGenTarget::Proc;
-        }
+        self.target = if is_func { CodeGenTarget::Func } else { CodeGenTarget::Proc };
         assert_eq!(sig.kind, TypeKind::Callable, "sig.kind == TypeKind::Callable");
         assert!(params.len() == sig.items.len() - 1, "the last element of a callable's type signature's items must be the return type");
         self.return_type = sig.items.last().map(|i| i.ty).unwrap();
@@ -2311,7 +2326,7 @@ impl FatGen {
             }
         }
         self.panic = self.label_here();
-        self.put2(Op::Panic, PanicReason::GlobalNotInitialized as isize, 0);
+        self.put2(Op::Panic, 0, PanicReason::GlobalNotInitialized as isize);
         let addr = self.code.len();
         self.prolog();
         let returned = self.stmts(ctx, body);
@@ -2341,16 +2356,14 @@ impl FatGen {
         if reg_counter == 0 {
             self.prolog();
         }
-        let offset = location - (self.code.len() * std::mem::size_of::<FatInstr>()) as isize;
-        let ip = self.put2_inc(Op::Move, Location::IP_REGISTER);
-        let expr = self.expr_with_destination(ctx, right, ty, &Location::pointer(ip, offset, true));
-        let initialized_flag_ptr = self.location_register(&Location::pointer(ip, offset - 4, true));
+        let expr = self.expr_with_destination(ctx, right, ty, &Location::rip(location, true));
+        let initialized_flag_ptr = self.location_register(&Location::rip(location - 4, true));
         let flag = self.constant(1.into());
         self.put2(Op::Store32, initialized_flag_ptr, flag);
         if ctx.types.types_match_with_promotion(ty, expr.ty) {
             if value_fits(expr.value, ty) {
-                assert!(expr.addr.base == ip);
-                assert!(expr.addr.offset == offset);
+                assert!(expr.addr.kind == LocationKind::Rip);
+                assert!(expr.addr.offset == location);
             } else {
                 error!(self, ctx.ast.expr_source_position(right), "constant expression does not fit in {}", ctx.type_str(ty));
             }
@@ -2545,7 +2558,7 @@ impl Compiler {
                     Op::Halt       => { break; }
                     Op::Panic      => {
                         // terrible
-                        if instr.dest == PanicReason::GlobalNotInitialized as i32 {
+                        if instr.left == PanicReason::GlobalNotInitialized as i32 {
                             // but which one
                             return Err("global value used before initialization".into())
                         } else {
@@ -2637,10 +2650,7 @@ impl Compiler {
                         reg![dest + Location::RETURN_ADDRESS_REGISTER as usize].int = ip;
                         reg![dest + Location::FP_REGISTER as usize].int = sp;
                         reg![dest + Location::SP_REGISTER as usize].int = std::ptr::addr_of_mut!(stack![dest]) as usize;
-                        // todo: patch
-                        let name = Intern(instr.left as u32);
-                        let f = self.funcs.get(&name).expect("Bad bytecode");
-                        ip = f.addr.wrapping_sub(1);
+                        ip = instr.left as usize;
                         sp = dest;
                     },
                     Op::CallIndirect  => { todo!() },
@@ -2673,7 +2683,7 @@ fn compile(str: &str) -> Result<Compiler> {
     let mut c = Compiler::new();
 
     // We can't parse successive files like this in general beacuse the AST assumes all nodes
-    // come from the same file. This works for now beacuse nothing ever asks where these come from
+    // come from the same file. This works for now because nothing ever asks where these come from
     parse::parse(&mut c, r#"
 panic: func () int {
     // built-in
@@ -2766,12 +2776,19 @@ assert: func (condition: bool) int {
         let info = c.types.info(panic_def.ty);
         assert!(matches!(info.arguments(), Some(&[])) && matches!(info.return_type(), Some(Type::Int)));
         let addr = gen.code.len();
-        gen.code.push(FatInstr { op: Op::Panic, dest: PanicReason::AssertionFailed as i32, left: 0, right: 0});
+        gen.code.push(FatInstr { op: Op::Panic, dest: 0, left: PanicReason::AssertionFailed as i32, right: 0});
         c.funcs.insert(panic, Code { signature: panic_def.ty, addr });
     }
 
     c.code = std::mem::take(&mut gen.code);
     c.report_errors(str)?;
+
+    for i in c.ip_start..c.code.len() {
+        if let FatInstr { op: Op::Call, left: name, ..} = c.code[i] {
+            let addr = c.funcs.get(&Intern(name as u32)).expect("Bad bytecode").addr;
+            c.code[i].left = i32::try_from(addr - 1).expect("todo: Data+code is larger than 2gb");
+        }
+    }
 
     Ok(c)
 }
@@ -2804,6 +2821,98 @@ fn repl() {
 }
 
 fn main() {
+    let ok = [
+        (r#"
+a: (v: int) = {1};
+b: (v: int) = {1};
+main: proc () -> int {
+    assert(b.v == 1);
+    return b.v;
+}"#, Value::Int(1)),
+(r#"
+V2: struct (x, y: int);
+a: int = 1 + 32;
+b: V2 = { 2, 3 }:V2;
+c: V2 = { 4, 5 };
+d: arr u8 [3] = { 0, 1, 2 };
+main: proc () -> int {
+    assert(a == 33);
+    assert(b.x == 2);
+    assert(b.y == 3);
+    assert(c.x == 4);
+    assert(c.y == 6);
+    assert(d[0] == 0);
+    assert(d[1] == 1);
+    assert(d[2] == 2);
+    d[0] = d[0] + d[1] : u8;
+    assert(d[0] == d[1]);
+    return d[1];
+}"#, Value::Int(1)),
+(r#"
+add: func (a, b: int) int {
+    return a + b;
+}
+madd: func (a, b, c: int) int {
+    return add(a, b * c);
+}
+A: int = madd(2,3,3);
+main: proc () -> int {
+    assert(A == 11);
+    return A;
+}"#, Value::Int(11)),
+(r#"
+inc: proc (a: ptr int) int {
+    old := *a;
+    *a = *a + 1;
+    return old;
+}
+a: int = 1;
+b: int = inc(&a);
+main: proc () -> int {
+    assert(b == 1);
+    return a;
+}"#, Value::Int(2)),
+(r#"
+inc: proc (a: ptr int) int {
+    old := *a;
+    *a = *a + 1;
+    return old;
+}
+d: int = a;
+b: int = inc(&c);
+c: int = a;
+a: int = 1;
+main: proc () -> int {
+    assert(d == 1);
+    assert(c == 2);
+    assert(b == 1);
+    assert(a == 1);
+    return a;
+}"#, Value::Int(1)),
+];
+    let err = [r#"
+b: int = a;
+a: int = b;
+}"#,r#"
+g: () int {
+    return a + 1;
+}
+b: int = g();
+a: int = 0;
+main: proc () -> int {
+    return b;
+}"#];
+    for test in ok.iter() {
+        let str = test.0;
+        let expect = test.1;
+        compile_and_run(str)
+            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
+            .map_err(|e| { println!("input: \"{}\"", str); e })
+            .unwrap();
+    }
+    for str in err.iter() {
+        compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+    }
     repl();
 }
 
@@ -2898,6 +3007,7 @@ fn decls() {
         "add: (a: int, b: int) -> int { return a + b; }",
         "V2: struct (x: f32, y: f32);",
         "V2: struct (x, y: f32);",
+        "Node: struct (next: ptr Node, value: int);",
         "func: func (func, proc: int) int { return func + proc; }",
         "V1: struct (x: f32); V2: struct (x: V1, y: V1);",
         "struct: struct (struct: struct (struct: int));",

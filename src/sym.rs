@@ -259,14 +259,6 @@ pub fn resolve_type(ctx: &mut Compiler, name: Intern) -> Type {
     Type::None
 }
 
-pub fn resolve_value(ctx: &mut Compiler, name: Intern) -> Type {
-    if let Some(&Symbol{ kind: Kind::Type, ty, .. }) = resolve(ctx, Kind::Value, name) {
-        return ty;
-    }
-    assert!(ctx.have_error());
-    Type::None
-}
-
 pub fn builtin(ctx: &mut Compiler, name: Intern, ty: Type) {
     ctx.symbols.builtin(name, ty);
 }
