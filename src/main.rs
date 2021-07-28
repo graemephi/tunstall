@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "bench", feature(test))]
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("64 bit is assumed");
 
@@ -67,9 +68,9 @@ struct Interns {
 }
 
 impl Interns {
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "bench")))]
     const BUF_CAPACITY: usize = 12;
-    #[cfg(not(test))]
+    #[cfg(any(not(test), feature = "bench"))]
     const BUF_CAPACITY: usize = 16*1024*1024;
 
     pub fn new() -> Interns {
@@ -137,8 +138,7 @@ impl Interns {
     }
 }
 
-// If the compiler were a library we'd need this. As an application this just
-// wastes time at exit
+// Clean up in test code so its not a leak false-positive
 #[cfg(test)]
 impl Drop for Interns {
     fn drop(&mut self) {
@@ -847,8 +847,10 @@ impl Location {
     }
 
     fn rip(location: isize, is_mutable: bool) -> Location {
-        // Morally, base is Self::IP_REGISTER. But offset is interpreted differently for it, and using BAD here will make
-        // things blow up, rather than emit bad loads, if not handled correctly.
+        // Morally, base is Self::IP_REGISTER. But we don't use LocationKind::Based as
+        // `offset` is interpreted differently for it, as we compute the real offset
+        // when a load is emitted, and using BAD here will make things blow up (rather
+        // than emit bad loads) on misuse.
         Location { base: Self::BAD, offset: location, kind: LocationKind::Rip, is_mutable, is_place: true }
     }
 
@@ -1260,7 +1262,7 @@ impl FatGen {
                 let offset = (to as isize) - (from as isize) - 1;
                 let offset = i32::try_from(offset).expect("function too large");
                 self.code[from].left = offset;
-                assert!(offset != 0, "zero offset {:?}", self.code[from].op);
+                debug_assert!(offset != 0, "zero offset {:?}", self.code[from].op);
             }
         }
         self.patches.clear();
@@ -1344,7 +1346,7 @@ impl FatGen {
                                     error!(self, 0, "argument 2 of ptr type must be a value expression")
                                 }
                             } else {
-                                // unbounded
+                                // unbound
                                 result = ctx.types.pointer(ty);
                             }
                         } else {
@@ -2190,7 +2192,7 @@ impl FatGen {
                 for case in cases {
                     let block_label = self.label();
                     labels.push(block_label);
-                    if let SwitchCaseData::Cases(_, exprs) = ctx.ast.switch_case(case) {
+                    if let SwitchCaseData::Cases(block, exprs) = ctx.ast.switch_case(case) {
                         for case_expr in exprs {
                             let expr = self.expr(ctx, case_expr);
                             if let Some(_ev) = expr.value {
@@ -2198,7 +2200,8 @@ impl FatGen {
                                     debug_assert_eq!(ty, Type::Bool);
                                     let expr_register = self.register(&expr);
                                     let matched = self.put3_inc(op, control_register, expr_register);
-                                    self.put_jump_nonzero(matched, block_label);
+                                    let label = if block.is_empty() { break_label } else { block_label };
+                                    self.put_jump_nonzero(matched, label);
                                 } else {
                                     error!(self, ctx.ast.expr_source_position(case_expr), "type mismatch between switch control ({}) and case ({})", ctx.type_str(control.ty), ctx.type_str(expr.ty))
                                 }
@@ -2212,16 +2215,18 @@ impl FatGen {
                 }
                 if let Some(label) = else_label {
                     self.put_jump(label);
+                } else {
+                    self.put_jump(break_label);
                 }
                 let mut first_block = true;
                 for (i, case) in cases.enumerate() {
-                    if !first_block {
-                        self.put_jump(break_label);
-                    }
                     let block = match ctx.ast.switch_case(case) {
                         SwitchCaseData::Cases(block, _) => block,
                         SwitchCaseData::Else(block) => block
                     };
+                    if !first_block && !block.is_empty() {
+                        self.put_jump(break_label);
+                    }
                     let block_label = labels[i];
                     self.patch(block_label);
                     let ret = self.stmts(ctx, block);
@@ -2232,8 +2237,8 @@ impl FatGen {
                         return_type = return_type.and(ret);
                     }
                 }
-                self.patch(break_label);
-                self.restore(gen_ctx);
+                    self.patch(break_label);
+                    self.restore(gen_ctx);
             }
             StmtData::Do(cond_expr, body_stmts) => {
                 let (break_label, continue_label, gen) = self.push_loop_context();
@@ -2463,7 +2468,7 @@ struct TypeStrFormatter<'a> {
 impl Display for TypeStrFormatter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         let info = self.ctx.types.info(self.ty);
-        let have_name = self.callable_name != Intern(0);
+        let have_name = info.name != Intern(0) || self.callable_name != Intern(0);
         let base_type = self.ctx.types.base_type(self.ty);
         let needs_parens = self.ctx.types.base_type(base_type) != base_type;
         match info.kind {
@@ -2858,42 +2863,6 @@ fn repl() {
 }
 
 fn main() {
-    let ok = [
-        (r#"
-        V2: struct (x: f32, y: f32);
-
-        dot: func (a: V2, b: V2) f32 {
-            return a.x*b.x + a.y*b.y;
-        }
-
-        main: proc () int {
-            return dot({ 1.0, 2.0 }, { 3.0, 4.0 }):i32;
-        }
-"#, Value::Int(1)),
-];
-    let err = [r#"
-b: int = a;
-a: int = b;
-}"#,r#"
-g: () int {
-    return a + 1;
-}
-b: int = g();
-a: int = 0;
-main: proc () -> int {
-    return b;
-}"#];
-    for test in ok.iter() {
-        let str = test.0;
-        let expect = test.1;
-        compile_and_run(str)
-            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
-            .map_err(|e| { println!("input: \"{}\"", str); e })
-            .unwrap();
-    }
-    for str in err.iter() {
-        compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
-    }
     repl();
 }
 
@@ -3295,7 +3264,34 @@ main: proc () int {
 "#, Value::Int(15)),
 (r#"
 main: proc () int {
-    a := 10;
+    a := 8;
+    switch (a) {
+        1 {}
+        8 { a = a + 2; }
+        3 {}
+    }
+    switch (a) {
+        1 {}
+        10 {}
+        3 { a = a + 2; }
+    }
+    switch (a) {
+        1 { a = a + 2; }
+        10 {}
+        3 {}
+    }
+    switch (a) {
+        1 {}
+        2 {}
+        3 { a = a + 2; }
+    }
+    // Emits jumps to the next instruction, which we debug assert against not emitting
+    // But this case doesn't matter, so...
+    // switch (a) {
+    //     1 {}
+    //     2 {}
+    //     3 {}
+    // }
     switch (a) {
         1 {}
         2, 3 {
@@ -3308,48 +3304,6 @@ main: proc () int {
     return 0;
 }
 "#, Value::Int(100)),
-(r#"
-main: proc () int {
-    a := 3.0;
-    b := 0;
-    switch (a) {
-        1.0 {
-            b = 0;
-        }
-        else {
-            b = 4;
-        }
-        2.0, 3.0 {
-            b = 1;
-        }
-        10.0 {
-            b = 100;
-        }
-    }
-    return b;
-}
-"#, Value::Int(1)),
-(r#"
-main: proc () int {
-    a := 3.0;
-    b := 0;
-    switch (a) {
-        1.0 {
-            b = 2;
-        }
-        else {
-            b = 4;
-        }
-        2.0 {
-            b = 1;
-        }
-        10.0 {
-            b = 100;
-        }
-    }
-    return b;
-}
-"#, Value::Int(4)),
 (r#"
 main: proc () int {
     a := 1;
@@ -3979,5 +3933,79 @@ main: proc () -> int {
     }
     for str in err.iter() {
         compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+    }
+}
+
+// cargo +nightly bench --features bench
+#[cfg(feature = "bench")]
+#[cfg(test)]
+mod bench {
+    extern crate test;
+    use test::Bencher;
+    use super::*;
+
+    #[bench]
+    fn bench(b: &mut test::Bencher) {
+        let fragment = r#"
+// _00 = prev
+// _01 = current
+Struct_01: struct (
+    field0: Struct_00,
+    field1: int,
+    ptr: ptr Struct_00,
+    arr: arr int [16]
+);
+
+g_01: int = 0;
+
+func_01: func (arg0: Struct_01, arg1: ptr Struct_00) -> int {
+    if (arg0.field1 > 0) {
+        for (i := arg0.field1; i !=  0; i = i - 1) {
+            switch (arg1.field1) {
+                0 { return arg0.field1; }
+                1 { return arg0.field1; }
+                2 { return arg0.field1; }
+                523 { return arg0.field1; }
+            }
+        }
+    }
+    return arg0.field1 + arg1.field1 + g_01;
+}
+
+proc_01: proc (arg: ptr Struct_00) -> int {
+    proc_00(&arg.field0);
+    return func_01({ *arg:Struct_00, 1, arg }, arg) + func_00(*arg, &{});
+}
+
+"#;
+        let mut code = String::from(r#"
+Struct0: (field0, field1: int);
+
+Struct1: struct (
+    field0: Struct0,
+    field1: int,
+    ptr: ptr Struct0,
+    arr: arr int [16]
+);
+
+g0: int = 0;
+
+func1: proc (arg0: Struct1, arg1: ptr Struct0) -> int {
+    return arg0.field1 + arg1.field1 + g0;
+}
+
+proc1: proc (arg: ptr Struct0) -> int {
+    return arg.field1;
+}
+
+"#);
+        for i in 2..2*1024 {
+            code.push_str(&fragment.replace("_00", &(i-1).to_string()).replace("_01", &i.to_string()));
+        }
+        b.bytes = code.len() as u64;
+        b.iter(|| {
+            let c = compile(&code).expect("ok");
+            test::black_box(&c);
+        });
     }
 }
