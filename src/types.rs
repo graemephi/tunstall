@@ -120,8 +120,8 @@ pub enum TypeKind {
 #[derive(Clone, Copy, Debug)]
 pub enum Bound {
     Constant(isize),
-    Offset(isize),
-    Indirect(isize, isize)
+    Reg(isize),
+    Based(isize, isize)
 }
 
 #[derive(Clone, Copy, Debug)]

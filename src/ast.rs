@@ -4,6 +4,7 @@ use std::fmt::Display;
 use crate::Intern;
 use crate::parse::TokenKind;
 use crate::parse::Keytype;
+use crate::debug_assert_implies;
 
 macro_rules! define_node_list {
     ($Node: ident, $List: ident, $ListIter: ident) => {
@@ -143,8 +144,59 @@ pub enum SwitchCaseData {
 pub struct Stmt(u32);
 define_node_list!(Stmt, StmtList, StmtListIter);
 
-// Todo: The For variant doubles this enum's size in memory. A tighter packing
-// can be done without requiring an API change to the AST.
+// Zero perf difference, half the size
+#[derive(Clone, Copy, Debug)]
+pub enum PackedStmtData {
+    Block(StmtList),
+    Return(Option<Expr>),
+    Break,
+    Continue,
+    If(Expr, Stmt, Stmt, Stmt),
+    IfElseIf(Expr, Stmt, Stmt, Stmt),
+    While(Expr, StmtList),
+    For000(StmtList),
+    For001(Stmt, StmtList),
+    For010(Expr, StmtList),
+    For011(Expr, Stmt, StmtList),
+    For100(Stmt, StmtList),
+    For101(Stmt, StmtList),
+    For110(Expr, Stmt, StmtList),
+    For111(Expr, Stmt, StmtList),
+    Switch(Expr, SwitchCaseList),
+    Do(Expr, StmtList),
+    Expr(Expr),
+    Assign(Expr, Expr),
+    VarDecl(TypeExpr, Expr, Expr)
+}
+
+impl PackedStmtData {
+    fn unpack(&self) -> StmtData {
+        use StmtData::*;
+        match *self {
+            PackedStmtData::Block(stmt_list)                                                    =>  Block(stmt_list),
+            PackedStmtData::Return(stmt)                                                        =>  Return(stmt),
+            PackedStmtData::Break                                                               =>  Break,
+            PackedStmtData::Continue                                                            =>  Continue,
+            PackedStmtData::IfElseIf(expr, Stmt(then_begin), Stmt(then_end), Stmt(elseif_end))  =>  If(expr, StmtList { begin: then_begin, end: then_end }, StmtList { begin: then_end + 1, end: elseif_end }),
+            PackedStmtData::If(expr, Stmt(then_begin), Stmt(else_begin), Stmt(else_end))        =>  If(expr, StmtList { begin: then_begin, end: else_begin }, StmtList { begin: else_begin, end: else_end }),
+            PackedStmtData::While(expr, stmt_list)                                              =>  While(expr, stmt_list),
+            PackedStmtData::For000(            stmt_list)                                       =>  For(None,                    None,       None,        stmt_list),
+            PackedStmtData::For001(      stmt, stmt_list)                                       =>  For(None,                    None,       Some(stmt),  stmt_list),
+            PackedStmtData::For010(expr,       stmt_list)                                       =>  For(None,                    Some(expr), None,        stmt_list),
+            PackedStmtData::For011(expr, stmt, stmt_list)                                       =>  For(None,                    Some(expr), Some(stmt),  stmt_list),
+            PackedStmtData::For100(      stmt, stmt_list)                                       =>  For(Some(stmt),   None,       None,                   stmt_list),
+            PackedStmtData::For101(      stmt, stmt_list)                                       =>  For(Some(stmt),   None,       Some(Stmt(stmt.0 + 1)), stmt_list),
+            PackedStmtData::For110(expr, stmt, stmt_list)                                       =>  For(Some(stmt),   Some(expr), None,                   stmt_list),
+            PackedStmtData::For111(expr, stmt, stmt_list)                                       =>  For(Some(stmt),   Some(expr), Some(Stmt(stmt.0 + 1)), stmt_list),
+            PackedStmtData::Switch(expr, switch_case_list)                                      =>  Switch(expr, switch_case_list),
+            PackedStmtData::Do(expr, stmt_list)                                                 =>  Do(expr, stmt_list),
+            PackedStmtData::Expr(expr)                                                          =>  Expr(expr),
+            PackedStmtData::Assign(left, right)                                                 =>  Assign(left, right),
+            PackedStmtData::VarDecl(type_expr, left, right)                                     =>  VarDecl(type_expr, left, right),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum StmtData {
     Block(StmtList),
@@ -159,6 +211,34 @@ pub enum StmtData {
     Expr(Expr),
     Assign(Expr, Expr),
     VarDecl(TypeExpr, Expr, Expr)
+}
+
+impl StmtData {
+    fn pack(&self) -> PackedStmtData {
+        use StmtData::*;
+        match *self {
+            Block(stmt_list)                                       => PackedStmtData::Block(stmt_list),
+            Return(stmt)                                           => PackedStmtData::Return(stmt),
+            Break                                                  => PackedStmtData::Break,
+            Continue                                               => PackedStmtData::Continue,
+            If(expr, then, elseif) if then.end + 1 == elseif.begin => PackedStmtData::IfElseIf(expr, Stmt(then.begin), Stmt(then.end), Stmt(elseif.end)),
+            If(expr, then, ellse)                                  => PackedStmtData::If(expr, Stmt(then.begin), Stmt(ellse.begin), Stmt(ellse.end)),
+            While(expr, stmt_list)                                 => PackedStmtData::While(expr, stmt_list),
+            For(None,      None,         None,       stmt_list)    => PackedStmtData::For000(            stmt_list),
+            For(None,      None,         Some(post), stmt_list)    => PackedStmtData::For001(      post, stmt_list),
+            For(None,      Some(expr),   None,       stmt_list)    => PackedStmtData::For010(expr,       stmt_list),
+            For(None,      Some(expr),   Some(post), stmt_list)    => PackedStmtData::For011(expr, post, stmt_list),
+            For(Some(pre),   None,       None,       stmt_list)    => PackedStmtData::For100(      pre,  stmt_list),
+            For(Some(pre),   None,       Some(_),    stmt_list)    => PackedStmtData::For101(      pre,  stmt_list),
+            For(Some(pre),   Some(expr), None,       stmt_list)    => PackedStmtData::For110(expr, pre,  stmt_list),
+            For(Some(pre),   Some(expr), Some(_),    stmt_list)    => PackedStmtData::For111(expr, pre,  stmt_list),
+            Switch(expr, switch_case_list)                         => PackedStmtData::Switch(expr, switch_case_list),
+            Do(expr, stmt_list)                                    => PackedStmtData::Do(expr, stmt_list),
+            Expr(expr)                                             => PackedStmtData::Expr(expr),
+            Assign(left, right)                                    => PackedStmtData::Assign(left, right),
+            VarDecl(type_expr, left, right)                        => PackedStmtData::VarDecl(type_expr, left, right),
+        }
+    }
 }
 
 /// A named declaration of a type, as in function parameters and
@@ -266,7 +346,7 @@ pub struct Ast {
     exprs: Vec<ExprData>,
     exprs_aux: Vec<ExprAux>,
     fields: Vec<CompoundFieldData>,
-    stmts: Vec<StmtData>,
+    stmts: Vec<PackedStmtData>,
     cases: Vec<SwitchCaseData>,
     items: Vec<ItemData>,
     decls: Vec<DeclData>,
@@ -362,16 +442,18 @@ impl Ast {
 
 
     pub fn stmt(&self, stmt: Stmt) -> StmtData {
-        self.stmts[stmt.0 as usize]
+        self.stmts[stmt.0 as usize].unpack()
     }
 
     fn push_stmt(&mut self, data: StmtData) -> Stmt {
-        let result = push_data(&mut self.stmts, data);
+        let result = push_data(&mut self.stmts, data.pack());
         Stmt(result)
     }
 
     pub fn push_stmts(&mut self, data: &[StmtData]) -> StmtList {
-        let (begin, end) = push_slice(&mut self.stmts, data);
+        let begin = u32::try_from(self.stmts.len()).expect("Program too big!");
+        self.stmts.extend(data.iter().map(|d| d.pack()));
+        let end = u32::try_from(self.stmts.len()).expect("Program too big!");
         StmtList { begin, end }
     }
 
@@ -391,11 +473,22 @@ impl Ast {
         self.push_stmt(StmtData::Continue)
     }
 
-    pub fn push_stmt_if(&mut self, cond: Expr, then_stmt: StmtList, else_stmt: StmtList) -> Stmt {
+    pub fn push_stmt_if(&mut self, cond: Expr, mut then_stmt: StmtList, mut else_stmt: StmtList) -> Stmt {
+        // Simplifies stmt packing
+        if then_stmt.is_empty() {
+            then_stmt = StmtList { begin: else_stmt.begin, end: else_stmt.begin };
+        }
+        if else_stmt.is_empty() {
+            else_stmt = StmtList { begin: then_stmt.end, end: then_stmt.end };
+        }
         self.push_stmt(StmtData::If(cond, then_stmt, else_stmt))
     }
 
     pub fn push_stmt_for(&mut self, pre: Option<Stmt>, cond: Option<Expr>, post: Option<Stmt>, body: StmtList) -> Stmt {
+        if let (Some(pre), Some(post)) = (pre, post) {
+            // Condition for stmt packing
+            debug_assert!(pre.0 + 1 == post.0);
+        }
         self.push_stmt(StmtData::For(pre, cond, post, body))
     }
 
@@ -426,7 +519,7 @@ impl Ast {
 
     pub fn pop_stmt(&mut self, stmt: Stmt) -> StmtData {
         debug_assert!(stmt.0 as usize == self.stmts.len() - 1);
-        self.stmts.remove(stmt.0 as usize)
+        self.stmts.remove(stmt.0 as usize).unpack()
     }
 
     pub fn switch_case(&self, case: SwitchCase) -> SwitchCaseData {

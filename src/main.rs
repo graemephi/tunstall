@@ -42,12 +42,14 @@ macro_rules! error {
     }}
 }
 
-#[allow(unused_macros)]
+
+#[macro_export]
 macro_rules! assert_implies {
     ($p:expr, $q:expr) => { assert!(!($p) || ($q)) }
 }
 
-#[allow(unused_macros)]
+
+#[macro_export]
 macro_rules! debug_assert_implies {
     ($p:expr, $q:expr) => { debug_assert!(!($p) || ($q)) }
 }
@@ -3211,7 +3213,8 @@ fn control_structures() {
 main: proc () int {
     a := 0;
     for (i := 0; i < 10; i = i + 1) {
-        a = a + 1;
+        a = a + 2;
+        a = a - 1;
     }
     return a;
 }
@@ -3325,6 +3328,24 @@ main: proc () int {
     return b;
 }"#, Value::Int(4)),
 (r#"
+fn: func (x: int) -> int {
+    if (x == 0) {
+        return 1;
+    } else if (x == 1) {
+        return 2;
+    } else if (x == 2) {
+        return 3;
+    }
+    return 0;
+}
+main: proc () int {
+    assert(fn(0) == 1);
+    assert(fn(1) == 2);
+    assert(fn(2) == 3);
+    assert(fn(3) == 0);
+    return 4;
+}"#, Value::Int(4)),
+(r#"
 inc: proc (p: ptr int) bool {
     *p = *p + 2;
     return 0;
@@ -3339,7 +3360,7 @@ main: proc () int {
         return v;
     }
     return 0;
-}"#, Value::Int(1))
+}"#, Value::Int(1)),
     ];
     for test in ok.iter() {
         let str = test.0;
