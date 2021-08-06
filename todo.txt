@@ -1,4 +1,5 @@
 split registers and stack for the vm--they can just be two stacks
+constant globals and no func write acesss
 
 V2: (x: f32, y: f32);
 

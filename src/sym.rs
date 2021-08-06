@@ -297,7 +297,7 @@ pub fn lookup_type_mut(ctx: &mut Compiler, name: Intern) -> Option<&mut Symbol> 
     ctx.symbols.get_mut(Kind::Type, name)
 }
 
-pub fn touch_type(ctx: &mut Compiler, name: Intern) -> Option<Type> {
+pub fn touch_type(ctx: &mut Compiler, name: Intern) -> Type {
     lookup_type_mut(ctx, name).map(|sym| (sym.state, sym.ty)).map(|(state, ty)| {
         if state == State::Declared {
             // We don't know what this is yet. But we don't have anything it could otherwise be (enum, union, ?).
@@ -309,6 +309,9 @@ pub fn touch_type(ctx: &mut Compiler, name: Intern) -> Option<Type> {
             assert!(ty != Type::None);
             ty
         }
+    }).unwrap_or_else(|| {
+        error!(ctx, 0, "could not find type '{}'", ctx.str(name));
+        Type::None
     })
 }
 

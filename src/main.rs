@@ -981,7 +981,7 @@ impl FatGen {
         debug_assert!(align.is_power_of_two());
         let result = align_up(self.reg_counter as usize, align) as isize;
         self.reg_counter = result + size as isize;
-        // todo: error if size does not fit on the stack
+        // Todo: error if size does not fit on the stack
         assert!(self.reg_counter < i32::MAX as isize);
         result
     }
@@ -998,7 +998,7 @@ impl FatGen {
             let right = i32::try_from(right).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 });
             self.code.push(FatInstr { op, dest, left, right });
         } else {
-            // todo: expr position
+            // Todo: expr position
             error!(self, 0, "non-constant expression");
         }
     }
@@ -1009,7 +1009,7 @@ impl FatGen {
             let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 });
             self.code.push(FatInstr { op, dest, left: unsafe { data.sint32.0 }, right: unsafe { data.sint32.1 }});
         } else {
-            // todo: expr position
+            // Todo: expr position
             error!(self, 0, "non-constant expression");
         }
     }
@@ -1205,7 +1205,7 @@ impl FatGen {
             self.labels.push(InstrLocation(!0));
             result
         } else {
-            // TODO: expr position
+            // Todo: expr position
             error!(self, 0, "non-constant expression");
             return Label(0);
         }
@@ -1286,9 +1286,7 @@ impl FatGen {
                 if name.0 == Keytype::Ptr as u32 {
                     result = Type::VoidPtr;
                 } else if ptr {
-                    result = sym::touch_type(ctx, name).unwrap_or_else(|| {
-                        error!(self, 0, "could not find type '{}'", ctx.str(name)); Type::None
-                    });
+                    result = sym::touch_type(ctx, name);
                 } else {
                     result = sym::resolve_type(ctx, name);
                 }
@@ -1300,13 +1298,13 @@ impl FatGen {
                     Some(Keytype::Arr) => {
                         let ty_expr = ctx.ast.type_expr_base_type(expr);
                         let len_expr = ctx.ast.type_expr_bound(expr);
-                        // todo: infer if ty_expr = None?
+                        // Todo: infer if ty_expr = None?
                         if let (Some(ty_expr), Some(len_expr)) = (ty_expr, len_expr) {
                             let ty = self.type_expr(ctx, ty_expr);
                             if let TypeExprData::Expr(len_expr) = *ctx.ast.type_expr(len_expr) {
                                 let len = self.constant_expr(ctx, len_expr);
                                 if len.ty.is_integer() && len.value.is_some() {
-                                    // TODO: This convert op is a roundabout way to check for the positive+fits condition
+                                    // Todo: This convert op is a roundabout way to check for the positive+fits condition
                                     // but should be more direct/less subtle
                                     if let Some(op) = convert_op(len.ty, Type::Int) {
                                         let value = apply_unary_op(op, len.value.unwrap());
@@ -1319,7 +1317,7 @@ impl FatGen {
                                         unreachable!();
                                     }
                                 } else {
-                                    // todo: type expr location
+                                    // Todo: type expr location
                                     error!(self, 0, "arr length must be a constant integer")
                                 }
                             } else {
@@ -1341,7 +1339,7 @@ impl FatGen {
                                     if bound.ty.is_integer() {
                                         todo!();
                                     } else {
-                                        // todo: type expr location
+                                        // Todo: type expr location
                                         error!(self, 0, "ptr bound must be an integer place")
                                     }
                                 } else {
@@ -1410,7 +1408,7 @@ impl FatGen {
                         }
                         result
                     } else {
-                        // TODO: Support more.complicated[0].paths
+                        // Todo: Support more.complicated[0].paths
                         error!(self, ctx.ast.expr_source_position(path), "bad path to struct field");
                         None
                     }
@@ -1609,7 +1607,7 @@ impl FatGen {
                     // Todo: check for duplicate fields. need to consider unions and fancy paths (both unimplemented)
                     let info = ctx.types.info(destination_type);
                     if matches!(info.kind, TypeKind::Struct|TypeKind::Array) {
-                        // TODO: We dump everything to the stack and copy over because we don't know yet
+                        // Todo: We dump everything to the stack and copy over because we don't know yet
                         // if the compound initializers are loading from the destination it is storing
                         // to. But this seems like a rare case to me, and we ought to be able to write
                         // directly to the destination in the common case, even without optimisations?
@@ -1717,7 +1715,7 @@ impl FatGen {
                                     let base = right.addr.offset;
                                     result.value_is_register = true;
                                     result.value = Some(base.into());
-                                    // todo: seems weird to be setting these with kind == None
+                                    // Todo: seems weird to be setting these with kind == None
                                     result.addr.is_mutable = right.addr.is_mutable;
                                     result.addr.is_place = right.addr.is_place;
                                 }
@@ -1926,7 +1924,7 @@ impl FatGen {
                         error!(self, ctx.ast.expr_source_position(callable), "{} arguments passed to {}, which takes {} arguments", args.len(), ctx.callable_str(ident(addr.value)), info.items.len() - 1);
                     }
                 } else {
-                    // TODO: get a string representation of the whole `callable` expr for nicer error message
+                    // Todo: get a string representation of the whole `callable` expr for nicer error message
                     error!(self, ctx.ast.expr_source_position(callable), "cannot call a {}", ctx.type_str(addr.ty));
                 }
             }
@@ -1992,17 +1990,18 @@ impl FatGen {
             debug_assert_implies!(result.ty != Type::None, result.value.is_some() || result.addr.kind != LocationKind::None);
         }
 
+        // Decay array to pointer
         if destination_type != Type::None {
             let result_info = ctx.types.info(result.ty);
             if destination_type.is_pointer()
             && result_info.kind == TypeKind::Array
             && result_info.base_type == ctx.types.base_type(destination_type) {
-                // Decay array to pointer
                 result.addr = Location::pointer(self.location_register(&result.addr), 0, result.addr.is_mutable);
                 result.ty = destination_type;
             }
         }
 
+        // Emit copy to destination and, if the copy changes the representation of an integer, update the type
         if destination_type != Type::None && dest.kind != LocationKind::None {
             let compatible = expr_integer_compatible_with_destination(&result, destination_type, dest);
             if compatible || ctx.types.annoying_deep_eq(destination_type, result.ty) {
@@ -2017,6 +2016,7 @@ impl FatGen {
             }
         }
 
+        // Emit jumps if the expression was for a control value (in if conditions, for example)
         if let Some(control) = control {
             if result.addr.kind != LocationKind::Control {
                 if result.ty == Type::Bool && control.true_to != control.false_to {
@@ -2089,7 +2089,7 @@ impl FatGen {
                 if self.return_type == Type::None {
                     self.put0(Op::Return);
                 } else {
-                    // TODO: stmt source position
+                    // Todo: stmt source position
                     error!(self, 0, "empty return, expected a return value of type {}", ctx.type_str(self.return_type));
                 }
             }
@@ -2097,7 +2097,7 @@ impl FatGen {
                 if let Some(label) = self.break_label() {
                     self.put_jump(label);
                 } else {
-                    // TODO: stmt source position
+                    // Todo: stmt source position
                     error!(self, 0, "break outside of loop/switch");
                 }
             }
@@ -2105,7 +2105,7 @@ impl FatGen {
                 if let Some(label) = self.continue_label() {
                     self.put_jump(label);
                 } else {
-                    // TODO: stmt source position
+                    // Todo: stmt source position
                     error!(self, 0, "continue outside of loop");
                 }
             }
@@ -2239,8 +2239,8 @@ impl FatGen {
                         return_type = return_type.and(ret);
                     }
                 }
-                    self.patch(break_label);
-                    self.restore(gen_ctx);
+                self.patch(break_label);
+                self.restore(gen_ctx);
             }
             StmtData::Do(cond_expr, body_stmts) => {
                 let (break_label, continue_label, gen) = self.push_loop_context();
@@ -2308,7 +2308,7 @@ impl FatGen {
                         }
                     }
                 } else {
-                    // todo: terrible error message
+                    // Todo: terrible error message
                     error!(self, ctx.ast.expr_source_position(left), "{} is not mutable", ctx.ast.expr(left));
                 }
             }
@@ -2474,7 +2474,7 @@ impl Display for TypeStrFormatter<'_> {
         let base_type = self.ctx.types.base_type(self.ty);
         let needs_parens = self.ctx.types.base_type(base_type) != base_type;
         match info.kind {
-            // todo: string of func signature, anonymous structs
+            // Todo: string of func signature, anonymous structs
             TypeKind::Callable if have_name   => write!(f, "{} {}", if info.mutable { "proc" } else { "func" }, self.ctx.str(self.callable_name)),
             TypeKind::Callable                => write!(f, "{}", if info.mutable { "proc" } else { "func" }),
             TypeKind::Struct if have_name     => write!(f, "{}", self.ctx.str(info.name)),
@@ -2830,7 +2830,7 @@ assert: func (condition: bool) int {
     for i in c.ip_start..c.code.len() {
         if let FatInstr { op: Op::Call, left: name, ..} = c.code[i] {
             let addr = c.funcs.get(&Intern(name as u32)).expect("Bad bytecode").addr;
-            c.code[i].left = i32::try_from(addr - 1).expect("todo: Data+code is larger than 2gb");
+            c.code[i].left = i32::try_from(addr - 1).expect("Todo: Data+code is larger than 2gb");
         }
     }
 
@@ -3966,7 +3966,7 @@ mod bench {
     use super::*;
 
     #[bench]
-    fn bench(b: &mut test::Bencher) {
+    fn compile(b: &mut test::Bencher) {
         let fragment = r#"
 // _00 = prev
 // _01 = current

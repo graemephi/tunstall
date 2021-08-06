@@ -4,7 +4,6 @@ use std::fmt::Display;
 use crate::Intern;
 use crate::parse::TokenKind;
 use crate::parse::Keytype;
-use crate::debug_assert_implies;
 
 macro_rules! define_node_list {
     ($Node: ident, $List: ident, $ListIter: ident) => {
@@ -224,14 +223,14 @@ impl StmtData {
             If(expr, then, elseif) if then.end + 1 == elseif.begin => PackedStmtData::IfElseIf(expr, Stmt(then.begin), Stmt(then.end), Stmt(elseif.end)),
             If(expr, then, ellse)                                  => PackedStmtData::If(expr, Stmt(then.begin), Stmt(ellse.begin), Stmt(ellse.end)),
             While(expr, stmt_list)                                 => PackedStmtData::While(expr, stmt_list),
-            For(None,      None,         None,       stmt_list)    => PackedStmtData::For000(            stmt_list),
-            For(None,      None,         Some(post), stmt_list)    => PackedStmtData::For001(      post, stmt_list),
-            For(None,      Some(expr),   None,       stmt_list)    => PackedStmtData::For010(expr,       stmt_list),
-            For(None,      Some(expr),   Some(post), stmt_list)    => PackedStmtData::For011(expr, post, stmt_list),
-            For(Some(pre),   None,       None,       stmt_list)    => PackedStmtData::For100(      pre,  stmt_list),
-            For(Some(pre),   None,       Some(_),    stmt_list)    => PackedStmtData::For101(      pre,  stmt_list),
-            For(Some(pre),   Some(expr), None,       stmt_list)    => PackedStmtData::For110(expr, pre,  stmt_list),
-            For(Some(pre),   Some(expr), Some(_),    stmt_list)    => PackedStmtData::For111(expr, pre,  stmt_list),
+            For(None,        None,         None,       stmt_list)  => PackedStmtData::For000(            stmt_list),
+            For(None,        None,         Some(post), stmt_list)  => PackedStmtData::For001(      post, stmt_list),
+            For(None,        Some(expr),   None,       stmt_list)  => PackedStmtData::For010(expr,       stmt_list),
+            For(None,        Some(expr),   Some(post), stmt_list)  => PackedStmtData::For011(expr, post, stmt_list),
+            For(Some(pre),   None,         None,       stmt_list)  => PackedStmtData::For100(      pre,  stmt_list),
+            For(Some(pre),   None,         Some(_),    stmt_list)  => PackedStmtData::For101(      pre,  stmt_list),
+            For(Some(pre),   Some(expr),   None,       stmt_list)  => PackedStmtData::For110(expr, pre,  stmt_list),
+            For(Some(pre),   Some(expr),   Some(_),    stmt_list)  => PackedStmtData::For111(expr, pre,  stmt_list),
             Switch(expr, switch_case_list)                         => PackedStmtData::Switch(expr, switch_case_list),
             Do(expr, stmt_list)                                    => PackedStmtData::Do(expr, stmt_list),
             Expr(expr)                                             => PackedStmtData::Expr(expr),
@@ -358,6 +357,18 @@ impl Ast {
         let mut result: Ast = Default::default();
         result.type_exprs.push(TypeExprData::Infer);
         result
+    }
+
+    #[allow(dead_code)]
+    pub fn size_in_bytes(&self) -> usize {
+          self.exprs.len()      * std::mem::size_of::<ExprData>()
+        + self.exprs_aux.len()  * std::mem::size_of::<ExprAux>()
+        + self.fields.len()     * std::mem::size_of::<CompoundFieldData>()
+        + self.stmts.len()      * std::mem::size_of::<PackedStmtData>()
+        + self.cases.len()      * std::mem::size_of::<SwitchCaseData>()
+        + self.items.len()      * std::mem::size_of::<ItemData>()
+        + self.decls.len()      * std::mem::size_of::<DeclData>()
+        + self.type_exprs.len() * std::mem::size_of::<TypeExprData>()
     }
 
     pub fn expr(&self, expr: Expr) -> ExprData {

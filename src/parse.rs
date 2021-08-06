@@ -929,6 +929,7 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn decl(&mut self) {
+        self.comment();
         let pos = self.pos();
         let name = self.name();
         if self.try_token(TokenKind::Colon).is_some() {
@@ -964,7 +965,6 @@ impl<'c, 'a> Parser<'_, '_> {
 pub fn parse(ctx: &mut Compiler, str: &str) {
     let mut parser = Parser::new(ctx, str);
     while !parser.is_eof() {
-        parser.comment();
         parser.decl();
     }
 }
