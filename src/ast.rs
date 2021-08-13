@@ -692,6 +692,13 @@ impl Ast {
         }
     }
 
+    pub fn type_expr_ptr_bound(&self, expr: TypeExpr) -> Option<TypeExpr> {
+        if let Some(Keytype::Ptr) = self.type_expr_keytype(expr) {
+            return self.type_expr_bound(expr);
+        }
+        None
+    }
+
     pub fn pop_type_expr(&mut self, expr: TypeExpr) -> TypeExprData {
         debug_assert!(expr.0 as usize == self.type_exprs.len() - 1);
         self.type_exprs.remove(expr.0 as usize)

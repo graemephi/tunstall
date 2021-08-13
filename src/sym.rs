@@ -8,11 +8,12 @@ use crate::Intern;
 
 use crate::eval_type;
 use crate::allocate_global_var;
+use crate::eval_item_bounds;
 
 use crate::error;
 
 use crate::ast::*;
-use crate::smallvec::*;
+use crate::types;
 use crate::parse::Keytype;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -133,29 +134,31 @@ fn find_first_duplicate(ast: &Ast, items: ItemList) -> Option<Intern> {
 
 fn resolve_callable(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
     ctx.symbols.resolving(Kind::Value, name, Type::None);
-    let mut decl_types = SmallVec::new();
     let kind = ctx.ast.type_expr_keytype(expr);
     let params = ctx.ast.type_expr_items(expr);
     let returns = ctx.ast.type_expr_returns(expr);
+    let ty = ctx.types.signature(TypeKind::Callable, kind == Some(Keytype::Proc));
     if let Some(Keytype::Func)|Some(Keytype::Proc) = kind {
         if let Some(params) = params {
             for param in params {
                 let item = ctx.ast.item(param);
-                let ty = eval_type(ctx, item.expr);
-                decl_types.push(ty);
+                let item_ty = eval_type(ctx, item.expr);
+                ctx.types.add_item_to_signature(ty, item_ty);
             }
 
             if let Some(returns) = returns {
                 let return_type = eval_type(ctx, returns);
-                decl_types.push(return_type);
+                ctx.types.add_item_to_signature(ty, return_type);
             } else {
-                decl_types.push(Type::None);
+                ctx.types.add_item_to_signature(ty, Type::None);
 
                 if let Some(Keytype::Func) = kind {
                     // todo: type expr pos
                     error!(ctx, 0, "func without return type");
                 }
             }
+
+            eval_item_bounds(ctx, ty, params);
             if let Some(dup) = find_first_duplicate(&ctx.ast, params) {
                 error!(ctx, 0, "duplicate parameter name {} in func {}", ctx.str(dup), ctx.str(name));
             }
@@ -165,7 +168,7 @@ fn resolve_callable(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol
     } else {
         panic!("non-callable type in callable decl");
     }
-    let ty = ctx.types.signature(TypeKind::Callable, &decl_types, kind == Some(Keytype::Proc));
+    let ty = ctx.types.complete(ty);
     ctx.symbols.resolved(Kind::Value, name, ty, 0)
 }
 
@@ -177,17 +180,19 @@ fn resolve_var(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
 }
 
 fn resolve_struct(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
-    let tentative_ty = ctx.types.next();
-    let ty = ctx.symbols.resolving(Kind::Type, name, tentative_ty);
-    if ty == tentative_ty {
-        ctx.types.strukt(name);
+    let tentative_ty = ctx.types.strukt(name);
+    let sym_ty = ctx.symbols.resolving(Kind::Type, name, Type::from(tentative_ty));
+    if sym_ty != tentative_ty {
+        ctx.types.sorry(tentative_ty);
     }
+    let ty = types::bare(sym_ty);
     if let Some(fields) = ctx.ast.type_expr_items(expr) {
         for field in fields {
             let item = ctx.ast.item(field);
             let item_type = eval_type(ctx, item.expr);
             ctx.types.add_item_to_type(ty, item.name, item_type);
         }
+        eval_item_bounds(ctx, ty, fields);
         if fields.len() == 0 {
             // todo: type expr pos
             error!(ctx, 0, "struct {} has no fields", ctx.str(name));
@@ -201,19 +206,20 @@ fn resolve_struct(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
     if ctx.ast.type_expr_len(expr) >= 3 {
         error!(ctx, 0, "struct {} has too many parameters for keytype struct", ctx.str(name));
     }
-    ctx.types.complete_type(ty);
+    let ty = ctx.types.complete(ty);
     ctx.symbols.resolved(Kind::Type, name, ty, 0)
 }
 
 pub fn resolve_anonymous_struct(ctx: &mut Compiler, fields: ItemList) -> Type {
     // Anonymous structs do not have a symbol, but we still have to resolve their fields.
-    let mut decl_types = SmallVec::new();
+    let ty = ctx.types.anonymous(TypeKind::Struct);
     if fields.is_nonempty() {
         for field in fields {
             let item = ctx.ast.item(field);
             let item_type = eval_type(ctx, item.expr);
-            decl_types.push((item.name, item_type));
+            ctx.types.add_item_to_type(ty, item.name, item_type);
         }
+        eval_item_bounds(ctx, ty, fields);
         if fields.len() == 0 {
             // todo: type expr pos
             error!(ctx, 0, "anonymous struct has no fields");
@@ -224,7 +230,7 @@ pub fn resolve_anonymous_struct(ctx: &mut Compiler, fields: ItemList) -> Type {
     } else {
         error!(ctx, 0, "anonymous struct has no fields");
     }
-    ctx.types.tuple(TypeKind::Struct, &decl_types)
+    ctx.types.complete(ty)
 }
 
 fn resolve(ctx: &mut Compiler, kind: Kind, name: Intern) -> Option<&Symbol> {
@@ -302,7 +308,7 @@ pub fn touch_type(ctx: &mut Compiler, name: Intern) -> Type {
         if state == State::Declared {
             // We don't know what this is yet. But we don't have anything it could otherwise be (enum, union, ?).
             assert!(ty == Type::None);
-            let ty = ctx.types.strukt(name);
+            let ty = ctx.types.strukt(name).into();
             ctx.symbols.touched(name, ty);
             ty
         } else {

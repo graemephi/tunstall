@@ -272,6 +272,12 @@ fn is_valid_identifier_character(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '\''
 }
 
+macro_rules! token_matches {
+    ($self: expr, $($kinds: pat)|+) => {
+        { $self.comment(); matches!($self.token.kind, $($kinds)|+) }
+    }
+}
+
 impl<'c, 'a> Parser<'_, '_> {
     fn new(ctx: &'c mut Compiler, str: &'a str) -> Parser<'c, 'a> {
         let mut result = Parser { ctx: ctx, str: str, p: str, token: Token::eof() };
@@ -387,11 +393,11 @@ impl<'c, 'a> Parser<'_, '_> {
         result
     }
 
-    fn is_eof(&self) -> bool {
-        self.token.kind == TokenKind::Eof
+    fn is_eof(&mut self) -> bool {
+        token_matches!(self, TokenKind::Eof)
     }
 
-    fn not(&self, kind: TokenKind) -> bool {
+    fn not(&mut self, kind: TokenKind) -> bool {
         !self.is_eof() && self.token.kind != kind
     }
 
@@ -454,13 +460,13 @@ impl<'c, 'a> Parser<'_, '_> {
     fn type_expr(&mut self, depth: isize) -> TypeExpr {
         use TokenKind::*;
         let mut list = SmallVecN::<_, 8>::new();
-        while matches!(self.token.kind, Name|LBracket|LParen|Arrow) {
+        while token_matches!(self, Name|LBracket|LParen|Arrow) {
             use TokenKind::*;
             let expr = match self.token.kind {
                 Name => {
                     let (p, token) = (self.p, self.token);
                     let name = self.name();
-                    if depth >= 1 && matches!(self.token.kind, Comma|Colon) {
+                    if depth >= 1 && token_matches!(self, Comma|Colon) {
                         // Roll back one token. Could be done "better" but eh
                         self.p = p;
                         self.token = token;
@@ -664,7 +670,7 @@ impl<'c, 'a> Parser<'_, '_> {
     fn mul_expr(&mut self) -> Expr {
         use TokenKind::*;
         let mut result = self.unary_expr();
-        while matches!(self.token.kind, Mul|Div|Mod|BitAnd|LShift|RShift) {
+        while token_matches!(self, Mul|Div|Mod|BitAnd|LShift|RShift) {
             let token = self.token;
             self.next_token();
             let right = self.unary_expr();
@@ -676,7 +682,7 @@ impl<'c, 'a> Parser<'_, '_> {
     fn add_expr(&mut self) -> Expr {
         use TokenKind::*;
         let mut result = self.mul_expr();
-        while matches!(self.token.kind, Add|Sub|BitOr|BitXor) {
+        while token_matches!(self, Add|Sub|BitOr|BitXor) {
             let token = self.token;
             self.next_token();
             let right = self.mul_expr();
@@ -688,7 +694,7 @@ impl<'c, 'a> Parser<'_, '_> {
     fn cmp_expr(&mut self) -> Expr {
         use TokenKind::*;
         let mut result = self.add_expr();
-        while matches!(self.token.kind, Lt|Gt|Eq|NEq|LtEq|GtEq) {
+        while token_matches!(self, Lt|Gt|Eq|NEq|LtEq|GtEq) {
             let token = self.token;
             self.next_token();
             let right = self.add_expr();
@@ -699,7 +705,7 @@ impl<'c, 'a> Parser<'_, '_> {
 
     fn and_expr(&mut self) -> Expr {
         let mut result = self.cmp_expr();
-        while matches!(self.token.kind, TokenKind::LogicAnd) {
+        while token_matches!(self, TokenKind::LogicAnd) {
             let token = self.token;
             self.next_token();
             let right = self.cmp_expr();
@@ -710,7 +716,7 @@ impl<'c, 'a> Parser<'_, '_> {
 
     fn or_expr(&mut self) -> Expr {
         let mut result = self.and_expr();
-        while matches!(self.token.kind, TokenKind::LogicOr) {
+        while token_matches!(self, TokenKind::LogicOr) {
             let token = self.token;
             self.next_token();
             let right = self.and_expr();
@@ -721,7 +727,7 @@ impl<'c, 'a> Parser<'_, '_> {
 
     fn ternary_expr(&mut self) -> Expr {
         let mut result = self.or_expr();
-        if matches!(self.token.kind, TokenKind::Question) {
+        if token_matches!(self, TokenKind::Question) {
             let token = self.token;
             self.token(TokenKind::Question);
             let left = self.expr();
@@ -912,7 +918,7 @@ impl<'c, 'a> Parser<'_, '_> {
 
     fn items(&mut self) -> ItemList {
         let mut items = SmallVec::new();
-        while self.token.kind == TokenKind::Name {
+        while token_matches!(self, TokenKind::Name) {
             let top = items.len();
             items.push(ItemData { name: self.name(), expr: TypeExpr(0) });
             while self.try_token(TokenKind::Comma).is_some() {
@@ -929,7 +935,6 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn decl(&mut self) {
-        self.comment();
         let pos = self.pos();
         let name = self.name();
         if self.try_token(TokenKind::Colon).is_some() {

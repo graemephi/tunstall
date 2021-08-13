@@ -345,6 +345,30 @@ impl RegValue {
             self.b8.0
         }
     }
+
+    fn to_nonnegative_isize(&self, ty: Type) -> Option<isize> {
+        // Todo: This convert op is a roundabout way to check for the
+        // positive+fits condition but should be more direct/less subtle.
+        // Really, a non-sign extended integer should never reach here, so this
+        // is superfluous, but putting it off
+        if let Some(op) = convert_op(ty, Type::Int) {
+            let value = apply_unary_op(op, *self);
+            if unsafe { value.sint } >= 0 {
+                return unsafe { Some(value.sint) };
+            }
+        }
+        None
+    }
+
+    fn to_positive_isize(&self, ty: Type) -> Option<isize> {
+        if let Some(op) = convert_op(ty, Type::Int) {
+            let value = apply_unary_op(op, *self);
+            if unsafe { value.sint } > 0 {
+                return unsafe { Some(value.sint) };
+            }
+        }
+        None
+    }
 }
 
 fn ident(value: Option<RegValue>) -> Intern {
@@ -431,11 +455,11 @@ pub enum Value {
 
 impl Value {
     fn from(reg: RegValue, ty: Type) -> Value {
-        match ty {
-            Type::U8|Type::U16|Type::U32|Type::U64 => unsafe { Value::UInt(reg.int) }
-            Type::F32  => unsafe { Value::F32(reg.float32.0) }
-            Type::F64  => unsafe { Value::F64(reg.float64) }
-            Type::Bool => unsafe { Value::Bool(reg.b8.0) }
+        match bare(ty) {
+            BareType::U8|BareType::U16|BareType::U32|BareType::U64 => unsafe { Value::UInt(reg.int) }
+            BareType::F32  => unsafe { Value::F32(reg.float32.0) }
+            BareType::F64  => unsafe { Value::F64(reg.float64) }
+            BareType::Bool => unsafe { Value::Bool(reg.b8.0) }
             _ => unsafe { Value::Int(reg.sint) }
         }
     }
@@ -469,12 +493,12 @@ impl From<Value> for RegValue {
 
 fn unary_op(op: parse::TokenKind, ty: Type) -> Option<(Op, Type)> {
     use parse::TokenKind;
-    match (op, integer_promote(ty)) {
-        (TokenKind::Sub,    Type::Int) => Some((Op::IntNeg, Type::Int)),
-        (TokenKind::BitNeg, Type::Int) => Some((Op::BitNeg, Type::Int)),
-        (TokenKind::Not,    _       )  => Some((Op::Not,    Type::Bool)),
-        (TokenKind::Sub,    Type::F32) => Some((Op::F32Neg, Type::F32)),
-        (TokenKind::Sub,    Type::F64) => Some((Op::F64Neg, Type::F64)),
+    match (op, bare(integer_promote(ty))) {
+        (TokenKind::Sub,    BareType::Int) => Some((Op::IntNeg, Type::Int)),
+        (TokenKind::BitNeg, BareType::Int) => Some((Op::BitNeg, Type::Int)),
+        (TokenKind::Not,    _            ) => Some((Op::Not,    Type::Bool)),
+        (TokenKind::Sub,    BareType::F32) => Some((Op::F32Neg, Type::F32)),
+        (TokenKind::Sub,    BareType::F64) => Some((Op::F64Neg, Type::F64)),
         _ => None
     }
 }
@@ -487,56 +511,56 @@ fn binary_op(op: parse::TokenKind, left: Type, right: Type) -> Option<(Op, Type)
     if left != right && !pointers {
         return None;
     }
-    match (op, left) {
-        (TokenKind::Add,      Type::Int) => Some((Op::IntAdd,  Type::Int)),
-        (TokenKind::Sub,      Type::Int) => Some((Op::IntSub,  Type::Int)),
-        (TokenKind::Mul,      Type::Int) => Some((Op::IntMul,  Type::Int)),
-        (TokenKind::Div,      Type::Int) => Some((Op::IntDiv,  Type::Int)),
-        (TokenKind::Mod,      Type::Int) => Some((Op::IntMod,  Type::Int)),
-        (TokenKind::BitNeg,   Type::Int) => Some((Op::BitNeg,  Type::Int)),
-        (TokenKind::BitAnd,   Type::Int) => Some((Op::BitAnd,  Type::Int)),
-        (TokenKind::BitOr,    Type::Int) => Some((Op::BitOr,   Type::Int)),
-        (TokenKind::BitXor,   Type::Int) => Some((Op::BitXor,  Type::Int)),
-        (TokenKind::LShift,   Type::Int) => Some((Op::LShift,  Type::Int)),
-        (TokenKind::RShift,   Type::Int) => Some((Op::RShift,  Type::Int)),
-        (TokenKind::GtEq,     Type::Int) => Some((Op::IntGtEq, Type::Bool)),
-        (TokenKind::Lt,       Type::Int) => Some((Op::IntLt,   Type::Bool)),
-        (TokenKind::Gt,       Type::Int) => Some((Op::IntGt,   Type::Bool)),
-        (TokenKind::Eq,       Type::Int) => Some((Op::IntEq,   Type::Bool)),
-        (TokenKind::NEq,      Type::Int) => Some((Op::IntNEq,  Type::Bool)),
-        (TokenKind::LtEq,     Type::Int) => Some((Op::IntLtEq, Type::Bool)),
+    match (op, bare(left)) {
+        (TokenKind::Add,      BareType::Int) => Some((Op::IntAdd,  Type::Int)),
+        (TokenKind::Sub,      BareType::Int) => Some((Op::IntSub,  Type::Int)),
+        (TokenKind::Mul,      BareType::Int) => Some((Op::IntMul,  Type::Int)),
+        (TokenKind::Div,      BareType::Int) => Some((Op::IntDiv,  Type::Int)),
+        (TokenKind::Mod,      BareType::Int) => Some((Op::IntMod,  Type::Int)),
+        (TokenKind::BitNeg,   BareType::Int) => Some((Op::BitNeg,  Type::Int)),
+        (TokenKind::BitAnd,   BareType::Int) => Some((Op::BitAnd,  Type::Int)),
+        (TokenKind::BitOr,    BareType::Int) => Some((Op::BitOr,   Type::Int)),
+        (TokenKind::BitXor,   BareType::Int) => Some((Op::BitXor,  Type::Int)),
+        (TokenKind::LShift,   BareType::Int) => Some((Op::LShift,  Type::Int)),
+        (TokenKind::RShift,   BareType::Int) => Some((Op::RShift,  Type::Int)),
+        (TokenKind::GtEq,     BareType::Int) => Some((Op::IntGtEq, Type::Bool)),
+        (TokenKind::Lt,       BareType::Int) => Some((Op::IntLt,   Type::Bool)),
+        (TokenKind::Gt,       BareType::Int) => Some((Op::IntGt,   Type::Bool)),
+        (TokenKind::Eq,       BareType::Int) => Some((Op::IntEq,   Type::Bool)),
+        (TokenKind::NEq,      BareType::Int) => Some((Op::IntNEq,  Type::Bool)),
+        (TokenKind::LtEq,     BareType::Int) => Some((Op::IntLtEq, Type::Bool)),
 
-        (TokenKind::LogicAnd, Type::Bool) => Some((Op::LogicAnd, Type::Bool)),
-        (TokenKind::LogicOr,  Type::Bool) => Some((Op::LogicOr,  Type::Bool)),
+        (TokenKind::LogicAnd, BareType::Bool) => Some((Op::LogicAnd, Type::Bool)),
+        (TokenKind::LogicOr,  BareType::Bool) => Some((Op::LogicOr,  Type::Bool)),
 
-        (TokenKind::Add,      Type::F32) => Some((Op::F32Add,  Type::F32)),
-        (TokenKind::Sub,      Type::F32) => Some((Op::F32Sub,  Type::F32)),
-        (TokenKind::Mul,      Type::F32) => Some((Op::F32Mul,  Type::F32)),
-        (TokenKind::Div,      Type::F32) => Some((Op::F32Div,  Type::F32)),
-        (TokenKind::Lt,       Type::F32) => Some((Op::F32Lt,   Type::Bool)),
-        (TokenKind::Gt,       Type::F32) => Some((Op::F32Gt,   Type::Bool)),
-        (TokenKind::Eq,       Type::F32) => Some((Op::F32Eq,   Type::Bool)),
-        (TokenKind::NEq,      Type::F32) => Some((Op::F32NEq,  Type::Bool)),
-        (TokenKind::LtEq,     Type::F32) => Some((Op::F32LtEq, Type::Bool)),
-        (TokenKind::GtEq,     Type::F32) => Some((Op::F32GtEq, Type::Bool)),
+        (TokenKind::Add,      BareType::F32) => Some((Op::F32Add,  Type::F32)),
+        (TokenKind::Sub,      BareType::F32) => Some((Op::F32Sub,  Type::F32)),
+        (TokenKind::Mul,      BareType::F32) => Some((Op::F32Mul,  Type::F32)),
+        (TokenKind::Div,      BareType::F32) => Some((Op::F32Div,  Type::F32)),
+        (TokenKind::Lt,       BareType::F32) => Some((Op::F32Lt,   Type::Bool)),
+        (TokenKind::Gt,       BareType::F32) => Some((Op::F32Gt,   Type::Bool)),
+        (TokenKind::Eq,       BareType::F32) => Some((Op::F32Eq,   Type::Bool)),
+        (TokenKind::NEq,      BareType::F32) => Some((Op::F32NEq,  Type::Bool)),
+        (TokenKind::LtEq,     BareType::F32) => Some((Op::F32LtEq, Type::Bool)),
+        (TokenKind::GtEq,     BareType::F32) => Some((Op::F32GtEq, Type::Bool)),
 
-        (TokenKind::Add,      Type::F64) => Some((Op::F64Add,  Type::F64)),
-        (TokenKind::Sub,      Type::F64) => Some((Op::F64Sub,  Type::F64)),
-        (TokenKind::Mul,      Type::F64) => Some((Op::F64Mul,  Type::F64)),
-        (TokenKind::Div,      Type::F64) => Some((Op::F64Div,  Type::F64)),
-        (TokenKind::Lt,       Type::F64) => Some((Op::F64Lt,   Type::Bool)),
-        (TokenKind::Gt,       Type::F64) => Some((Op::F64Gt,   Type::Bool)),
-        (TokenKind::Eq,       Type::F64) => Some((Op::F64Eq,   Type::Bool)),
-        (TokenKind::NEq,      Type::F64) => Some((Op::F64NEq,  Type::Bool)),
-        (TokenKind::LtEq,     Type::F64) => Some((Op::F64LtEq, Type::Bool)),
-        (TokenKind::GtEq,     Type::F64) => Some((Op::F64GtEq, Type::Bool)),
+        (TokenKind::Add,      BareType::F64) => Some((Op::F64Add,  Type::F64)),
+        (TokenKind::Sub,      BareType::F64) => Some((Op::F64Sub,  Type::F64)),
+        (TokenKind::Mul,      BareType::F64) => Some((Op::F64Mul,  Type::F64)),
+        (TokenKind::Div,      BareType::F64) => Some((Op::F64Div,  Type::F64)),
+        (TokenKind::Lt,       BareType::F64) => Some((Op::F64Lt,   Type::Bool)),
+        (TokenKind::Gt,       BareType::F64) => Some((Op::F64Gt,   Type::Bool)),
+        (TokenKind::Eq,       BareType::F64) => Some((Op::F64Eq,   Type::Bool)),
+        (TokenKind::NEq,      BareType::F64) => Some((Op::F64NEq,  Type::Bool)),
+        (TokenKind::LtEq,     BareType::F64) => Some((Op::F64LtEq, Type::Bool)),
+        (TokenKind::GtEq,     BareType::F64) => Some((Op::F64GtEq, Type::Bool)),
 
-        (TokenKind::GtEq, _)  if pointers => Some((Op::IntGtEq, Type::Bool)),
-        (TokenKind::Lt,   _)  if pointers => Some((Op::IntLt,   Type::Bool)),
-        (TokenKind::Gt,   _)  if pointers => Some((Op::IntGt,   Type::Bool)),
-        (TokenKind::Eq,   _)  if pointers => Some((Op::IntEq,   Type::Bool)),
-        (TokenKind::NEq,  _)  if pointers => Some((Op::IntNEq,  Type::Bool)),
-        (TokenKind::LtEq, _)  if pointers => Some((Op::IntLtEq, Type::Bool)),
+        (TokenKind::GtEq, _)  if pointers    => Some((Op::IntGtEq, Type::Bool)),
+        (TokenKind::Lt,   _)  if pointers    => Some((Op::IntLt,   Type::Bool)),
+        (TokenKind::Gt,   _)  if pointers    => Some((Op::IntGt,   Type::Bool)),
+        (TokenKind::Eq,   _)  if pointers    => Some((Op::IntEq,   Type::Bool)),
+        (TokenKind::NEq,  _)  if pointers    => Some((Op::IntNEq,  Type::Bool)),
+        (TokenKind::LtEq, _)  if pointers    => Some((Op::IntLtEq, Type::Bool)),
 
         _ => None
     }
@@ -550,7 +574,7 @@ fn is_address_computation(op: parse::TokenKind, left: Type, right: Type) -> bool
 fn is_offset_computation(ctx: &Compiler, op: parse::TokenKind, left: Type, right: Type) -> bool {
     use parse::TokenKind::*;
     // See... annoying
-    matches!(op, Sub) && left.is_pointer() && right.is_pointer() && ctx.types.annoying_deep_eq(left, right)
+    matches!(op, Sub) && left.is_pointer() && right.is_pointer() && ctx.types.annoying_deep_eq_ignoring_mutability(left, right)
 }
 
 fn convert_op(from: Type, to: Type) -> Option<Op> {
@@ -558,38 +582,38 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
     let op = if from == to {
         Op::Noop
     } else if from == Type::Int {
-        match to {
-            Type::Bool => Op::CmpZero,
-            Type::U8   => Op::MoveLower8,
-            Type::U16  => Op::MoveLower16,
-            Type::U32  => Op::MoveLower32,
-            Type::U64  => Op::Move,
-            Type::I8   => Op::MoveAndSignExtendLower8,
-            Type::I16  => Op::MoveAndSignExtendLower16,
-            Type::I32  => Op::MoveAndSignExtendLower32,
-            Type::I64  => Op::Move,
-            Type::F32  => Op::IntToFloat32,
-            Type::F64  => Op::IntToFloat64,
+        match bare(to) {
+            BareType::Bool => Op::CmpZero,
+            BareType::U8   => Op::MoveLower8,
+            BareType::U16  => Op::MoveLower16,
+            BareType::U32  => Op::MoveLower32,
+            BareType::U64  => Op::Move,
+            BareType::I8   => Op::MoveAndSignExtendLower8,
+            BareType::I16  => Op::MoveAndSignExtendLower16,
+            BareType::I32  => Op::MoveAndSignExtendLower32,
+            BareType::I64  => Op::Move,
+            BareType::F32  => Op::IntToFloat32,
+            BareType::F64  => Op::IntToFloat64,
             _ if to.is_pointer() => Op::Noop,
             _ => return None
         }
     } else if from.is_pointer() {
-        match to {
-            Type::U64|Type::I64|Type::Int => Op::Noop,
+        match bare(to) {
+            BareType::U64|BareType::I64|BareType::Int => Op::Noop,
             _ if to.is_pointer() => Op::Noop,
             _ => return None
         }
     } else if to.is_integer() {
-        match from {
-            Type::Bool => Op::Noop,
-            Type::F32  => Op::Float32ToInt,
-            Type::F64  => Op::Float64ToInt,
+        match bare(from) {
+            BareType::Bool => Op::Noop,
+            BareType::F32  => Op::Float32ToInt,
+            BareType::F64  => Op::Float64ToInt,
             _ => return None
         }
     } else {
-        match (from, to) {
-            (Type::F32, Type::F64) => Op::Float32To64,
-            (Type::F64, Type::F32) => Op::Float64To32,
+        match (bare(from), bare(to)) {
+            (BareType::F32, BareType::F64) => Op::Float32To64,
+            (BareType::F64, BareType::F32) => Op::Float64To32,
             _ => return None
         }
     };
@@ -597,27 +621,27 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
 }
 
 fn store_op(ty: Type) -> Option<Op> {
-    match ty {
-        Type::I8|Type::U8|Type::Bool            => Some(Op::Store8),
-        Type::I16|Type::U16                     => Some(Op::Store16),
-        Type::I32|Type::U32|Type::F32           => Some(Op::Store32),
-        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Store64),
-        _ if ty.is_pointer()                    => Some(Op::Store64),
+    match bare(ty) {
+        BareType::I8|BareType::U8|BareType::Bool                => Some(Op::Store8),
+        BareType::I16|BareType::U16                             => Some(Op::Store16),
+        BareType::I32|BareType::U32|BareType::F32               => Some(Op::Store32),
+        BareType::Int|BareType::I64|BareType::U64|BareType::F64 => Some(Op::Store64),
+        _ if ty.is_pointer()                                    => Some(Op::Store64),
         _ => None
     }
 }
 
 fn load_op(ty: Type) -> Option<Op> {
-    match ty {
-        Type::Bool                              => Some(Op::LoadBool),
-        Type::I8                                => Some(Op::LoadAndSignExtend8),
-        Type::I16                               => Some(Op::LoadAndSignExtend16),
-        Type::I32                               => Some(Op::LoadAndSignExtend32),
-        Type::U8                                => Some(Op::Load8),
-        Type::U16                               => Some(Op::Load16),
-        Type::U32|Type::F32                     => Some(Op::Load32),
-        Type::Int|Type::I64|Type::U64|Type::F64 => Some(Op::Load64),
-        _ if ty.is_pointer()                    => Some(Op::Load64),
+    match bare(ty) {
+        BareType::Bool                                          => Some(Op::LoadBool),
+        BareType::I8                                            => Some(Op::LoadAndSignExtend8),
+        BareType::I16                                           => Some(Op::LoadAndSignExtend16),
+        BareType::I32                                           => Some(Op::LoadAndSignExtend32),
+        BareType::U8                                            => Some(Op::Load8),
+        BareType::U16                                           => Some(Op::Load16),
+        BareType::U32|BareType::F32                             => Some(Op::Load32),
+        BareType::Int|BareType::I64|BareType::U64|BareType::F64 => Some(Op::Load64),
+        _ if ty.is_pointer()                                    => Some(Op::Load64),
         _ => None
     }
 }
@@ -749,7 +773,7 @@ impl Locals {
         self.assert_invariants();
         self.local_keys.iter()
             .rposition(|v| *v == ident)
-            .map(|i| unsafe { self.local_values.get_unchecked(i) })
+            .map(|i| &self.local_values[i])
     }
 
     fn push_scope(&mut self) -> usize {
@@ -770,13 +794,13 @@ impl Locals {
 
 fn value_fits(value: Option<RegValue>, ty: Type) -> bool {
     unsafe {
-        match (value, ty) {
-            (Some(value), Type::I8)  =>  i8::MIN as isize <= value.sint && value.sint <=  i8::MAX as isize,
-            (Some(value), Type::I16) => i16::MIN as isize <= value.sint && value.sint <= i16::MAX as isize,
-            (Some(value), Type::I32) => i32::MIN as isize <= value.sint && value.sint <= i32::MAX as isize,
-            (Some(value), Type::U8)  =>  u8::MIN as usize <= value.int  && value.int  <=  u8::MAX as usize,
-            (Some(value), Type::U16) => u16::MIN as usize <= value.int  && value.int  <= u16::MAX as usize,
-            (Some(value), Type::U32) => u32::MIN as usize <= value.int  && value.int  <= u32::MAX as usize,
+        match (value, bare(ty)) {
+            (Some(value), BareType::I8)  =>  i8::MIN as isize <= value.sint && value.sint <=  i8::MAX as isize,
+            (Some(value), BareType::I16) => i16::MIN as isize <= value.sint && value.sint <= i16::MAX as isize,
+            (Some(value), BareType::I32) => i32::MIN as isize <= value.sint && value.sint <= i32::MAX as isize,
+            (Some(value), BareType::U8)  =>  u8::MIN as usize <= value.int  && value.int  <=  u8::MAX as usize,
+            (Some(value), BareType::U16) => u16::MIN as usize <= value.int  && value.int  <= u16::MAX as usize,
+            (Some(value), BareType::U32) => u32::MIN as usize <= value.int  && value.int  <= u32::MAX as usize,
             _ => true
         }
     }
@@ -929,7 +953,9 @@ struct PathContext {
 enum CodeGenTarget {
     Func,
     Proc,
-    GlobalExpr
+    GlobalExpr,
+    TypeExpr,
+    TypeExprIgnoreBounds
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -946,7 +972,6 @@ struct FatGen {
     labels: Vec<InstrLocation>,
     patches: Vec<(Label, InstrLocation)>,
     return_type: Type,
-    constant: bool,
     target: CodeGenTarget,
     panic: Label,
     error: Option<Error>,
@@ -964,11 +989,14 @@ impl FatGen {
             labels: Vec::new(),
             patches: Vec::new(),
             return_type: Type::None,
-            constant: false,
             target: CodeGenTarget::Func,
             panic: Label(0),
             error: None,
         }
+    }
+
+    fn can_emit_code(&self) -> bool {
+        matches!(self.target, CodeGenTarget::Func|CodeGenTarget::Proc|CodeGenTarget::GlobalExpr)
     }
 
     fn error(&mut self, source_position: usize, msg: String) {
@@ -991,7 +1019,7 @@ impl FatGen {
     }
 
     fn put3(&mut self, op: Op, dest: isize, left: isize, right: isize) {
-        if self.constant == false {
+        if self.can_emit_code() {
             assert_implies!(requires_register_destination(op), (dest as usize & (Self::REGISTER_SIZE - 1)) == 0);
             let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 });
             let left = i32::try_from(left).unwrap_or_else(|_| { assert!(self.error.is_some()); 0 });
@@ -1004,7 +1032,7 @@ impl FatGen {
     }
 
     fn put(&mut self, op: Op, dest: isize, data: RegValue) {
-        if self.constant == false {
+        if self.can_emit_code() {
             assert_implies!(requires_register_destination(op), (dest as usize & (Self::REGISTER_SIZE - 1)) == 0);
             let dest = i32::try_from(dest).unwrap_or_else(|_| { error!(self, 0, "stack is limited to range addressable by i32"); 0 });
             self.code.push(FatInstr { op, dest, left: unsafe { data.sint32.0 }, right: unsafe { data.sint32.1 }});
@@ -1200,7 +1228,7 @@ impl FatGen {
     }
 
     fn label(&mut self) -> Label {
-        if self.constant == false {
+        if self.can_emit_code() {
             let result = Label(self.labels.len());
             self.labels.push(InstrLocation(!0));
             result
@@ -1271,14 +1299,18 @@ impl FatGen {
     }
 
     fn type_expr(&mut self, ctx: &mut Compiler, expr: TypeExpr) -> Type {
-        self.type_expr_(ctx, expr, false)
+        self.type_expr_really(ctx, expr, true, false)
     }
 
     fn type_expr_ptr(&mut self, ctx: &mut Compiler, expr: TypeExpr) -> Type {
-        self.type_expr_(ctx, expr, true)
+        self.type_expr_really(ctx, expr, false, true)
     }
 
-    fn type_expr_(&mut self, ctx: &mut Compiler, expr: TypeExpr, ptr: bool) -> Type {
+    fn type_expr_really(&mut self, ctx: &mut Compiler, expr: TypeExpr, outermost: bool, ptr: bool) -> Type {
+        let target = self.target;
+        if !matches!(self.target, CodeGenTarget::TypeExpr|CodeGenTarget::TypeExprIgnoreBounds) {
+            self.target = CodeGenTarget::TypeExpr;
+        }
         let mut result = Type::None;
         match *ctx.ast.type_expr(expr) {
             TypeExprData::Infer => unreachable!(),
@@ -1300,21 +1332,14 @@ impl FatGen {
                         let len_expr = ctx.ast.type_expr_bound(expr);
                         // Todo: infer if ty_expr = None?
                         if let (Some(ty_expr), Some(len_expr)) = (ty_expr, len_expr) {
-                            let ty = self.type_expr(ctx, ty_expr);
+                            let ty = self.type_expr_really(ctx, ty_expr, false, ptr);
                             if let TypeExprData::Expr(len_expr) = *ctx.ast.type_expr(len_expr) {
                                 let len = self.constant_expr(ctx, len_expr);
                                 if len.ty.is_integer() && len.value.is_some() {
-                                    // Todo: This convert op is a roundabout way to check for the positive+fits condition
-                                    // but should be more direct/less subtle
-                                    if let Some(op) = convert_op(len.ty, Type::Int) {
-                                        let value = apply_unary_op(op, len.value.unwrap());
-                                        if unsafe { value.sint } > 0 {
-                                            result = ctx.types.array(ty, unsafe { value.sint } as usize);
-                                        } else {
-                                            error!(self, 0, "arr length must be a positive integer and fit in a signed integer");
-                                        }
+                                    if let Some(value) = len.value.and_then(|v| v.to_positive_isize(len.ty)) {
+                                        result = ctx.types.array(ty, value as usize);
                                     } else {
-                                        unreachable!();
+                                        error!(self, 0, "arr length must be positive integer and fit in a signed integer");
                                     }
                                 } else {
                                     // Todo: type expr location
@@ -1334,16 +1359,41 @@ impl FatGen {
                         if let Some(ty_expr) = ctx.ast.type_expr_base_type(expr) {
                             let ty = self.type_expr_ptr(ctx, ty_expr);
                             if let Some(bound_expr) = ctx.ast.type_expr_bound(expr) {
-                                if let TypeExprData::Expr(bound_expr) = *ctx.ast.type_expr(bound_expr) {
-                                    let bound = self.constant_expr(ctx, bound_expr);
-                                    if bound.ty.is_integer() {
-                                        todo!();
+                                if !outermost {
+                                    error!(self, 0, "ptr bounds apply only to the outermost type");
+                                } else if self.target == CodeGenTarget::TypeExpr {
+                                    if let TypeExprData::Expr(bound_expr) = *ctx.ast.type_expr(bound_expr) {
+                                        let expr_result = self.constant_expr(ctx, bound_expr);
+                                        if expr_result.ty.is_integer() {
+                                            assert!(expr_result.value_is_register == false, "unimplemented/untested");
+                                            let mut bound = Bound::Constant(1);
+                                            match expr_result.value {
+                                                Some(v) => {
+                                                    if let Some(v) = v.to_nonnegative_isize(expr_result.ty) {
+                                                        bound = Bound::Constant(v)
+                                                    } else {
+                                                        // We could lift this restriction, but why?
+                                                        error!(ctx, 0, "constant ptr bounds must be nonnegative");
+                                                    }
+                                                }
+                                                None => match expr_result.addr.kind {
+                                                    LocationKind::None|LocationKind::Control => unreachable!(),
+                                                    LocationKind::Register => bound = Bound::FieldOffset(expr_result.addr.offset),
+                                                    LocationKind::Based => bound = Bound::FieldBased(expr_result.addr.base, expr_result.addr.offset),
+                                                    LocationKind::Rip => bound = Bound::Based(Location::IP_REGISTER, expr_result.addr.offset)
+                                                }
+                                            }
+                                            result = ctx.types.bound_pointer(ty, bound)
+                                        } else {
+                                            // Todo: type expr location
+                                            error!(self, 0, "ptr bound must be an integer")
+                                        }
                                     } else {
-                                        // Todo: type expr location
-                                        error!(self, 0, "ptr bound must be an integer place")
+                                        error!(self, 0, "argument 2 of ptr type must be a value expression")
                                     }
                                 } else {
-                                    error!(self, 0, "argument 2 of ptr type must be a value expression")
+                                    assert!(self.target == CodeGenTarget::TypeExprIgnoreBounds);
+                                    result = ctx.types.pointer(ty);
                                 }
                             } else {
                                 // unbound
@@ -1372,6 +1422,7 @@ impl FatGen {
                 }
             }
         }
+        self.target = target;
         result
     }
 
@@ -1431,16 +1482,8 @@ impl FatGen {
                 let index = unsafe { value.sint };
                 let offset = index * element_size as isize;
                 if base.ty.is_pointer() {
-                    if base.addr.offset == 0 {
-                        assert!(base.addr.kind == LocationKind::Based);
-                        let ptr = self.register(&base);
-                        let offset_reg = self.constant(offset.into());
-                        let base_reg = self.put3_inc(Op::IntAdd, ptr, offset_reg);
-                        Location::pointer(base_reg, 0, base.addr.is_mutable)
-                    } else {
-                        let ptr = self.register(&base);
-                        Location::pointer(ptr, offset, base.addr.is_mutable)
-                    }
+                    let ptr = self.register(&base);
+                    Location::pointer(ptr, offset, base.addr.is_mutable)
                 } else {
                     base.addr.offset_by(offset)
                 }
@@ -1487,11 +1530,10 @@ impl FatGen {
     fn constant_expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprResult {
         // This is kind of a hack to keep constant and non-constant expressions
         // totally unified while things are still incomplete
+        assert!(matches!(self.target, CodeGenTarget::TypeExpr|CodeGenTarget::TypeExprIgnoreBounds));
         let code_len = self.code.len();
         let labels_len = self.labels.len();
-        self.constant = true;
         let result = self.expr(ctx, expr);
-        self.constant = false;
         if let None = result.value {
             // This means the constant expr has not evaluated to a constant. But
             // it might have evaluated to a memory location that the compiler
@@ -1500,7 +1542,6 @@ impl FatGen {
         } else {
             debug_assert!(self.code.len() == code_len);
             debug_assert!(self.labels.len() == labels_len);
-            debug_assert!(result.addr.offset == Location::BAD);
         }
         result
     }
@@ -1662,7 +1703,7 @@ impl FatGen {
                         result.ty = item.ty;
                         if left.ty.is_immutable_pointer() {
                             result.addr.is_mutable = false;
-                            result.ty = ctx.types.immutable(result.ty);
+                            result.ty = result.ty.to_immutable();
                         }
                     } else {
                         error!(self, ctx.ast.expr_source_position(left_expr), "no field '{}' on type {}", ctx.str(field), ctx.type_str(left.ty));
@@ -1686,7 +1727,7 @@ impl FatGen {
                         result.ty = ctx.types.base_type(left.ty);
                         if left.ty.is_immutable_pointer() {
                             result.addr.is_mutable = false;
-                            result.ty = ctx.types.immutable(result.ty);
+                            result.ty = result.ty.to_immutable();
                         }
                     } else {
                         error!(self, ctx.ast.expr_source_position(index_expr), "index must be an integer (found {})", ctx.type_str(index.ty))
@@ -1743,7 +1784,7 @@ impl FatGen {
                             result.addr.is_place = true;
                             result.ty = ctx.types.base_type(right.ty);
                             if right.ty.is_immutable_pointer() {
-                                result.ty = ctx.types.immutable(result.ty);
+                                result.ty = result.ty.to_immutable();
                             }
                         } else {
                             error!(self, ctx.ast.expr_source_position(right_expr), "cannot dereference {}", ctx.type_str(right.ty));
@@ -1888,7 +1929,7 @@ impl FatGen {
                                 let info = ctx.types.info(addr.ty);
                                 let item = info.items[i];
                                 let gen = self.expr_with_destination_type(ctx, expr, item.ty);
-                                if !ctx.types.annoying_deep_eq(gen.ty, item.ty) {
+                                if !ctx.types.annoying_deep_eq_ignoring_mutability(gen.ty, item.ty) {
                                     error!(self, ctx.ast.expr_source_position(expr), "argument {} of {} is of type {}, found {}", i, ctx.callable_str(ident(addr.value)), ctx.type_str(item.ty), ctx.type_str(gen.ty));
                                     break;
                                 }
@@ -1960,7 +2001,7 @@ impl FatGen {
                         // We can send integer types back up the tree unmodified
                         // without doing the conversion here.
                     } else {
-                        result.ty = ctx.types.copy_mutability(to_ty, left.ty);
+                        result.ty = to_ty.with_mutability_of(left.ty);
                     }
                 } else if expression_transposable() {
                     // The cast-on-the-right synax doesn't work great with taking addresses.
@@ -2004,7 +2045,7 @@ impl FatGen {
         // Emit copy to destination and, if the copy changes the representation of an integer, update the type
         if destination_type != Type::None && dest.kind != LocationKind::None {
             let compatible = expr_integer_compatible_with_destination(&result, destination_type, dest);
-            if compatible || ctx.types.annoying_deep_eq(destination_type, result.ty) {
+            if compatible || ctx.types.annoying_deep_eq_ignoring_mutability(destination_type, result.ty) {
                 if result.addr != *dest {
                     self.copy(ctx, destination_type, dest, &result);
                     result.addr = *dest;
@@ -2363,8 +2404,7 @@ impl FatGen {
                 Location::pointer(reg, 0, false)
             };
             if is_func {
-                let const_ty = ctx.types.immutable(ty);
-                self.locals.insert(name, Local::argument(loc, const_ty));
+                self.locals.insert(name, Local::argument(loc, ty.to_immutable()));
             } else {
                 self.locals.insert(name, Local::argument(loc, ty));
             }
@@ -2423,6 +2463,7 @@ pub fn eval_type(ctx: &mut Compiler, ty: TypeExpr) -> Type {
     // but borrow checker doesn't like it if it lives on ctx, and I've thought
     // about it too long already
     let mut fg = ctx.fgs.pop().unwrap_or_else(|| FatGen::new(Vec::new()));
+    fg.target = CodeGenTarget::TypeExprIgnoreBounds;
     let result = fg.type_expr(ctx, ty);
     fg.error.take().map(|e| ctx.errors.push(e));
     ctx.fgs.push(fg);
@@ -2439,6 +2480,35 @@ pub fn allocate_global_var(ctx: &mut Compiler, ty: Type) -> isize {
     let result = align_up(top, alignment);
     ctx.data.resize_with(result+size, Default::default);
     result as isize
+}
+
+pub fn eval_item_bounds(ctx: &mut Compiler, ty: BareType, items: ast::ItemList) {
+    // Same song and dance as eval_type
+    let mut fg = ctx.fgs.pop().unwrap_or_else(|| FatGen::new(Vec::new()));
+    fg.target = CodeGenTarget::TypeExpr;
+
+    // Add struct fields as local variables.
+    let locals_mark = fg.locals.push_scope();
+    let item_names = items.map(|i| ctx.ast.item(i).name);
+    let item_info = ctx.types.info(ty.into()).items.iter();
+    for (name, info) in item_names.zip(item_info) {
+        // Not actually a register, but has the behaviour we want: field
+        // accesses get turned into Location::Based locations without
+        // generating code, so bounds can be more expressive. Could be
+        // made a bit more rigorous.
+        let loc = Location::register(info.offset as isize);
+        fg.locals.insert(name, Local::new(loc, info.ty));
+    }
+
+    for (i, item) in items.enumerate() {
+        let info = ctx.ast.item(item);
+        let item_ty = fg.type_expr(ctx, info.expr);
+        ctx.types.set_item_bound(ty, i, info.name, item_ty);
+    }
+
+    fg.error.take().map(|e| ctx.errors.push(e));
+    fg.locals.restore_scope(locals_mark);
+    ctx.fgs.push(fg);
 }
 
 fn position_to_line_column(str: &str, pos: usize) -> (usize, usize) {
@@ -2469,6 +2539,7 @@ struct TypeStrFormatter<'a> {
 
 impl Display for TypeStrFormatter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        let base = self.ctx.types.base_type(self.ty);
         let info = self.ctx.types.info(self.ty);
         let have_name = info.name != Intern(0) || self.callable_name != Intern(0);
         let base_type = self.ctx.types.base_type(self.ty);
@@ -2479,10 +2550,10 @@ impl Display for TypeStrFormatter<'_> {
             TypeKind::Callable                => write!(f, "{}", if info.mutable { "proc" } else { "func" }),
             TypeKind::Struct if have_name     => write!(f, "{}", self.ctx.str(info.name)),
             TypeKind::Struct                  => write!(f, "anonymous struct"),
-            TypeKind::Array if needs_parens   => write!(f, "arr ({}) [{}]", self.ctx.type_str(info.base_type), info.num_array_elements),
-            TypeKind::Array                   => write!(f, "arr {} [{}]", self.ctx.type_str(info.base_type), info.num_array_elements),
-            TypeKind::Pointer if needs_parens => write!(f, "ptr ({})", self.ctx.type_str(info.base_type)),
-            TypeKind::Pointer                 => write!(f, "ptr {}", self.ctx.type_str(info.base_type)),
+            TypeKind::Array if needs_parens   => write!(f, "arr ({}) [{}]", self.ctx.type_str(base), info.num_array_elements),
+            TypeKind::Array                   => write!(f, "arr {} [{}]", self.ctx.type_str(base), info.num_array_elements),
+            TypeKind::Pointer if needs_parens => write!(f, "ptr ({})", self.ctx.type_str(base)),
+            TypeKind::Pointer                 => write!(f, "ptr {}", self.ctx.type_str(base)),
             _ => self.ctx.str(info.name).fmt(f)
         }
     }
@@ -2666,7 +2737,6 @@ impl Compiler {
                     Op::F64LtEq    => { reg![dest].int = (reg![left].float64 <= reg![right].float64) as usize; }
                     Op::F64GtEq    => { reg![dest].int = (reg![left].float64 >= reg![right].float64) as usize; }
 
-                    // dest and left are aligned to register size
                     Op::MoveLower8               => { reg![dest].int       = reg![left].int8.0    as usize; }
                     Op::MoveLower16              => { reg![dest].int       = reg![left].int16.0   as usize; }
                     Op::MoveLower32              => { reg![dest].int       = reg![left].int32.0   as usize; }
@@ -2789,7 +2859,7 @@ assert: func (condition: bool) int {
         let info = c.types.info(sym.ty);
         if info.mutable
         && matches!(info.arguments(), Some(&[]))
-        && matches!(info.return_type(), Some(Type::Int)) {
+        && matches!(info.return_type().map(bare), Some(BareType::Int)) {
             // main's ok
             gen.code.extend_from_slice(&[FatInstr::call(main), FatInstr::HALT]);
         } else {
@@ -2818,7 +2888,7 @@ assert: func (condition: bool) int {
     let panic = c.intern("panic");
     if let Some(&panic_def) = sym::lookup_value(&c, panic) {
         let info = c.types.info(panic_def.ty);
-        assert!(matches!(info.arguments(), Some(&[])) && matches!(info.return_type(), Some(Type::Int)));
+        assert!(matches!(info.arguments(), Some(&[])) && matches!(info.return_type().map(bare), Some(BareType::Int)));
         let addr = gen.code.len();
         gen.code.push(FatInstr { op: Op::Panic, dest: 0, left: PanicReason::AssertionFailed as i32, right: 0});
         c.funcs.insert(panic, Code { signature: panic_def.ty, addr });
@@ -2961,6 +3031,8 @@ fn decls() {
         "V2: struct (x: f32, y: f32);",
         "V2: struct (x, y: f32);",
         "Node: struct (next: ptr Node, value: int);",
+        "Node: struct (children: arr (ptr Node) [2], value: int);",
+        "Node: struct (children: ptr (arr Node [2]), value: int);",
         "func: func (func, proc: int) int { return func + proc; }",
         "V1: struct (x: f32); V2: struct (x: V1, y: V1);",
         "struct: struct (struct: struct (struct: int));",
@@ -3957,6 +4029,47 @@ main: proc () -> int {
     }
 }
 
+#[test]
+fn bounds() {
+    let ok = [
+        (r#"
+Buf: (
+    buf: ptr u8 [len],
+    buf1: ptr u8 [buf[0]],
+    buf3: ptr u8 [*buf],
+    len: int,
+    cap: int
+);
+fn: func (p: ptr int [8], q: ptr int [*p]) -> int {
+    return *p + *q;
+}
+main: proc () -> int {
+    return 1;
+}"#, Value::Int(1)),
+];
+    let err = [r#"
+Buf: (
+    // Feels like we could in principle support this and more complicated accesses, but why?
+    buf: ptr u8 [buf[len]],
+    len: int,
+    cap: int
+);
+main: proc () -> int {
+    return 1;
+}"#];
+    for test in ok.iter() {
+        let str = test.0;
+        let expect = test.1;
+        compile_and_run(str)
+            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
+            .map_err(|e| { println!("input: \"{}\"", str); e })
+            .unwrap();
+    }
+    for str in err.iter() {
+        compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+    }
+}
+
 // cargo +nightly bench --features bench
 #[cfg(feature = "bench")]
 #[cfg(test)]
@@ -3981,7 +4094,7 @@ g_01: int = 0;
 
 func_01: func (arg0: Struct_01, arg1: ptr Struct_00) -> int {
     if (arg0.field1 > 0) {
-        for (i := arg0.field1; i !=  0; i = i - 1) {
+        for (i := arg0.field1; i != 0; i = i - 1) {
             switch (arg1.field1) {
                 0 { return arg0.field1; }
                 1 { return arg0.field1; }
