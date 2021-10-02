@@ -158,7 +158,7 @@ fn resolve_callable(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol
                 }
             }
 
-            eval_item_bounds(ctx, ty, params);
+            eval_item_bounds(ctx, ty, params, returns);
             if let Some(dup) = find_first_duplicate(&ctx.ast, params) {
                 error!(ctx, 0, "duplicate parameter name {} in func {}", ctx.str(dup), ctx.str(name));
             }
@@ -192,7 +192,7 @@ fn resolve_struct(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
             let item_type = eval_type(ctx, item.expr);
             ctx.types.add_item_to_type(ty, item.name, item_type);
         }
-        eval_item_bounds(ctx, ty, fields);
+        eval_item_bounds(ctx, ty, fields, None);
         if fields.len() == 0 {
             // todo: type expr pos
             error!(ctx, 0, "struct {} has no fields", ctx.str(name));
@@ -219,7 +219,7 @@ pub fn resolve_anonymous_struct(ctx: &mut Compiler, fields: ItemList) -> Type {
             let item_type = eval_type(ctx, item.expr);
             ctx.types.add_item_to_type(ty, item.name, item_type);
         }
-        eval_item_bounds(ctx, ty, fields);
+        eval_item_bounds(ctx, ty, fields, None);
         if fields.len() == 0 {
             // todo: type expr pos
             error!(ctx, 0, "anonymous struct has no fields");

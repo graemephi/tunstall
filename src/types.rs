@@ -2,6 +2,7 @@ use std::collections::hash_map::HashMap;
 use std::convert::TryFrom;
 
 use crate::Compiler;
+use crate::ast;
 use crate::Intern;
 use crate::hash;
 
@@ -45,11 +46,8 @@ pub fn builtins(ctx: &mut Compiler) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bound {
     Single,
-    Constant(isize),
-    FieldOffset(isize),
-    FieldBased(isize, isize),
-    Reg(isize),
-    Based(isize, isize),
+    Constant(usize),
+    Expr(ast::Expr)
 }
 
 impl Default for Bound {
@@ -88,7 +86,7 @@ impl BareType {
 
 #[derive(Copy, Clone, Default, Eq, Debug)]
 pub struct Type {
-    id: u32,
+    pub id: u32,
     pub bound: Bound
 }
 
@@ -104,18 +102,17 @@ impl PartialEq<BareType> for Type {
     }
 }
 
-impl From<BareType> for Type {
-    fn from(ty: BareType) -> Type {
-        Type { id: ty.id, bound: Bound::Single }
-    }
-}
-
 impl PartialEq<Type> for BareType {
     fn eq(&self, other: &Type) -> bool {
         self.id == other.id
     }
 }
 
+impl From<BareType> for Type {
+    fn from(ty: BareType) -> Type {
+        Type { id: ty.id, bound: Bound::Single }
+    }
+}
 
 #[allow(non_upper_case_globals)]
 impl Type {
@@ -260,6 +257,10 @@ impl TypeInfo {
             None
         }
     }
+
+    pub fn bare_return_type(&self) -> Option<BareType> {
+        self.return_type().map(bare)
+    }
 }
 
 pub struct Types {
@@ -395,7 +396,7 @@ impl Types {
         arr.alignment = alignment;
         arr.base_type = BareType { id: base_type.id };
         arr.num_array_elements = num_array_elements;
-        let ty = Type::from(ty);
+        let ty = Type { id: ty.id, bound: Bound::Constant(num_array_elements) };
         self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
         ty
     }
@@ -410,24 +411,26 @@ impl Types {
                 }
             }
         }
+
         // Make mutable and immutable variants of the pointer. This........ means we can
         // go to and from mutable and immutable pointers without a mutable reference to
         // self........
 
         // lowest friction way to achieve this but feels stupid. we want ty < imm_ty and
-        // ty on the odd index. dont even bother trying to use anything in the
-        // freelist, theres no point
+        // ty on the odd index. but entries in the freelist are probably not contiguous,
+        // and the easiest way to deal with that is to hide it from .make()
         let dont_use_this = std::mem::take(&mut self.freelist);
         let ty = self.make(TypeKind::Pointer);
         let immutable_ty = self.make(TypeKind::Pointer);
         let (ty, immutable_ty) = if ty.id & 1 == 0 {
+            self.freelist = dont_use_this;
             (ty, immutable_ty)
         } else {
             let shift = self.make(TypeKind::Pointer);
+            self.freelist = dont_use_this;
             self.sorry(ty);
             (immutable_ty, shift)
         };
-        self.freelist = dont_use_this;
         assert!((ty.id & Type::IMMUTABLE_BIT) == 0);
         assert!((immutable_ty.id & Type::IMMUTABLE_BIT) == Type::IMMUTABLE_BIT);
         assert!(ty.id + 1 == immutable_ty.id);
@@ -498,6 +501,8 @@ impl Types {
                     let info = self.info(result);
                     let other = self.info(other_ty);
                     if info.kind == other.kind && info.mutable == other.mutable && info.items.iter().eq(other.items.iter()) {
+                        // Deduplicate. Is this even worth doing? What if we
+                        // just define equality on hashes?
                         self.sorry(ty);
                         return other_ty;
                     }
@@ -509,22 +514,15 @@ impl Types {
     }
 
     pub fn annoying_deep_eq_ignoring_mutability(&self, a: Type, b: Type) -> bool {
-        // This is bad side of encoding mutability in the pointer type.
-        // We could do a kind of half-baked provenance thing while
-        // generating code, but I don't know else how to handle cases like
-        //
-        // a = mutable local ptr;
-        // b = immutable ptr from func args;
-        // ab: SomeStruct = { a, b };
-        // ab.a.v = ...; // allow
-        // ab.b.v = ...; // disallow
-        //
-        // without actual "analysis"
-        if a.is_pointer() && b.is_pointer() {
-            if a.to_mutable() == b.to_mutable() {
-                return true;
-            }
+        // We need to do this because const-ness is encoded in the type. This
+        // lets us catch some writes thru constant pointers without doing
+        // analysis, but can't catch all of them. SO: we can, and should, not do this,
+        // and also, there are currently programs permitted that shouldnt be
+        if a.to_mutable() == b.to_mutable() {
+            return true;
+        }
 
+        if a.is_pointer() && b.is_pointer() {
             let a_base = self.base_type(a);
             let b_base = self.base_type(b);
             assert!(a_base != a && b_base != b);
@@ -532,7 +530,7 @@ impl Types {
             return self.annoying_deep_eq_ignoring_mutability(a_base, b_base);
         }
 
-        a == b
+        false
     }
 
     pub fn types_match_with_promotion(&self, promotable: Type, other: Type) -> bool {
@@ -656,8 +654,8 @@ Ptr: struct (
     assert_eq!(ptr.items[3].ty, ptr_ptr);
     assert_eq!(ptr.items[0].ty.bound, Bound::Single);
     assert_eq!(ptr.items[1].ty.bound, Bound::Constant(2));
-    assert_eq!(ptr.items[2].ty.bound, Bound::FieldOffset(32));
-    assert_eq!(ptr.items[3].ty.bound, Bound::FieldBased(8, 4));
+    // assert_eq!(ptr.items[2].ty.bound, Bound::Offset(32));
+    // assert_eq!(ptr.items[3].ty.bound, Bound::Based(8, 4));
     assert_eq!(c.types.info(c.types.base_type(ptr_ptr)) as *const _, ptr as *const _);
 
     assert_eq!(padding.size, 24);

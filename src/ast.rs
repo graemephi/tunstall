@@ -73,7 +73,7 @@ pub struct CompoundFieldData {
     pub value: Expr
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Expr(u32);
 
 define_node_list!(Expr, ExprList, ExprListIter);
@@ -690,13 +690,6 @@ impl Ast {
             TypeExprData::List(_) => self.type_expr_index(expr, index),
             _ => None,
         }
-    }
-
-    pub fn type_expr_ptr_bound(&self, expr: TypeExpr) -> Option<TypeExpr> {
-        if let Some(Keytype::Ptr) = self.type_expr_keytype(expr) {
-            return self.type_expr_bound(expr);
-        }
-        None
     }
 
     pub fn pop_type_expr(&mut self, expr: TypeExpr) -> TypeExprData {

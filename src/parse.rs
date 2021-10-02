@@ -832,7 +832,7 @@ impl<'c, 'a> Parser<'_, '_> {
                 let expr = self.paren_expr();
                 let then_stmt = self.stmt_block();
                 let else_stmt = if self.try_keyword(Else).is_some() {
-                    if matches!(self.token.keyword, Some(If)) {
+                    if let Some(If) = self.token.keyword {
                         let stmt = self.stmt();
                         StmtList::from(stmt)
                     } else {
@@ -890,7 +890,7 @@ impl<'c, 'a> Parser<'_, '_> {
                 let mut cases = SmallVec::new();
                 let mut seen_else = false;
                 while self.not(RBrace) {
-                    if matches!(self.token.keyword, Some(Else)) {
+                    if let Some(Else) = self.token.keyword {
                         if seen_else {
                             parse_error!(self, "multiple else cases in switch")
                         } else {
