@@ -2619,14 +2619,12 @@ pub fn eval_item_bounds(ctx: &mut Compiler, ty: BareType, items: ast::ItemList, 
 
     // Add struct fields as local variables.
     let locals_mark = fg.locals.push_scope();
-    let item_names = items.map(|i| ctx.ast.item(i).name);
-    let item_info = ctx.types.info(ty.into()).items.iter();
-    for (name, info) in item_names.zip(item_info) {
+    for info in ctx.types.info(ty.into()).items.iter() {
         // Not actually a register, but has the behaviour we want: field
         // accesses get turned into Location::Based locations without
         // generating code, so bounds can be more expressive.
         let loc = Location::register(info.offset as isize);
-        fg.locals.insert(name, Local::new(loc, info.ty, 0));
+        fg.locals.insert(info.name, Local::new(loc, info.ty, 0));
     }
 
     for (i, item) in items.enumerate() {
@@ -2637,8 +2635,10 @@ pub fn eval_item_bounds(ctx: &mut Compiler, ty: BareType, items: ast::ItemList, 
 
     if let Some(returns) = returns {
         let item_ty = fg.type_expr(ctx, returns);
-        let i = ctx.types.info(ty.into()).items.len() - 1;
-        ctx.types.set_item_bound(ty, i, Intern(0), item_ty);
+        let items = &ctx.types.info(ty.into()).items;
+        let i = items.len() - 1;
+        let name = items[i].name;
+        ctx.types.set_item_bound(ty, i, name, item_ty);
     }
 
     fg.error.take().map(|e| ctx.errors.push(e));

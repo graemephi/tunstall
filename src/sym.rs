@@ -137,20 +137,21 @@ fn resolve_callable(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol
     let kind = ctx.ast.type_expr_keytype(expr);
     let params = ctx.ast.type_expr_items(expr);
     let returns = ctx.ast.type_expr_returns(expr);
-    let ty = ctx.types.signature(TypeKind::Callable, kind == Some(Keytype::Proc));
+    let ty = ctx.types.callable(name, kind == Some(Keytype::Proc));
+    let returns_str = ctx.intern("(returns)");
     if let Some(Keytype::Func)|Some(Keytype::Proc) = kind {
         if let Some(params) = params {
             for param in params {
                 let item = ctx.ast.item(param);
                 let item_ty = eval_type(ctx, item.expr);
-                ctx.types.add_item_to_signature(ty, item_ty);
+                ctx.types.add_item_to_type(ty, item.name, item_ty);
             }
 
             if let Some(returns) = returns {
                 let return_type = eval_type(ctx, returns);
-                ctx.types.add_item_to_signature(ty, return_type);
+                ctx.types.add_item_to_type(ty, returns_str, return_type);
             } else {
-                ctx.types.add_item_to_signature(ty, Type::None);
+                ctx.types.add_item_to_type(ty, returns_str, Type::None);
 
                 if let Some(Keytype::Func) = kind {
                     // todo: type expr pos

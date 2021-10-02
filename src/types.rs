@@ -347,8 +347,20 @@ impl Types {
         self.freelist.push(ty.id & !Type::POINTER_BIT);
     }
 
-    pub fn signature(&mut self, kind: TypeKind, mutable: bool) -> BareType {
-        let ty = self.make(kind);
+    pub fn callable(&mut self, name: Intern, mutable: bool) -> BareType {
+        #[cfg(debug_assertions)] {
+            let hash = hash(&(TypeKind::Callable, name));
+            if let Some(types) = self.type_by_hash.get(&hash) {
+                for &ty in types.iter() {
+                    let info = self.info(ty);
+                    if info.kind == TypeKind::Callable && info.name == name {
+                        panic!("callable made twice");
+                    }
+                }
+            }
+        }
+        let ty = self.make(TypeKind::Callable);
+        self.info_mut(ty).name = name;
         self.info_mut(ty).mutable = mutable;
         ty
     }
@@ -459,8 +471,15 @@ impl Types {
 
     pub fn add_item_to_type(&mut self, ty: BareType, name: Intern, item: Type) {
         let (size, alignment) = {
-            let item_info = self.info(item);
-            (item_info.size, item_info.alignment)
+            let ty_info = self.info_mut(ty);
+            match ty_info.kind {
+                TypeKind::Callable => (std::mem::size_of::<*const u8>(), std::mem::align_of::<*const u8>()),
+                TypeKind::Struct => {
+                    let item_info = self.info(item);
+                    (item_info.size, item_info.alignment)
+                },
+                _ => unreachable!()
+            }
         };
         let info = self.info_mut(ty);
         let offset = (info.size + (alignment - 1)) & !(alignment - 1);
@@ -470,19 +489,9 @@ impl Types {
         info.items.push(Item { name, ty: item, offset });
     }
 
-    pub fn add_item_to_signature(&mut self, ty: BareType, item: Type) {
-        let (size, alignment) = (std::mem::size_of::<*const u8>(), std::mem::align_of::<*const u8>());
-        let info = self.info_mut(ty);
-        let offset = (info.size + (alignment - 1)) & !(alignment - 1);
-        assert!(offset & !(alignment - 1) == offset);
-        info.size = offset + size;
-        info.alignment = info.alignment.max(alignment);
-        info.items.push(Item { name: Intern(0), ty: item, offset });
-    }
-
     pub fn set_item_bound(&mut self, ty: BareType, index: usize, name: Intern, type_with_bound: Type) {
         let info = self.info_mut(ty);
-        assert!(info.items[index].name == name || info.items[index].name == Intern(0));
+        assert!(info.items[index].name == name);
         assert!(info.items[index].ty.id == type_with_bound.id || type_with_bound == Type::None);
         info.items[index].ty = type_with_bound;
     }
@@ -495,12 +504,12 @@ impl Types {
         assert!(info.size as isize >= 0);
         let result = Type::from(ty);
         if info.name == Intern(0) {
-            let hash = hash(&(info.kind, info.mutable, &info.items));
+            let hash = hash(&(info.kind, &info.items));
             if let Some(types) = self.type_by_hash.get(&hash) {
                 for &other_ty in types.iter() {
                     let info = self.info(result);
                     let other = self.info(other_ty);
-                    if info.kind == other.kind && info.mutable == other.mutable && info.items.iter().eq(other.items.iter()) {
+                    if info.kind == other.kind && info.items.iter().eq(other.items.iter()) {
                         // Deduplicate. Is this even worth doing? What if we
                         // just define equality on hashes?
                         self.sorry(ty);
@@ -654,8 +663,8 @@ Ptr: struct (
     assert_eq!(ptr.items[3].ty, ptr_ptr);
     assert_eq!(ptr.items[0].ty.bound, Bound::Single);
     assert_eq!(ptr.items[1].ty.bound, Bound::Constant(2));
-    // assert_eq!(ptr.items[2].ty.bound, Bound::Offset(32));
-    // assert_eq!(ptr.items[3].ty.bound, Bound::Based(8, 4));
+    // assert_eq!(ptr.items[2].ty.bound, ???);
+    // assert_eq!(ptr.items[3].ty.bound, ???);
     assert_eq!(c.types.info(c.types.base_type(ptr_ptr)) as *const _, ptr as *const _);
 
     assert_eq!(padding.size, 24);
