@@ -735,11 +735,11 @@ fn apply_binary_op(op: Op, left: RegValue, right: RegValue) -> RegValue {
 struct Local {
     loc: Location,
     ty: Type,
-    mark: isize
+    mark: Mark
 }
 
 impl Local {
-    fn new(loc: Location, ty: Type, mark: isize) -> Local {
+    fn new(loc: Location, ty: Type, mark: Mark) -> Local {
         let mut loc = loc;
         loc.is_mutable = true;
         loc.is_place = true;
@@ -751,21 +751,37 @@ impl Local {
         debug_assert!(loc.is_mutable == false);
         loc.is_mutable = false;
         loc.is_place = true;
-        Local { loc, ty, mark: number_of_arguments }
+        Local { loc, ty, mark: Mark { mode: Mode::RestrictedScope, index: number_of_arguments }}
     }
+}
+
+
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+enum Mode {
+    All,
+    Type,
+    RestrictedScope,
+}
+impl Default for Mode { fn default() -> Mode { Mode::All }}
+
+
+#[derive(Clone, Copy, Eq, PartialEq, Default, Debug)]
+struct Mark {
+    mode: Mode,
+    index: isize
 }
 
 #[derive(Default)]
 struct Locals {
+    mark: Mark,
     local_values: Vec<Local>,
     local_keys: Vec<Intern>,
-    top_scope_index: isize,
 }
 
 impl Locals {
     fn assert_invariants(&self) {
         debug_assert!(self.local_keys.len() == self.local_values.len());
-        debug_assert!(self.top_scope_index <= self.local_values.len() as isize);
+        debug_assert!(self.mark.index <= self.local_values.len() as isize);
     }
 
     fn insert(&mut self, ident: Intern, local: Local) {
@@ -776,28 +792,67 @@ impl Locals {
 
     fn get(&self, ident: Intern) -> Option<&Local> {
         self.assert_invariants();
+        let start = if self.mark.mode == Mode::Type {
+            self.mark.index as usize
+        }  else {
+            0
+        };
+        let end = if self.mark.mode == Mode::RestrictedScope {
+            self.mark.index as usize
+        } else {
+            isize::MAX as usize
+        };
         self.local_keys.iter()
+            .take(end)
+            .skip(start)
             .rposition(|v| *v == ident)
-            .map(|i| &self.local_values[i])
+            .map(|i| &self.local_values[start + i])
     }
 
-    fn push_scope(&mut self) -> isize {
+    fn push_scope(&mut self) -> Mark {
         self.assert_invariants();
-        let result = self.top_scope_index;
-        self.top_scope_index = self.top();
+        let result = self.mark;
+        self.mark = self.top();
         result
     }
 
-    fn restore_scope(&mut self, mark: isize) {
+    fn push_type(&mut self, ctx: &Compiler, ty: Type, base: &Location) -> Mark {
         self.assert_invariants();
-        debug_assert!(mark <= self.top_scope_index);
-        self.local_values.truncate(self.top_scope_index as usize);
-        self.local_keys.truncate(self.top_scope_index as usize);
-        self.top_scope_index = mark;
+        let result = self.push_scope();
+        self.mark.mode = Mode::Type;
+        let number_of_fields = ctx.types.info(ty).items.len() as isize;
+        for info in ctx.types.info(ty).items.iter() {
+            let mut loc = base.offset_by(info.offset as isize);
+            loc.is_mutable = false;
+            self.insert(info.name, Local::argument(loc, info.ty, number_of_fields));
+        }
+        result
     }
 
-    fn top(&self) -> isize {
-        self.local_values.len() as isize
+    fn restore_scope(&mut self, mark: Mark) {
+        self.assert_invariants();
+        debug_assert!(mark.index <= self.mark.index);
+        self.local_values.truncate(self.mark.index as usize);
+        self.local_keys.truncate(self.mark.index as usize);
+        self.mark = mark;
+    }
+
+    fn restrict_to(&mut self, mark: Mark) -> Mark {
+        self.assert_invariants();
+        let result = self.mark;
+        assert!(mark.mode == Mode::All || mark.mode == Mode::RestrictedScope);
+        self.mark = Mark { mode: Mode::RestrictedScope, ..mark };
+        result
+    }
+
+    fn clear_restriction(&mut self, mark: Mark) {
+        self.assert_invariants();
+        debug_assert!(mark.index <= self.mark.index);
+        self.mark = mark;
+    }
+
+    fn top(&self) -> Mark {
+        Mark { mode: Mode::All, index: self.local_values.len() as isize }
     }
 }
 
@@ -850,7 +905,7 @@ pub struct Location {
 }
 
 impl Location {
-    const BAD: isize = isize::MAX;
+    const BAD: isize = isize::MIN;
     const RETURN_REGISTER: isize = 0;
     const RETURN_ADDRESS_REGISTER: isize = 1 * FatGen::REGISTER_SIZE as isize;
     const FP_REGISTER: isize = 2 * FatGen::REGISTER_SIZE as isize;
@@ -883,9 +938,9 @@ impl Location {
 
     fn rip(location: isize, is_mutable: bool) -> Location {
         // Morally, base is Self::IP_REGISTER. But we don't use LocationKind::Based as
-        // `offset` is interpreted differently for it, as we compute the real offset
-        // when a load is emitted, and using BAD here will make things blow up (rather
-        // than emit bad loads) on misuse.
+        // `offset` is interpreted differently for it, as we only know the value of RIP
+        // when we actually emit code to acess this location. Using BAD here will make
+        // things blow up (rather than emit bad loads) on misuse.
         Location { base: Self::BAD, offset: location, kind: LocationKind::Rip, is_mutable, is_place: true }
     }
 
@@ -894,7 +949,6 @@ impl Location {
     }
 
     fn offset_by(&self, offset: isize) -> Location {
-        debug_assert_implies!(offset > 0, matches!(self.kind, LocationKind::Based|LocationKind::Rip));
         let mut result = *self;
         result.offset += offset;
         result
@@ -905,27 +959,52 @@ impl Location {
 enum EvaluatedBound {
     Unconditional,
     Constant(RegValue),
-    Location(Location)
-}
-
-#[derive(Clone, Copy, Debug)]
-enum EvaluatedIndex {
-    Constant(RegValue),
-    Location(Location)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BoundIndex {
-    bound: EvaluatedBound,
-    index: EvaluatedIndex,
+    Register(isize)
 }
 
 #[derive(Clone, Copy, Debug)]
 enum BoundContext {
     None,
-    LocalsMark(isize),
+    Mark(Mark),
     Type(Type, Location),
-    Evaluated(BoundIndex)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Destination {
+    addr: Location,
+    bound_context: BoundContext,
+    ty: Type,
+    deferred_bounds_checks: bool
+}
+
+impl Destination {
+    fn none() -> Destination {
+        Destination { ty: Type::None, addr: Location::none(), bound_context: BoundContext::None, deferred_bounds_checks: false }
+    }
+
+    fn for_type(ty: Type, mark: Mark) -> Destination {
+        Destination { ty, addr: Location::none(), bound_context: BoundContext::Mark(mark), deferred_bounds_checks: false }
+    }
+
+    fn for_location(ty: Type, addr: Location) -> Destination {
+        Destination { ty, addr, bound_context: BoundContext::None, deferred_bounds_checks: false }
+    }
+
+    fn for_item(ty: Type) -> Destination {
+        Destination { ty, addr: Location::none(), bound_context: BoundContext::None, deferred_bounds_checks: true }
+    }
+
+    fn for_item_with_location(ty: Type, addr: Location) -> Destination {
+        Destination { ty, addr, bound_context: BoundContext::None, deferred_bounds_checks: true }
+    }
+
+    fn for_return_type(ty: Type, bound_context: BoundContext) -> Destination {
+        Destination { ty, addr: Location::ret(ty.is_basic()), bound_context, deferred_bounds_checks: false }
+    }
+
+    fn of_expr_result(e: &ExprResult) -> Destination {
+        Destination { ty: e.ty, addr: e.addr, bound_context: e.bound_context, deferred_bounds_checks: false }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -933,6 +1012,7 @@ struct ExprResult {
     addr: Location,
     bound_context: BoundContext,
     ty: Type,
+    expr: Expr,
     value_is_register: bool,
     value: Option<RegValue>,
 }
@@ -997,8 +1077,9 @@ enum CodeGenTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PanicReason {
+    AssertionFailed,
     GlobalNotInitialized,
-    AssertionFailed
+    IndexOutOfBounds
 }
 
 struct FatGen {
@@ -1008,10 +1089,14 @@ struct FatGen {
     jmp: JumpContext,
     labels: Vec<InstrLocation>,
     patches: Vec<(Label, InstrLocation)>,
+    generating_code_for: Type,
     return_type: Type,
+    arguments_location: Location,
+    arguments_mark: Mark,
     target: CodeGenTarget,
-    panic: Label,
+    panics: Vec<(Label, PanicReason)>,
     error: Option<Error>,
+    type_expr_evaluation_incomplete: bool,
 }
 
 impl FatGen {
@@ -1025,10 +1110,14 @@ impl FatGen {
             jmp: JumpContext::default(),
             labels: Vec::new(),
             patches: Vec::new(),
+            generating_code_for: Type::None,
             return_type: Type::None,
+            arguments_location: Location::none(),
+            arguments_mark: Mark::default(),
             target: CodeGenTarget::Func,
-            panic: Label(0),
+            panics: Vec::new(),
             error: None,
+            type_expr_evaluation_incomplete: false,
         }
     }
 
@@ -1344,7 +1433,7 @@ impl FatGen {
     }
 
     fn type_expr_really(&mut self, ctx: &mut Compiler, expr: TypeExpr, outermost: bool, ptr: bool) -> Type {
-        let target = self.target;
+        let stashed_target = self.target;
         if !matches!(self.target, CodeGenTarget::TypeExpr|CodeGenTarget::TypeExprIgnoreBounds) {
             self.target = CodeGenTarget::TypeExpr;
         }
@@ -1428,6 +1517,7 @@ impl FatGen {
                                 } else {
                                     assert!(self.target == CodeGenTarget::TypeExprIgnoreBounds);
                                     result = ctx.types.pointer(ty);
+                                    result.bound = Bound::Compiling;
                                 }
                             } else {
                                 // unbound
@@ -1456,7 +1546,7 @@ impl FatGen {
                 }
             }
         }
-        self.target = target;
+        self.target = stashed_target;
         result
     }
 
@@ -1509,30 +1599,87 @@ impl FatGen {
     }
 
     fn bound(&mut self, ctx: &mut Compiler, bound: Bound, bound_context: &BoundContext) -> EvaluatedBound {
+        if let Bound::Compiling = bound {
+            assert!(matches!(self.target, CodeGenTarget::TypeExpr|CodeGenTarget::TypeExprIgnoreBounds));
+            self.type_expr_evaluation_incomplete = true;
+        }
+        if let BoundContext::None = bound_context {
+            return EvaluatedBound::Unconditional;
+        }
+
         match bound {
-            Bound::Single => EvaluatedBound::Unconditional,
+            Bound::Compiling => EvaluatedBound::Unconditional,
+            Bound::Single => EvaluatedBound::Constant(1.into()),
             Bound::Constant(n) => EvaluatedBound::Constant(n.into()),
-            Bound::Expr(expr) => {
-                match bound_context {
-                    BoundContext::None => {
-                        todo!()
-                    },
-                    BoundContext::LocalsMark(mark) => {
-                        todo!()
-                    },
-                    BoundContext::Type(ty, addr) => {
-                        todo!()
-                    }
-                    BoundContext::Evaluated(_) => {
-                        todo!()
-                    }
+            Bound::Expr(expr) => match bound_context {
+                BoundContext::None => unreachable!(),
+                &BoundContext::Mark(mark) => {
+                    let restriction = self.locals.restrict_to(mark);
+                    let bound = self.expr(ctx, expr);
+                    assert!(bound.value.is_none());
+                    self.locals.clear_restriction(restriction);
+                    EvaluatedBound::Register(self.register(&bound))
+                },
+                BoundContext::Type(ty, addr) => {
+                    let mark = if ty.is_pointer() {
+                        let base_ty = ctx.types.base_type(*ty);
+                        let base_addr = Location::pointer(self.location_register(&addr), 0, false);
+                        self.locals.push_type(ctx, base_ty, &base_addr)
+                    } else {
+                        self.locals.push_type(ctx, *ty, addr)
+                    };
+                    let bound = self.expr(ctx, expr);
+                    assert!(bound.value.is_none());
+                    self.locals.restore_scope(mark);
+                    EvaluatedBound::Register(self.register(&bound))
                 }
             }
         }
     }
 
-    fn bounds_check(&mut self, index_register: isize, bound_register: isize) {
+    fn destination_bounds_check(&mut self, ctx: &mut Compiler, destination: &Destination, expr: &ExprResult) {
+        match destination.ty.bound {
+            Bound::Compiling => unreachable!(),
+            Bound::Single => (),
+            Bound::Constant(dest_n) => {
+                match self.bound(ctx, expr.ty.bound, &expr.bound_context) {
+                    EvaluatedBound::Unconditional => (),
+                    EvaluatedBound::Constant(v) => {
+                        let expr_n = unsafe { v.int };
+                        if dest_n > expr_n {
+                            error!(self, ctx.ast.expr_source_position(expr.expr), "bounds do not match: have {}, but destination wants {}", ctx.type_str(expr.ty), ctx.type_str(destination.ty))
+                        }
+                    }
+                    EvaluatedBound::Register(bound_register) => {
+                        let dest = self.constant(dest_n.into());
+                        let src = bound_register;
+                        let in_bounds = self.put3_inc(Op::IntLtEq, dest, src);
+                        self.assert(in_bounds, PanicReason::IndexOutOfBounds);
+                    }
+                }
+            }
+            Bound::Expr(_) => {
+                let dest = match self.bound(ctx, destination.ty.bound, &destination.bound_context) {
+                    EvaluatedBound::Unconditional => unreachable!(),
+                    EvaluatedBound::Constant(v) => self.constant(v),
+                    EvaluatedBound::Register(bound_register) => bound_register,
+                };
+                let src = match self.bound(ctx, expr.ty.bound, &expr.bound_context) {
+                    EvaluatedBound::Unconditional => unreachable!(),
+                    EvaluatedBound::Constant(v) => self.constant(v),
+                    EvaluatedBound::Register(bound_register) => bound_register,
+                };
+                let in_bounds = self.put3_inc(Op::IntLtEq, dest, src);
+                self.assert(in_bounds, PanicReason::IndexOutOfBounds);
+            }
+        }
+    }
 
+    fn bounds_check(&mut self, index_register: isize, bound_register: isize) {
+        if self.can_emit_code() {
+            let in_bounds = self.put3_inc(Op::IntLt, index_register, bound_register);
+            self.assert(in_bounds, PanicReason::IndexOutOfBounds);
+        }
     }
 
     fn compute_address(&mut self, ctx: &mut Compiler, base: &ExprResult, index: &ExprResult, bound_context: &BoundContext) -> Location {
@@ -1553,12 +1700,11 @@ impl FatGen {
                             error!(self, 0, "index is less than zero. array accesses using [] must be non-negative");
                         } else if !(index < bound) {
                             // todo: index position and text representation
-                            error!(self, 0, "constant index is out of bound")
+                            error!(self, 0, "constant index {} is out of bound {}", index, bound)
                         }
                     },
-                    EvaluatedBound::Location(addr) => {
+                    EvaluatedBound::Register(bound_register) => {
                         let index_register = self.constant(value);
-                        let bound_register = self.location_register(&addr);
                         self.bounds_check(index_register, bound_register);
                     }
                 }
@@ -1578,8 +1724,7 @@ impl FatGen {
                         let bound_register = self.constant(value);
                         self.bounds_check(index_register, bound_register);
                     },
-                    EvaluatedBound::Location(addr) => {
-                        let bound_register = self.location_register(&addr);
+                    EvaluatedBound::Register(bound_register) => {
                         self.bounds_check(index_register, bound_register);
                     }
                 }
@@ -1623,19 +1768,20 @@ impl FatGen {
     fn constant_expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprResult {
         // This is kind of a hack to keep constant and non-constant expressions
         // totally unified while things are still incomplete
-
+        //
         // Constant expressions will not emit code when evaluated here for type
         // checking, but may be evaluated later in a non-constant context where
         // they can emit code. For example
         //      len := 3;
-        //      p: ptr char [len + 1] = ...;
+        //      p: ptr u8 [len + 1] = ...;
         // When generating code for the declaration of p, we don't emit code to
         // compute len + 1, but when p is accessed and bound checked, we will.
         //
         // But we don't track whether this re-evaluation is necessary. So,
         // calling code can't trust the ExprResult to have a valid location that
-        // can be used for codegen. We don't use constant expressions for
-        // anything but type exprs, which don't do that, yet.
+        // can be used for codegen. But currently we don't use constant
+        // expressions for anything but type exprs, which don't use ExprResult
+        // locations that way.
         assert!(matches!(self.target, CodeGenTarget::TypeExpr|CodeGenTarget::TypeExprIgnoreBounds));
 
         let code_len = self.code.len();
@@ -1653,29 +1799,36 @@ impl FatGen {
         result
     }
 
+
+    fn assert(&mut self, condition_register: isize, reason: PanicReason) {
+        let label = self.label();
+        self.panics.push((label, reason));
+        self.put_jump_zero(condition_register, label);
+    }
+
     fn expr(&mut self, ctx: &mut Compiler, expr: Expr) -> ExprResult {
-        self.expr_with_destination_and_optional_control(ctx, expr, Type::None, &Location::none(), None)
+        self.expr_with_destination_and_optional_control(ctx, expr, &Destination::none(), None)
     }
 
     fn expr_with_control(&mut self, ctx: &mut Compiler, expr: Expr, control: Control) -> ExprResult {
-        self.expr_with_destination_and_optional_control(ctx, expr, Type::None, &Location::none(), Some(control))
+        self.expr_with_destination_and_optional_control(ctx, expr, &Destination::none(), Some(control))
     }
 
     fn expr_with_destination_type(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type) -> ExprResult {
-        self.expr_with_destination_and_optional_control(ctx, expr, destination_type, &Location::none(), None)
+        self.expr_with_destination_and_optional_control(ctx, expr, &Destination::for_type(destination_type, self.locals.top()), None)
     }
 
-    fn expr_with_destination(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type, dest: &Location) -> ExprResult {
-        self.expr_with_destination_and_optional_control(ctx, expr, destination_type, dest, None)
+    fn expr_with_destination(&mut self, ctx: &mut Compiler, expr: Expr, destination: &Destination) -> ExprResult {
+        self.expr_with_destination_and_optional_control(ctx, expr, destination, None)
     }
 
-    fn expr_with_destination_and_control(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type, dest: &Location, control: Control) -> ExprResult {
-        self.expr_with_destination_and_optional_control(ctx, expr, destination_type, dest, Some(control))
+    fn expr_with_destination_and_control(&mut self, ctx: &mut Compiler, expr: Expr, destination: &Destination, control: Control) -> ExprResult {
+        self.expr_with_destination_and_optional_control(ctx, expr, destination, Some(control))
     }
 
-    fn expr_with_destination_and_optional_control(&mut self, ctx: &mut Compiler, expr: Expr, destination_type: Type, dest: &Location, control: Option<Control>) -> ExprResult {
+    fn expr_with_destination_and_optional_control(&mut self, ctx: &mut Compiler, expr: Expr, destination: &Destination, control: Option<Control>) -> ExprResult {
         let mut control = control;
-        let mut result = ExprResult { addr: Location::none(), bound_context: BoundContext::None, ty: Type::None, value_is_register: false, value: None };
+        let mut result = ExprResult { addr: Location::none(), bound_context: BoundContext::None, ty: Type::None, expr, value_is_register: false, value: None };
         match ctx.ast.expr(expr) {
             ExprData::Int(value) => {
                 result.value = Some(value.into());
@@ -1692,11 +1845,11 @@ impl FatGen {
             ExprData::Name(name) => {
                 if let Some(local) = self.locals.get(name) {
                     result.ty = local.ty;
-                    result.bound_context = BoundContext::LocalsMark(local.mark);
+                    result.bound_context = BoundContext::Mark(local.mark);
                     result.addr = local.loc;
                 } else if let Some(sym) = sym::lookup_value(ctx, name) {
                     result.ty = sym.ty;
-                    result.bound_context = BoundContext::LocalsMark(0);
+                    result.bound_context = BoundContext::Mark(Mark { mode: Mode::RestrictedScope, index: self.arguments_mark.index });
                     match ctx.types.info(sym.ty).kind {
                         TypeKind::Callable => result.value = Some(sym.name.into()),
                         _ => {
@@ -1743,7 +1896,7 @@ impl FatGen {
                                 // avoid doing any reachability analysis.
                                 let (initialized_flag_ptr, offset) = self.location_base_offset(&Location::rip(loc - 4, true));
                                 let initialized_flag = self.put3_inc(Op::Load32, initialized_flag_ptr, offset);
-                                self.put_jump_zero(initialized_flag, self.panic);
+                                self.assert(initialized_flag, PanicReason::GlobalNotInitialized);
                             }
 
                             result.addr = Location::rip(loc, true);
@@ -1754,28 +1907,34 @@ impl FatGen {
                 }
             }
             ExprData::Compound(fields) => {
-                if destination_type != Type::None {
+                if destination.ty != Type::None {
                     // Todo: check for duplicate fields. need to consider unions and fancy paths (both unimplemented)
-                    let info = ctx.types.info(destination_type);
+                    let info = ctx.types.info(destination.ty);
                     if let TypeKind::Struct|TypeKind::Array = info.kind {
                         let base;
-                        if fields.is_empty() && dest.kind != LocationKind::None {
-                            base = *dest;
+                        if fields.is_empty() && destination.addr.kind != LocationKind::None {
+                            base = destination.addr;
                         } else {
                             // Todo: We dump everything to the stack and copy over because we don't know yet
                             // if the compound initializer is loading from the destination it is storing
                             // to. But this seems like a rare case to me, and we ought to be able to write
                             // directly to the destination in the common case, even without optimisations?
-                            base = self.stack_alloc(ctx, destination_type);
+                            base = self.stack_alloc(ctx, destination.ty);
                         }
                         let mut path_ctx = PathContext { state: PathContextState::ExpectAny, index: 0 };
+                        // let field_exprs = SmallVec::new();
                         self.zero(&base, info.size as isize);
                         for field in fields {
                             let field = ctx.ast.compound_field(field);
-                            if let Some(item) = self.path(ctx, &mut path_ctx, destination_type, field.path) {
+                            if let Some(item) = self.path(ctx, &mut path_ctx, destination.ty, field.path) {
                                 let dest = base.offset_by(item.offset as isize);
-                                let expr = self.expr_with_destination(ctx, field.value, item.ty, &dest);
-                                if expr.ty != item.ty {
+                                // Todo: No bound context--this means that if a types field has a bound, when we use an initializer,
+                                // it is not checked. It could be, and maybe should be? But if we pass it in right now, when the bound ptr
+                                // is assigned, the bound integer may not yet be initialized.
+                                let expr = self.expr_with_destination(ctx, field.value, &Destination::for_item_with_location(item.ty, dest));
+                                if expr.ty == item.ty {
+                                    // field_exprs.push((item, expr));
+                                } else {
                                     match path_ctx.state {
                                         PathContextState::ExpectPaths =>
                                             error!(self, ctx.ast.expr_source_position(field.value), "incompatible types (field '{}' is of type {}, found {})", ctx.str(item.name), ctx.type_str(item.ty), ctx.type_str(expr.ty)),
@@ -1786,8 +1945,13 @@ impl FatGen {
                                 }
                             }
                         }
+                        // for (item, expr) in field_exprs.iter() {
+                        //     let dest =  Destination::of_expr_result(expr);
+                        //     dest.
+                        //     self.destination_bounds_check(ctx, expr)
+                        // }
                         result.addr = base;
-                        result.ty = destination_type;
+                        result.ty = destination.ty;
                     } else {
                         error!(self, ctx.ast.expr_source_position(expr), "compound initializer used for non-Type type");
                     }
@@ -1832,25 +1996,29 @@ impl FatGen {
             ExprData::Index(left_expr, index_expr) => {
                 let left = self.expr(ctx, left_expr);
                 if let TypeKind::Array|TypeKind::Pointer = ctx.types.info(left.ty).kind {
-                    let index = self.expr(ctx, index_expr);
-                    if index.ty.is_integer() {
-                        result.addr = self.compute_address(ctx, &left, &index, &left.bound_context);
-                        result.ty = ctx.types.base_type(left.ty);
-                        if left.ty.is_immutable_pointer() {
-                            result.addr.is_mutable = false;
-                            result.ty = result.ty.to_immutable();
+                    if left.ty.bound != Bound::Single {
+                        let index = self.expr(ctx, index_expr);
+                        if index.ty.is_integer() {
+                            result.addr = self.compute_address(ctx, &left, &index, &left.bound_context);
+                            result.ty = ctx.types.base_type(left.ty);
+                            if left.ty.is_immutable_pointer() {
+                                result.addr.is_mutable = false;
+                                result.ty = result.ty.to_immutable();
+                            }
+                        } else {
+                            error!(self, ctx.ast.expr_source_position(index_expr), "index must be an integer (found {})", ctx.type_str(index.ty))
                         }
                     } else {
-                        error!(self, ctx.ast.expr_source_position(index_expr), "index must be an integer (found {})", ctx.type_str(index.ty))
+                        error!(self, ctx.ast.expr_source_position(left_expr), "cannot index unbounded pointers. You can use pointer arithmetic and explicit dereferences");
                     }
                 } else {
                     error!(self, ctx.ast.expr_source_position(left_expr), "indexed type must be an array or pointer (found {}, a {:?})", ctx.type_str(left.ty), ctx.types.info(left.ty).kind)
                 }
             },
             ExprData::Unary(op_token, right_expr) => {
-                let right = if op_token == parse::TokenKind::BitAnd && destination_type != Type::None {
+                let right = if op_token == parse::TokenKind::BitAnd && destination.ty != Type::None {
                     // Address/cast/compound transposition
-                    self.expr_with_destination_type(ctx, right_expr, ctx.types.base_type(destination_type))
+                    self.expr_with_destination_type(ctx, right_expr, ctx.types.base_type(destination.ty))
                 } else {
                     self.expr(ctx, right_expr)
                 };
@@ -1997,9 +2165,9 @@ impl FatGen {
                 if cond.ty == Type::Bool {
                     let exit = self.label();
                     self.patch(left);
-                    let left = self.expr_with_destination_and_control(ctx, left_expr, destination_type, dest, jump(exit));
+                    let left = self.expr_with_destination_and_control(ctx, left_expr, destination, jump(exit));
                     self.patch(right);
-                    let right = self.expr_with_destination(ctx, right_expr, left.ty, &left.addr);
+                    let right = self.expr_with_destination(ctx, right_expr, &Destination::of_expr_result(&left));
                     self.patch(exit);
                     if left.ty == right.ty {
                         debug_assert!(left.addr == right.addr);
@@ -2020,11 +2188,11 @@ impl FatGen {
                         if not_calling_proc_from_func {
                             let return_type = info.return_type().expect("tried to generate code to call a func without return type");
                             let dest_location = if return_type.is_basic() == false {
-                                if ctx.types.annoying_deep_eq_ignoring_mutability(return_type, destination_type)
-                                && dest.kind != LocationKind::None {
+                                if ctx.types.annoying_deep_eq_ignoring_mutability(return_type, destination.ty)
+                                && destination.addr.kind != LocationKind::None {
                                     // For aggregate types, if we already have a destination, we can just pass the
                                     // pointer in as the return destination directly
-                                    *dest
+                                    destination.addr
                                 } else {
                                     // Otherwise, use the stack
                                     let info = ctx.types.info(return_type);
@@ -2039,16 +2207,22 @@ impl FatGen {
                             for (i, expr) in args.enumerate() {
                                 let info = ctx.types.info(addr.ty);
                                 let item = info.items[i];
-                                let compiled_expr = self.expr_with_destination_type(ctx, expr, item.ty);
+                                let compiled_expr = self.expr_with_destination(ctx, expr, &Destination::for_item(item.ty));
                                 if !ctx.types.annoying_deep_eq_ignoring_mutability(compiled_expr.ty, item.ty) {
                                     error!(self, ctx.ast.expr_source_position(expr), "argument {} of {} is of type {}, found {}", i, ctx.callable_str(ident(addr.value)), ctx.type_str(item.ty), ctx.type_str(compiled_expr.ty));
                                     break;
                                 }
                                 let reg = self.location_register(&compiled_expr.addr);
-                                arg_exprs.push((compiled_expr, reg));
+                                arg_exprs.push((compiled_expr, item.ty, reg));
                             }
                             let arguments_start = self.reg_counter;
-                            for &(expr, reg) in arg_exprs.iter() {
+                            // for &(expr, ty, _) in arg_exprs.iter() {
+                            //     // Silly: recontruct destination from expr for bounds checking
+                            //     let mut dest = Destination::of_expr_result(&expr);
+                            //     dest.ty = ty;
+                            //     self.destination_bounds_check(ctx, &dest, &expr);
+                            // }
+                            for &(expr, _, reg) in arg_exprs.iter() {
                                 match expr.value {
                                     Some(_) if expr.ty.is_pointer() => self.register(&expr),
                                     Some(gv) => self.constant(gv),
@@ -2085,8 +2259,8 @@ impl FatGen {
             }
             ExprData::Cast(expr, type_expr) => {
                 let to_ty = self.type_expr(ctx, type_expr);
-                let left = if to_ty == destination_type {
-                    self.expr_with_destination(ctx, expr, destination_type, dest)
+                let left = if to_ty == destination.ty {
+                    self.expr_with_destination(ctx, expr, destination)
                 } else {
                     self.expr_with_destination_type(ctx, expr, to_ty)
                 };
@@ -2138,7 +2312,7 @@ impl FatGen {
         };
 
         #[cfg(debug_assertions)]
-        if self.error.is_none() {
+        if self.error.is_none() && self.can_emit_code() {
             debug_assert_implies!(result.addr.offset == Location::BAD, matches!(result.addr.kind, LocationKind::None|LocationKind::Control));
             debug_assert_implies!(result.addr.offset != Location::BAD, result.addr.kind != LocationKind::None);
             debug_assert_implies!(result.addr.base != Location::BAD, matches!(result.addr.kind, LocationKind::Based|LocationKind::Rip));
@@ -2146,33 +2320,45 @@ impl FatGen {
         }
 
         // Decay array to pointer
-        if destination_type.is_pointer() {
+        if destination.ty.is_pointer() {
             let result_info = ctx.types.info(result.ty);
             if result_info.kind == TypeKind::Array
-            && result_info.base_type == ctx.types.base_type(destination_type) {
+            && result_info.base_type == ctx.types.base_type(destination.ty) {
                 result.addr = Location::pointer(self.location_register(&result.addr), 0, result.addr.is_mutable);
-                result.ty = destination_type.with_mutability_of(result.ty);
-                // Todo: formalize this idea vvvv. &a[n] -> ptr to a::ty with bound a::len - n.
-                // The bound was set correctly from the array but we lose it in the with_mutability_of
-                result.ty.bound = Bound::Constant(result_info.num_array_elements);
+                result.ty = destination.ty.with_mutability_and_bound_of(result.ty);
+            }
+        }
+
+        // Check bounds are compatible if specified on destination.
+        // So, constant bounds are fine if they fit, expression bounds have to emit a check
+        if destination.ty != Type::None {
+            if destination.deferred_bounds_checks == false {
+                self.destination_bounds_check(ctx, destination, &result);
+                result.ty.bound = destination.ty.bound;
             }
         }
 
         // Emit copy to destination and, if the copy changes the representation of an integer, update the type
-        if destination_type != Type::None && dest.kind != LocationKind::None {
-            let compatible = expr_integer_compatible_with_destination(&result, destination_type, dest);
-            if compatible || ctx.types.annoying_deep_eq_ignoring_mutability(destination_type, result.ty) {
-                if result.addr != *dest {
-                    self.copy(ctx, destination_type, dest, &result);
-                    result.addr = *dest;
+        if destination.ty != Type::None && destination.addr.kind != LocationKind::None {
+            let compatible = expr_integer_compatible_with_destination(&result, destination.ty, &destination.addr);
+            if compatible || ctx.types.annoying_deep_eq_ignoring_mutability(destination.ty, result.ty) {
+                if result.addr != destination.addr {
+                    self.copy(ctx, destination.ty, &destination.addr, &result);
+                    result.addr = destination.addr;
                 }
 
-                result.ty = destination_type.with_mutability_of(result.ty);
+                // Changing the result type here will never change the base type of a pointer.
+                // In that case, the ptr bound may no longer accurately reflect the size of the
+                // underyling allocation. In other words, the following must hold:
+                if result.ty != destination.ty && result.ty.is_pointer() {
+                    let rb = ctx.types.info(result.ty).base_type;
+                    let db = ctx.types.info(destination.ty).base_type;
+                    assert!(ctx.types.info(rb).size == ctx.types.info(db).size);
+                }
+
+                result.ty = destination.ty.with_mutability_and_bound_of(result.ty);
             }
         }
-
-        // Todo: check bounds are compatible if specified on destination.
-        // So, constant bounds are fine if they fit, expression bounds have to emit a check
 
         // Emit jumps if the expression was for a control value (in if conditions, for example)
         if let Some(control) = control {
@@ -2228,7 +2414,7 @@ impl FatGen {
 
         // If we don't have a bound context, use the current scope
         if let BoundContext::None = result.bound_context {
-            result.bound_context = BoundContext::LocalsMark(self.locals.top());
+            result.bound_context = BoundContext::Mark(self.locals.top());
         }
         result
     }
@@ -2240,7 +2426,8 @@ impl FatGen {
                 return_type = self.stmts(ctx, body)
             }
             StmtData::Return(Some(expr)) => {
-                let ret_expr = self.expr_with_destination(ctx, expr, self.return_type, &Location::ret(self.return_type.is_basic()));
+                let bound_context = BoundContext::Type(self.generating_code_for, self.arguments_location);
+                let ret_expr = self.expr_with_destination(ctx, expr, &Destination::for_return_type(self.return_type, bound_context));
                 // TODO: iron out the story for constant pointers. i dont want any explicit
                 // annotations, except possibly for pointers into write-protected pages (which
                 // is mostly out of scope for this compiler). but for constness to leak out of
@@ -2440,7 +2627,10 @@ impl FatGen {
                     let decl_type;
                     if let TypeExprData::Infer = ctx.ast.type_expr(ty_expr) {
                         expr = self.expr(ctx, right);
-                        decl_type = expr.ty;
+                        // We strip the expr bound so bounds are not tracked if ptrs are taken off their
+                        // parent structure and store them on the stack. We _could_ do that, but maybe
+                        // it would be confusing? Or not that useful?
+                        decl_type = expr.ty.strip_expr_bound();
                     } else {
                         decl_type = self.type_expr(ctx, ty_expr);
                         expr = self.expr_with_destination_type(ctx, right, decl_type);
@@ -2466,7 +2656,7 @@ impl FatGen {
             StmtData::Assign(left, right) => {
                 let lv = self.expr(ctx, left);
                 if lv.addr.is_mutable {
-                    let value = self.expr_with_destination(ctx, right, lv.ty, &lv.addr);
+                    let value = self.expr_with_destination(ctx, right, &Destination::of_expr_result(&lv));
                     if lv.ty != value.ty {
                         if value_fits(value.value, lv.ty) {
                             error!(self, ctx.ast.expr_source_position(left), "type mismatch between destination ({}) and value ({})", ctx.type_str(lv.ty), ctx.type_str(value.ty))
@@ -2520,12 +2710,15 @@ impl FatGen {
         self.target = if is_func { CodeGenTarget::Func } else { CodeGenTarget::Proc };
         self.return_type = sig.items.last().map(|i| i.ty).unwrap();
         self.reg_counter = (Self::REGISTER_SIZE as isize) * (1 - sig.items.len() as isize);
+        self.generating_code_for = signature;
         assert_implies!(is_func, self.return_type != Type::None);
 
         let param_names = params.map(|item| ctx.ast.item(item).name);
         let param_types = sig.items.iter().map(|i| i.ty);
         let number_of_arguments = params.len() as isize;
         let top = self.locals.push_scope();
+        self.arguments_location = Location::stack(self.reg_counter);
+        self.arguments_mark = top;
         for (name, ty) in Iterator::zip(param_names, param_types) {
             let reg = self.inc_reg();
             let loc = if ty.is_basic() {
@@ -2537,8 +2730,6 @@ impl FatGen {
             self.locals.insert(name, Local::argument(loc, ty, number_of_arguments));
         }
 
-        self.panic = self.label_here();
-        self.put2(Op::Panic, 0, PanicReason::GlobalNotInitialized as isize);
         let addr = self.code.len();
         self.prolog();
         let returned = self.stmts(ctx, body);
@@ -2552,13 +2743,24 @@ impl FatGen {
         } else {
             self.put0(Op::Return);
         }
+
+        let panic: RegValue = ctx.intern("panic").into();
+        let mut panics = std::mem::take(&mut self.panics);
+        for &(label, reason) in &panics {
+            self.patch(label);
+            let c = self.constant((reason as u32).into());
+            self.put(Op::Call, c, panic);
+        }
+        self.panics = { panics.clear(); panics };
+
         self.apply_patches();
         self.locals.restore_scope(top);
 
         assert!(self.patches.len() == 0);
         assert!(self.jmp.break_to.is_none());
         assert!(self.jmp.continue_to.is_none());
-        assert!(self.locals.top_scope_index == 0);
+        assert!(self.locals.mark.index == 0);
+        assert!(self.type_expr_evaluation_incomplete == false);
 
         self.error.take().map(|e| ctx.error(e.source_position, e.msg));
         Code { signature, addr }
@@ -2566,11 +2768,12 @@ impl FatGen {
 
     fn global_expr(&mut self, ctx: &mut Compiler, ty: Type, right: Expr, location: isize, reg_counter: isize) {
         self.target = CodeGenTarget::GlobalExpr;
+        self.generating_code_for = Type::None;
         self.reg_counter = reg_counter;
         if reg_counter == 0 {
             self.prolog();
         }
-        let expr = self.expr_with_destination(ctx, right, ty, &Location::rip(location, true));
+        let expr = self.expr_with_destination(ctx, right, &Destination::for_location(ty, Location::rip(location, true)));
         let flag = self.constant(1.into());
         let (ip, offset) = self.location_base_offset(&Location::rip(location - 4, true));
         self.put3(Op::Store32, ip, flag, offset);
@@ -2585,6 +2788,7 @@ impl FatGen {
             error!(self, ctx.ast.expr_source_position(right), "type mismatch between declaration ({}) and value ({})", ctx.type_str(ty), ctx.type_str(expr.ty))
         }
         self.error.take().map(|e| ctx.error(e.source_position, e.msg));
+        assert!(self.type_expr_evaluation_incomplete == false);
     }
 }
 
@@ -2616,33 +2820,36 @@ pub fn eval_item_bounds(ctx: &mut Compiler, ty: BareType, items: ast::ItemList, 
     // Same song and dance as eval_type
     let mut fg = ctx.fgs.pop().unwrap_or_else(|| FatGen::new(Vec::new()));
     fg.target = CodeGenTarget::TypeExpr;
+    fg.type_expr_evaluation_incomplete = true;
 
-    // Add struct fields as local variables.
-    let locals_mark = fg.locals.push_scope();
-    for info in ctx.types.info(ty.into()).items.iter() {
-        // Not actually a register, but has the behaviour we want: field
-        // accesses get turned into Location::Based locations without
-        // generating code, so bounds can be more expressive.
-        let loc = Location::register(info.offset as isize);
-        fg.locals.insert(info.name, Local::new(loc, info.ty, 0));
-    }
+    // For expression bounds defined out of order on a type we repeatedly evaluate until the
+    // type_expr_evaluation_incomplete flag is not set. This is n^2 in the number of items in the worst case
+    for _ in 0..items.len() + 1 {
+        fg.type_expr_evaluation_incomplete = false;
+        let locals_mark = fg.locals.push_type(ctx, ty.into(), &Location::none());
 
-    for (i, item) in items.enumerate() {
-        let info = ctx.ast.item(item);
-        let item_ty = fg.type_expr(ctx, info.expr);
-        ctx.types.set_item_bound(ty, i, info.name, item_ty);
-    }
+        for (i, item) in items.enumerate() {
+            let info = ctx.ast.item(item);
+            let item_ty = fg.type_expr(ctx, info.expr);
+            ctx.types.set_item_bound(ty, i, info.name, item_ty);
+        }
 
-    if let Some(returns) = returns {
-        let item_ty = fg.type_expr(ctx, returns);
-        let items = &ctx.types.info(ty.into()).items;
-        let i = items.len() - 1;
-        let name = items[i].name;
-        ctx.types.set_item_bound(ty, i, name, item_ty);
+        if let Some(returns) = returns {
+            let item_ty = fg.type_expr(ctx, returns);
+            let items = &ctx.types.info(ty.into()).items;
+            let i = items.len() - 1;
+            let name = items[i].name;
+            ctx.types.set_item_bound(ty, i, name, item_ty);
+        }
+
+        fg.locals.restore_scope(locals_mark);
+
+        if fg.type_expr_evaluation_incomplete == false {
+            break;
+        }
     }
 
     fg.error.take().map(|e| ctx.errors.push(e));
-    fg.locals.restore_scope(locals_mark);
     ctx.fgs.push(fg);
 }
 
@@ -2770,7 +2977,7 @@ impl Compiler {
         let stack = unsafe { stack.align_to_mut::<RegValue>().1 };
         let stack: *mut [u8] = unsafe { std::slice::from_raw_parts_mut(stack.as_mut_ptr() as *mut u8, stack.len() * std::mem::size_of::<RegValue>()) };
 
-        // The VM allows taking (real!) pointers to addresses on the VM stack. These are
+        // The VM allows taking (real) pointers to addresses on the VM stack. These are
         // immediately invalidated by taking a & reference to the stack. Solution: never
         // take a reference to the stack (even one immediately turned into a pointer).
 
@@ -2808,12 +3015,17 @@ impl Compiler {
                     Op::Halt       => { break; }
                     Op::Panic      => {
                         // terrible
-                        if instr.left == PanicReason::GlobalNotInitialized as i32 {
+                        if reg![dest].int == PanicReason::GlobalNotInitialized as usize {
                             // but which one
                             return Err("global value used before initialization".into())
-                        } else {
+                        } else if reg![dest].int == PanicReason::AssertionFailed as usize {
                             // but where
                             return Err("assertion failed".into())
+                        } else if reg![dest].int == PanicReason::IndexOutOfBounds as usize {
+                            // :(((((((((((
+                            return Err("index is out of bounds".into())
+                        } else {
+                            unreachable!();
                         }
                     }
                     Op::Noop       => {}
@@ -3066,7 +3278,38 @@ fn repl() {
     }
 }
 
-fn main() {
+fn main() {{
+    let ok = [
+(r#"
+
+Buf: (
+    buf: ptr u8 [len],
+    buf1: ptr u8 [buf[0]],
+    buf2: ptr u8 [*buf],
+    buf3: ptr u8 [buf[len]],
+    len: int,
+    cap: int
+);
+"#, Value::Int(1)),
+];
+    let err = [r#"
+main: proc () int {
+    a := 1;
+    return *a;
+}
+"#];
+    for test in ok.iter() {
+        let str = test.0;
+        let expect = test.1;
+        compile_and_run(str)
+            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
+            .map_err(|e| { println!("input: \"{}\"", str); e })
+            .unwrap();
+    }
+    for str in err.iter() {
+        compile_and_run(str).map(|e| { println!("input: \"{}\"", str); e }).unwrap_err();
+    }
+}
     repl();
 }
 
@@ -3339,7 +3582,7 @@ sum2: func (a: ptr (arr i32 [3])) int {
     }
     return acc;
 }
-sum3: func (a: ptr i32) int {
+sum3: func (a: ptr i32 [3]) int {
     acc := 0;
     for (i := 0; i < 3; i = i + 1) {
         acc = acc + a[i];
@@ -3872,7 +4115,7 @@ main: proc () int {
     arrp := &arr[0];
     acc := 0;
     for (i := 0; i < 8; i = i + 1) {
-        acc = acc + arrp[i];
+        acc = acc + *(arrp + i);
     }
     return acc;
 }
@@ -3886,14 +4129,14 @@ main: proc () int {
     arrp := &arr[0];
     acc := 0;
     for (i := 0; i < 8; i = i + 1) {
-        acc = acc + *(arrp + (&arrp[i] - arrp));
+        acc = acc + *(arrp + (&arr[i] - arrp));
     }
     return acc;
 }
 "#, Value::Int(0+1+2+3+4+5+6+7)),
 (r#"
 Buf: struct (
-    buf: ptr u8,
+    buf: ptr u8 [len],
     len: int
 );
 main: proc () int {
@@ -3909,8 +4152,8 @@ main: proc () int {
     assert(&arr[0] == buf.buf);
     assert(arr[0] == buf.buf[0]);
     assert(arr[1] == buf.buf[i]);
-    assert(arr[1] == b[i]);
-    assert(&arr[1] == &b[i]);
+    assert(arr[1] == *(b+i));
+    assert(&arr[1] == &*(b+i));
     return buf.buf[1];
 }
 "#, Value::Int(1)),
@@ -3968,14 +4211,14 @@ main: proc () int {
 (r#"
 V2: struct (x: i32, y: i32);
 rot22: proc(vv: ptr -> ptr V2) {
-    **vv = { -vv[0].y:i32, vv[0].x };
+    **vv = { -(*vv).y:i32, (*vv).x };
 }
 rot12: proc (v: ptr V2) {
     vv := &v;
     rot22(vv);
 }
 rot21: proc(vv: ptr -> ptr V2) {
-    vv[0].x = -1;
+    (*vv).x = -1;
 }
 rot11: proc(v: ptr V2) {
     vv := &v;
@@ -4174,13 +4417,13 @@ Buf: (
     len: int,
     cap: int
 );
-fn: func (buf: ptr u8 [len], len: int) -> ptr u8 [len] {
-    return buf;
-}
+// fn: func (buf: ptr u8 [len], len: int) -> ptr u8 [len] {
+//     return buf;
+// }
 main: proc () -> int {
-    b: Buf = {};
-    p := fn(b.buf, b.len);
-    q := &b.buf[0];
+    // b: Buf = {len=1};
+    // p := fn(b.buf, b.len);
+    // q := &b.buf[0];
     return 1;
 }"#, Value::Int(1))
 ];

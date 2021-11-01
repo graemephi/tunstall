@@ -32,7 +32,7 @@ pub fn builtins(ctx: &mut Compiler) {
         let name = ctx.interns.put(str);
         let ty = Type { id: i as u32, bound };
         let items = Vec::new();
-        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: bare(ty), mutable: true, num_array_elements: 0 });
+        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: ty, mutable: true, num_array_elements: 0 });
         assert!(size == 0 || size.is_power_of_two());
         sym::builtin(ctx, name, ty);
     }
@@ -45,6 +45,7 @@ pub fn builtins(ctx: &mut Compiler) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bound {
+    Compiling,
     Single,
     Constant(usize),
     Expr(ast::Expr)
@@ -179,6 +180,20 @@ impl Type {
         }
         self.to_mutable()
     }
+
+    pub fn with_mutability_and_bound_of(self, other: Type) -> Type {
+        if other.is_immutable_pointer() {
+            return self.to_immutable();
+        }
+        self.to_mutable()
+    }
+
+    pub fn strip_expr_bound(self) -> Type {
+        if let Bound::Expr(..) = self.bound {
+            return Type { id: self.id, bound: Bound::Single };
+        }
+        self
+    }
 }
 
 pub fn integer_promote(ty: Type) -> Type {
@@ -232,7 +247,7 @@ pub struct TypeInfo {
     pub alignment: usize,
     pub items: Vec<Item>,
     // Types without a base_type are their own base_type
-    pub base_type: BareType,
+    pub base_type: Type,
     // Two kinds of type can be mutable
     //  pointers: appear as immutable when passed into funcs
     //  callables: procs are "mutable" in that they allow side-effects
@@ -279,6 +294,10 @@ impl Types {
     }
 
     pub fn info(&self, ty: Type) -> &TypeInfo {
+        &self.types[(ty.id & !Type::POINTER_BIT) as usize]
+    }
+
+    pub fn info_bare(&self, ty: BareType) -> &TypeInfo {
         &self.types[(ty.id & !Type::POINTER_BIT) as usize]
     }
 
@@ -329,7 +348,7 @@ impl Types {
             size: 0,
             alignment: 1,
             items: Vec::new(),
-            base_type: result,
+            base_type: result.into(),
             mutable: true,
             num_array_elements: 0,
         };
@@ -406,7 +425,7 @@ impl Types {
         let arr = self.info_mut(ty);
         arr.size = base_size.checked_mul(num_array_elements).unwrap();
         arr.alignment = alignment;
-        arr.base_type = BareType { id: base_type.id };
+        arr.base_type = base_type.strip_expr_bound();
         arr.num_array_elements = num_array_elements;
         let ty = Type { id: ty.id, bound: Bound::Constant(num_array_elements) };
         self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
@@ -450,7 +469,7 @@ impl Types {
         let ptr = self.info_mut(ty);
         ptr.size = std::mem::size_of::<*const u8>();
         ptr.alignment = ptr.size;
-        ptr.base_type = bare(base_type);
+        ptr.base_type = base_type.strip_expr_bound();
         ptr.mutable = true;
 
         let ty = Type::from(ty);
@@ -466,7 +485,7 @@ impl Types {
     }
 
     pub fn base_type(&self, ty: Type) -> Type {
-        Type { id: self.info(ty).base_type.id, bound: ty.bound }
+        self.info(ty).base_type
     }
 
     pub fn add_item_to_type(&mut self, ty: BareType, name: Intern, item: Type) {
@@ -585,7 +604,7 @@ Padding2: struct (
 
 Ptr: struct (
     a: ptr,
-    b: ptr u8 [2],
+    b: ptr u8 [8],
     c: ptr int [bound],
     d: ptr Ptr [b[4]],
     bound: int
@@ -662,7 +681,7 @@ Ptr: struct (
     assert_eq!(ptr.items[2].ty, int_ptr);
     assert_eq!(ptr.items[3].ty, ptr_ptr);
     assert_eq!(ptr.items[0].ty.bound, Bound::Single);
-    assert_eq!(ptr.items[1].ty.bound, Bound::Constant(2));
+    assert_eq!(ptr.items[1].ty.bound, Bound::Constant(8));
     // assert_eq!(ptr.items[2].ty.bound, ???);
     // assert_eq!(ptr.items[3].ty.bound, ???);
     assert_eq!(c.types.info(c.types.base_type(ptr_ptr)) as *const _, ptr as *const _);

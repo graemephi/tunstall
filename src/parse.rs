@@ -631,33 +631,9 @@ impl<'c, 'a> Parser<'_, '_> {
     fn unary_expr(&mut self) -> Expr {
         use TokenKind::*;
         match self.token.kind {
-            Sub => {
+            Sub|BitNeg|Not|BitAnd|Mul => {
                 let token = self.token;
-                self.token(Sub);
-                let operand = self.unary_expr();
-                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
-            },
-            BitNeg => {
-                let token = self.token;
-                self.token(BitNeg);
-                let operand = self.unary_expr();
-                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
-            },
-            Not => {
-                let token = self.token;
-                self.token(Not);
-                let operand = self.unary_expr();
-                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
-            },
-            BitAnd => {
-                let token = self.token;
-                self.token(BitAnd);
-                let operand = self.unary_expr();
-                self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
-            },
-            Mul => {
-                let token = self.token;
-                self.token(Mul);
+                self.next_token();
                 let operand = self.unary_expr();
                 self.ctx.ast.push_expr_unary(token.source_index, token.kind, operand)
             },

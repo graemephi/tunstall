@@ -1,5 +1,6 @@
 split registers and stack for the vm--they can just be two stacks
 constant globals and no func write acesss
+Maybe: a: arr; &a[n] -> ptr to a::ty with bound a::len - n
 
 V2: (x: f32, y: f32);
 
