@@ -182,10 +182,9 @@ impl Type {
     }
 
     pub fn with_mutability_and_bound_of(self, other: Type) -> Type {
-        if other.is_immutable_pointer() {
-            return self.to_immutable();
-        }
-        self.to_mutable()
+        let mut result = self.with_mutability_of(other);
+        result.bound = other.bound;
+        result
     }
 
     pub fn strip_expr_bound(self) -> Type {
