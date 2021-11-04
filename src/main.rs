@@ -41,12 +41,10 @@ macro_rules! error {
     }}
 }
 
-
 #[macro_export]
 macro_rules! assert_implies {
     ($p:expr, $q:expr) => { assert!(!($p) || ($q)) }
 }
-
 
 #[macro_export]
 macro_rules! debug_assert_implies {
@@ -994,7 +992,7 @@ impl Location {
 enum EvaluatedBound {
     Unconditional,
     Constant(RegValue),
-    Register(isize)
+    Location(Type, Location)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1235,7 +1233,7 @@ impl FatGen {
         dest
     }
 
-    fn location_register(&mut self, location: &Location) -> isize {
+    fn location_address(&mut self, location: &Location) -> isize {
         match location.kind {
             LocationKind::None => Location::BAD,
             LocationKind::Control => Location::BAD,
@@ -1262,7 +1260,7 @@ impl FatGen {
     fn location_base_offset(&mut self, location: &Location) -> (isize, isize) {
         if location.offset > i32::MAX as isize {
             panic!("untested");
-            return (self.location_register(location), 0);
+            return (self.location_address(location), 0);
         }
         match location.kind {
             LocationKind::Based => {
@@ -1276,7 +1274,25 @@ impl FatGen {
         }
     }
 
+    fn location_value(&mut self, ty: Type, addr: &Location) -> isize {
+        match addr.kind {
+            LocationKind::None => Location::BAD,
+            LocationKind::Control => unreachable!(),
+            LocationKind::Register => addr.offset,
+            LocationKind::Based|LocationKind::Rip => {
+                if let Some(op) = load_op(ty) {
+                    let (ptr, offset) = self.location_base_offset(&addr);
+                    self.put3_inc(op, ptr, offset)
+                } else {
+                    Location::BAD
+                }
+            }
+        }
+    }
+
     fn register(&mut self, expr: &ExprResult) -> isize {
+        // Todo: apparently, it's load bearing whether we check the addr first
+        // or the constant value first. Why???
         match expr.addr.kind {
             LocationKind::None => match expr.value {
                 Some(v) if expr.value_is_register => {
@@ -1287,16 +1303,7 @@ impl FatGen {
                 Some(v) => self.constant(v),
                 None => Location::BAD
             },
-            LocationKind::Control => unreachable!(),
-            LocationKind::Register => expr.addr.offset,
-            LocationKind::Based|LocationKind::Rip => {
-                if let Some(op) = load_op(expr.ty) {
-                    let (ptr, offset) = self.location_base_offset(&expr.addr);
-                    self.put3_inc(op, ptr, offset)
-                } else {
-                    Location::BAD
-                }
-            }
+            _ => self.location_value(expr.ty, &expr.addr)
         }
     }
 
@@ -1339,7 +1346,7 @@ impl FatGen {
         match dest.kind {
             LocationKind::None|LocationKind::Control|LocationKind::Register => unreachable!(),
             LocationKind::Based|LocationKind::Rip => {
-                let dest_addr_register = self.location_register(dest);
+                let dest_addr_register = self.location_address(dest);
                 let size_register = self.constant(size.into());
                 self.put2(Op::Zero, dest_addr_register, size_register);
             }
@@ -1371,8 +1378,8 @@ impl FatGen {
                         }
                     }
                     LocationKind::Based|LocationKind::Rip => {
-                        let dest_addr_register = self.location_register(dest);
-                        let src_addr_register = self.location_register(&src.addr);
+                        let dest_addr_register = self.location_address(dest);
+                        let src_addr_register = self.location_address(&src.addr);
                         let size_register = self.constant(size.into());
                         self.put3(Op::Copy, dest_addr_register, src_addr_register, size_register);
                     }
@@ -1660,12 +1667,12 @@ impl FatGen {
                     assert_implies!(self.error.is_none(), bound.ty.is_integer());
                     assert!(bound.value.is_none());
                     self.locals.clear_restriction(restriction);
-                    EvaluatedBound::Register(self.register(&bound))
+                    EvaluatedBound::Location(bound.ty, bound.addr)
                 },
                 BoundContext::Type(ty, addr) => {
                     let mark = if ty.is_pointer() {
                         let base_ty = ctx.types.base_type(*ty);
-                        let base_addr = Location::pointer(self.location_register(&addr), 0, false);
+                        let base_addr = Location::pointer(self.location_address(&addr), 0, false);
                         self.locals.push_type(ctx, base_ty, &base_addr)
                     } else {
                         self.locals.push_type(ctx, *ty, addr)
@@ -1674,7 +1681,7 @@ impl FatGen {
                     assert_implies!(self.error.is_none(), bound.ty.is_integer());
                     assert!(bound.value.is_none());
                     self.locals.restore_scope(mark);
-                    EvaluatedBound::Register(self.register(&bound))
+                    EvaluatedBound::Location(bound.ty, bound.addr)
                 }
             }
         }
@@ -1694,25 +1701,35 @@ impl FatGen {
                             error!(self, ctx.ast.expr_source_position(expr.expr), "bounds do not match: have {}:{}, but destination wants {}:{}", expr_n, ctx.type_str(expr.ty), dest_n, ctx.type_str(destination.ty))
                         }
                     }
-                    EvaluatedBound::Register(bound_register) => {
+                    EvaluatedBound::Location(ty, addr) => {
                         let dest = self.constant(dest_n.into());
-                        let src = bound_register;
+                        let src = self.location_value(ty, &addr);
                         let in_bounds = self.put3_inc(Op::IntLtEq, dest, src);
                         self.assert(in_bounds, PanicReason::IndexOutOfBounds);
                     }
                 }
             }
             Bound::Expr(_) => {
-                let dest = match self.bound(ctx, destination.ty.bound, &destination.bound_context) {
+                let dest = self.bound(ctx, destination.ty.bound, &destination.bound_context);
+                let src = self.bound(ctx, expr.ty.bound, &expr.bound_context);
+                if let EvaluatedBound::Location(dest_ty, dest_addr) = dest {
+                    if let EvaluatedBound::Location(src_ty, src_addr) = src {
+                        if dest_ty == src_ty && dest_addr == src_addr {
+                            return;
+                        }
+                    }
+                }
+                let dest = match dest {
                     EvaluatedBound::Unconditional => unreachable!(),
                     EvaluatedBound::Constant(v) => self.constant(v),
-                    EvaluatedBound::Register(bound_register) => bound_register,
+                    EvaluatedBound::Location(ty, addr) => self.location_value(ty, &addr),
                 };
-                let src = match self.bound(ctx, expr.ty.bound, &expr.bound_context) {
+                let src = match src {
                     EvaluatedBound::Unconditional => unreachable!(),
                     EvaluatedBound::Constant(v) => self.constant(v),
-                    EvaluatedBound::Register(bound_register) => bound_register,
+                    EvaluatedBound::Location(ty, addr) => self.location_value(ty, &addr),
                 };
+                assert!(dest != src);
                 let in_bounds = self.put3_inc(Op::IntLtEq, dest, src);
                 self.assert(in_bounds, PanicReason::IndexOutOfBounds);
             }
@@ -1747,8 +1764,9 @@ impl FatGen {
                             error!(self, 0, "constant index {} is out of bound {}", index, bound)
                         }
                     },
-                    EvaluatedBound::Register(bound_register) => {
+                    EvaluatedBound::Location(ty, addr) => {
                         let index_register = self.constant(value);
+                        let bound_register = self.location_value(ty, &addr);
                         self.bounds_check(index_register, bound_register);
                     }
                 }
@@ -1768,7 +1786,8 @@ impl FatGen {
                         let bound_register = self.constant(value);
                         self.bounds_check(index_register, bound_register);
                     },
-                    EvaluatedBound::Register(bound_register) => {
+                    EvaluatedBound::Location(ty, addr) => {
+                        let bound_register = self.location_value(ty, &addr);
                         self.bounds_check(index_register, bound_register);
                     }
                 }
@@ -2091,7 +2110,7 @@ impl FatGen {
                                 }
                                 LocationKind::Based|LocationKind::Rip => {
                                     debug_assert!(right.addr.is_place);
-                                    result.addr = Location::register(self.location_register(&right.addr));
+                                    result.addr = Location::register(self.location_address(&right.addr));
                                 }
                             }
                             result.addr.is_mutable = right.addr.is_mutable;
@@ -2184,7 +2203,7 @@ impl FatGen {
                 } else if is_address_computation(op_token, left.ty, right.ty) {
                     let (ptr, offset) = if left.ty.is_pointer() { assert!(right.ty.is_integer()); (&left, &right) } else { assert!(left.ty.is_integer()); (&right, &left) };
                     let where_u_at = self.compute_address(ctx, ptr, offset, &BoundContext::None);
-                    result.addr = Location::register(self.location_register(&where_u_at));
+                    result.addr = Location::register(self.location_address(&where_u_at));
                     result.ty = ptr.ty;
                 } else if is_offset_computation(ctx, op_token, left.ty, right.ty) {
                     let size = ctx.types.info(ctx.types.base_type(left.ty)).size;
@@ -2255,7 +2274,7 @@ impl FatGen {
                             let dest_ptr = if return_type.is_basic() {
                                 Location::BAD
                             } else {
-                                self.location_register(&dest_location)
+                                self.location_address(&dest_location)
                             };
                             let mut arg_exprs = SmallVec::new();
                             let isolated_scope_for_bound_checks = self.locals.restrict_to(self.locals.top());
@@ -2275,7 +2294,7 @@ impl FatGen {
                                         Location::BAD
                                     }
                                 } else {
-                                    self.location_register(&compiled_expr.addr)
+                                    self.location_address(&compiled_expr.addr)
                                 };
                                 arg_exprs.push((compiled_expr, item.name, reg));
 
@@ -2396,7 +2415,7 @@ impl FatGen {
                 // Todo: mutability of the result is discarded here, and maybe it should be
                 // preserved. I want to get rid of the concept of mutability in this sense so:
                 // punting.
-                result.addr = Location::register(self.location_register(&result.addr));
+                result.addr = Location::register(self.location_address(&result.addr));
                 result.ty = destination.ty.with_mutability_and_bound_of(result.ty);
             }
         }
