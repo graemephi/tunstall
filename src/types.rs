@@ -677,8 +677,8 @@ Ptr: struct (
     assert_eq!(ptr.items[3].ty, ptr_ptr);
     assert_eq!(ptr.items[0].ty.bound, Bound::Single);
     assert_eq!(ptr.items[1].ty.bound, Bound::Constant(8));
-    // assert_eq!(ptr.items[2].ty.bound, ???);
-    // assert_eq!(ptr.items[3].ty.bound, ???);
+    assert!(matches!(ptr.items[2].ty.bound, Bound::Expr(_)));
+    assert!(matches!(ptr.items[3].ty.bound, Bound::Expr(_)));
     assert_eq!(c.types.info(c.types.base_type(ptr_ptr)) as *const _, ptr as *const _);
 
     assert_eq!(padding.size, 24);

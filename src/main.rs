@@ -1135,7 +1135,6 @@ struct FatGen {
     target: CodeGenTarget,
     panics: Vec<(Label, PanicReason)>,
     error: Option<Error>,
-    type_expr_evaluation_incomplete: bool,
 }
 
 impl FatGen {
@@ -1156,7 +1155,6 @@ impl FatGen {
             target: CodeGenTarget::Func,
             panics: Vec::new(),
             error: None,
-            type_expr_evaluation_incomplete: false,
         }
     }
 
@@ -1649,7 +1647,7 @@ impl FatGen {
     fn bound(&mut self, ctx: &mut Compiler, bound: Bound, bound_context: &BoundContext) -> EvaluatedBound {
         if let Bound::Compiling = bound {
             assert!(matches!(self.target, CodeGenTarget::TypeExpr|CodeGenTarget::TypeExprIgnoreBounds));
-            self.type_expr_evaluation_incomplete = true;
+            return EvaluatedBound::Unconditional;
         }
         if let BoundContext::None = bound_context {
             return EvaluatedBound::Unconditional;
@@ -2859,7 +2857,6 @@ impl FatGen {
         assert!(self.jmp.break_to.is_none());
         assert!(self.jmp.continue_to.is_none());
         assert!(self.locals.mark.index == 0);
-        assert!(self.type_expr_evaluation_incomplete == false);
 
         self.error.take().map(|e| ctx.error(e.source_position, e.msg));
         Code { signature, addr }
@@ -2887,7 +2884,6 @@ impl FatGen {
             error!(self, ctx.ast.expr_source_position(right), "type mismatch between declaration ({}) and value ({})", ctx.type_str(ty), ctx.type_str(expr.ty))
         }
         self.error.take().map(|e| ctx.error(e.source_position, e.msg));
-        assert!(self.type_expr_evaluation_incomplete == false);
     }
 }
 
@@ -2919,36 +2915,23 @@ pub fn eval_item_bounds(ctx: &mut Compiler, ty: BareType, items: ast::ItemList, 
     // Same song and dance as eval_type
     let mut fg = ctx.fgs.pop().unwrap_or_else(|| FatGen::new(Vec::new()));
     fg.target = CodeGenTarget::TypeExpr;
-    fg.type_expr_evaluation_incomplete = true;
+    let locals_mark = fg.locals.push_type(ctx, ty.into(), &Location::none());
 
-    // For expression bounds defined out of order on a type we repeatedly evaluate until the
-    // type_expr_evaluation_incomplete flag is not set. This is n^2 in the number of items in the worst case
-    for _ in 0..items.len() + 1 {
-        fg.type_expr_evaluation_incomplete = false;
-        let locals_mark = fg.locals.push_type(ctx, ty.into(), &Location::none());
-
-        for (i, item) in items.enumerate() {
-            let info = ctx.ast.item(item);
-            let item_ty = fg.type_expr(ctx, info.expr);
-            ctx.types.set_item_bound(ty, i, info.name, item_ty);
-        }
-
-        if let Some(returns) = returns {
-            let item_ty = fg.type_expr(ctx, returns);
-            let items = &ctx.types.info(ty.into()).items;
-            let i = items.len() - 1;
-            let name = items[i].name;
-            ctx.types.set_item_bound(ty, i, name, item_ty);
-        }
-
-        fg.locals.restore_scope(locals_mark);
-
-        if fg.type_expr_evaluation_incomplete == false {
-            break;
-        }
+    for (i, item) in items.enumerate() {
+        let info = ctx.ast.item(item);
+        let item_ty = fg.type_expr(ctx, info.expr);
+        ctx.types.set_item_bound(ty, i, info.name, item_ty);
     }
 
-    assert!(fg.type_expr_evaluation_incomplete == false);
+    if let Some(returns) = returns {
+        let item_ty = fg.type_expr(ctx, returns);
+        let items = &ctx.types.info(ty.into()).items;
+        let i = items.len() - 1;
+        let name = items[i].name;
+        ctx.types.set_item_bound(ty, i, name, item_ty);
+    }
+
+    fg.locals.restore_scope(locals_mark);
     fg.error.take().map(|e| ctx.errors.push(e));
     ctx.fgs.push(fg);
 }
