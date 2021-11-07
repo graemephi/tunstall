@@ -122,11 +122,6 @@ impl Type {
     // without having to look up information from the handle. It's for convenience,
     // more than anything else.
     const POINTER_BIT: u32 = 1 << (u32::BITS - 1);
-    // Likewise, we always put immutable and mutable pointers to the same base type
-    // adjacent in the big type array, with immutable pointers in the odd indices.
-    // Immutable pointer types always come after mutable pointers in the array.
-    // Non-pointer types are never immutable so the immutable bit is free to vary.
-    const IMMUTABLE_BIT: u32 = 1;
 
     pub const None: Type = Type { id: TypeKind::None as u32, bound: Bound::Constant(0) };
     pub const Int:  Type = Type { id: TypeKind::Int as u32, bound: Bound::Single };
@@ -141,8 +136,8 @@ impl Type {
     pub const F32:  Type = Type { id: TypeKind::F32 as u32, bound: Bound::Single };
     pub const F64:  Type = Type { id: TypeKind::F64 as u32, bound: Bound::Single };
     pub const Bool: Type = Type { id: TypeKind::Bool as u32, bound: Bound::Single };
-    pub const VoidPtr: Type = Type { id: (TypeKind::Bool as u32 + 2) | Self::POINTER_BIT, bound: Bound::Single };
-    pub const U8Ptr:   Type = Type { id: (TypeKind::Bool as u32 + 4) | Self::POINTER_BIT, bound: Bound::Single };
+    pub const VoidPtr: Type = Type { id: (TypeKind::Bool as u32 + 1) | Self::POINTER_BIT, bound: Bound::Single };
+    pub const U8Ptr:   Type = Type { id: (TypeKind::Bool as u32 + 2) | Self::POINTER_BIT, bound: Bound::Single };
 
     pub fn is_integer(self) -> bool {
         Type::Int.id <= self.id && self.id <= Type::U64.id
@@ -156,35 +151,8 @@ impl Type {
         (self.id & Self::POINTER_BIT) == Self::POINTER_BIT
     }
 
-    pub fn is_immutable_pointer(self) -> bool {
-        self.is_pointer() && (self.id & Self::IMMUTABLE_BIT) == Self::IMMUTABLE_BIT
-    }
-
-    pub fn to_mutable(self) -> Type {
-        if self.is_pointer() {
-            return Type { id: self.id & !Self::IMMUTABLE_BIT, bound: self.bound };
-        }
-        self
-    }
-
-    pub fn to_immutable(self) -> Type {
-        if self.is_pointer() {
-            return Type { id: self.id | Self::IMMUTABLE_BIT, bound: self.bound };
-        }
-        self
-    }
-
-    pub fn with_mutability_of(self, other: Type) -> Type {
-        if other.is_immutable_pointer() {
-            return self.to_immutable();
-        }
-        self.to_mutable()
-    }
-
-    pub fn with_mutability_and_bound_of(self, other: Type) -> Type {
-        let mut result = self.with_mutability_of(other);
-        result.bound = other.bound;
-        result
+    pub fn with_bound_of(self, other: Type) -> Type {
+        Type { id: self.id, bound: other.bound }
     }
 
     pub fn strip_expr_bound(self) -> Type {
@@ -438,28 +406,7 @@ impl Types {
             }
         }
 
-        // Make mutable and immutable variants of the pointer. This........ means we can
-        // go to and from mutable and immutable pointers without a mutable reference to
-        // self........
-
-        // lowest friction way to achieve this but feels stupid. we want ty < imm_ty and
-        // ty on the odd index. but entries in the freelist are probably not contiguous,
-        // and the easiest way to deal with that is to hide it from .make()
-        let dont_use_this = std::mem::take(&mut self.freelist);
         let ty = self.make(TypeKind::Pointer);
-        let immutable_ty = self.make(TypeKind::Pointer);
-        let (ty, immutable_ty) = if ty.id & 1 == 0 {
-            self.freelist = dont_use_this;
-            (ty, immutable_ty)
-        } else {
-            let shift = self.make(TypeKind::Pointer);
-            self.freelist = dont_use_this;
-            self.sorry(ty);
-            (immutable_ty, shift)
-        };
-        assert!((ty.id & Type::IMMUTABLE_BIT) == 0);
-        assert!((immutable_ty.id & Type::IMMUTABLE_BIT) == Type::IMMUTABLE_BIT);
-        assert!(ty.id + 1 == immutable_ty.id);
 
         let ptr = self.info_mut(ty);
         ptr.size = std::mem::size_of::<*const u8>();
@@ -467,11 +414,9 @@ impl Types {
         ptr.base_type = base_type.strip_expr_bound();
         ptr.mutable = true;
 
-        let ty = Type::from(ty);
-        *self.info_mut(immutable_ty) = TypeInfo { mutable: false, items: Vec::new(), ..*self.info(ty) };
-
-        self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
-        ty
+        let result = Type::from(ty);
+        self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(result);
+        result
     }
 
     pub fn bound_pointer(&mut self, ty: Type, bound: Bound) -> Type {
@@ -536,28 +481,8 @@ impl Types {
         result
     }
 
-    pub fn annoying_deep_eq_ignoring_mutability(&self, a: Type, b: Type) -> bool {
-        // We need to do this because const-ness is encoded in the type. This
-        // lets us catch some writes thru constant pointers without doing
-        // analysis, but can't catch all of them. SO: we can, and should, not do this,
-        // and also, there are currently programs permitted that shouldnt be
-        if a.to_mutable() == b.to_mutable() {
-            return true;
-        }
-
-        if a.is_pointer() && b.is_pointer() {
-            let a_base = self.base_type(a);
-            let b_base = self.base_type(b);
-            assert!(a_base != a && b_base != b);
-
-            return self.annoying_deep_eq_ignoring_mutability(a_base, b_base);
-        }
-
-        false
-    }
-
     pub fn types_match_with_promotion(&self, promotable: Type, other: Type) -> bool {
-        self.annoying_deep_eq_ignoring_mutability(promotable, other) || integer_promote(promotable) == other
+        promotable == other || integer_promote(promotable) == other
     }
 }
 
