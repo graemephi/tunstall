@@ -1659,8 +1659,8 @@ impl FatGen {
             Bound::Constant(n) => EvaluatedBound::Constant(n.into()),
             Bound::Expr(expr) => match bound_context {
                 BoundContext::None => unreachable!(),
-                &BoundContext::Mark(mark) => {
-                    let restriction = self.locals.restrict_to(mark);
+                BoundContext::Mark(mark) => {
+                    let restriction = self.locals.restrict_to(*mark);
                     let bound = self.expr(ctx, expr);
                     assert_implies!(self.error.is_none(), bound.ty.is_integer());
                     assert!(bound.value.is_none());
@@ -2221,7 +2221,7 @@ impl FatGen {
                     if left.ty != right.ty {
                         error!(self, ctx.ast.expr_source_position(left_expr), "incompatible types ({} {} {})", ctx.type_str(left.ty), op_token, ctx.type_str(right.ty));
                     } else {
-                        error!(self, ctx.ast.expr_source_position(left_expr), "as use the {} operator with {}", op_token, ctx.type_str(right.ty));
+                        error!(self, ctx.ast.expr_source_position(left_expr), "cannot use the {} operator with {}", op_token, ctx.type_str(right.ty));
                     }
                 }
             }
@@ -2332,14 +2332,14 @@ impl FatGen {
                             result.bound_context = BoundContext::Type(addr.ty, Location::stack(arguments_start));
                             result.is_call_result = true;
                         } else {
-                            error!(self, ctx.ast.expr_source_position(callable), "as call proc '{}' from within a func", ctx.callable_str(ident(addr.value)));
+                            error!(self, ctx.ast.expr_source_position(callable), "cannot call proc '{}' from within a func", ctx.callable_str(ident(addr.value)));
                         }
                     } else {
                         error!(self, ctx.ast.expr_source_position(callable), "{} arguments passed to {}, which takes {} arguments", args.len(), ctx.callable_str(ident(addr.value)), info.items.len() - 1);
                     }
                 } else {
                     // Todo: get a string representation of the whole `callable` expr for nicer error message
-                    error!(self, ctx.ast.expr_source_position(callable), "as call a {}", ctx.type_str(addr.ty));
+                    error!(self, ctx.ast.expr_source_position(callable), "cannot call a {}", ctx.type_str(addr.ty));
                 }
             }
             ExprData::Cast(expr, type_expr) => {
@@ -2392,7 +2392,7 @@ impl FatGen {
                     debug_assert!(left.ty.is_pointer());
                     result = ExprResult { ty: ctx.types.pointer(to_ty), ..left };
                 } else {
-                    error!(self, ctx.ast.expr_source_position(expr), "as cast from {} to {}", ctx.type_str(left.ty), ctx.type_str(to_ty));
+                    error!(self, ctx.ast.expr_source_position(expr), "cannot cast from {} to {}", ctx.type_str(left.ty), ctx.type_str(to_ty));
                 }
             }
         };
@@ -2710,7 +2710,7 @@ impl FatGen {
                         // which will fail with a confusing error message if `name` is not declared,
                         // and be a noop otherwise. We disallow the latter case because it's confusing
                         // and provide a better error message for the former.
-                        error!(self, ctx.ast.expr_source_position(expr), "as declare a value without initializing it");
+                        error!(self, ctx.ast.expr_source_position(expr), "cannot declare a value without initializing it");
                     }
                 }
                 self.expr(ctx, expr);
@@ -2747,7 +2747,7 @@ impl FatGen {
                         error!(self, ctx.ast.expr_source_position(left), "type mismatch between declaration ({}) and value ({})", ctx.type_str(decl_type), ctx.type_str(expr.ty))
                     }
                 } else {
-                    error!(self, ctx.ast.expr_source_position(left), "as declare {} as a variable", ctx.ast.expr(left));
+                    error!(self, ctx.ast.expr_source_position(left), "cannot declare {} as a variable", ctx.ast.expr(left));
                 }
             }
             StmtData::Assign(left, right) => {
@@ -4508,10 +4508,10 @@ fn bounds() {
     let ok = [
         (r#"
 Buf: (
-    buf: ptr u8 [len],
-    buf1: ptr u8 [buf[0]],
-    buf2: ptr u8 [*buf],
     buf3: ptr u8 [buf[len]],
+    buf2: ptr u8 [*buf],
+    buf1: ptr u8 [buf[0]],
+    buf: ptr u8 [len],
     len: int,
     cap: int
 );
