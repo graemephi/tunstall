@@ -393,12 +393,13 @@ impl<'c, 'a> Parser<'_, '_> {
         result
     }
 
-    fn is_eof(&mut self) -> bool {
-        token_matches!(self, TokenKind::Eof)
+    fn is(&mut self, kind: TokenKind) -> bool {
+        self.comment();
+        self.token.kind == kind
     }
 
     fn not(&mut self, kind: TokenKind) -> bool {
-        !self.is_eof() && self.token.kind != kind
+        !self.is(TokenKind::Eof) && self.token.kind != kind
     }
 
     fn comment(&mut self) {
@@ -408,8 +409,7 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn try_token(&mut self, kind: TokenKind) -> Option<Token> {
-        self.comment();
-        if self.token.kind == kind {
+        if self.is(kind) {
             let result = Some(self.token);
             self.next_token();
             return result;
@@ -419,8 +419,7 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn token(&mut self, kind: TokenKind) -> Token {
-        self.comment();
-        if self.token.kind == kind {
+        if self.is(kind) {
             let result = self.token;
             self.next_token();
             return result;
@@ -430,8 +429,7 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn try_keyword(&mut self, keyword: Keyword) -> Option<Token> {
-        self.comment();
-        if self.token.kind == TokenKind::Keyword && self.token.keyword == Some(keyword) {
+        if self.is(TokenKind::Keyword) && self.token.keyword == Some(keyword) {
             let result = Some(self.token);
             self.next_token();
             return result;
@@ -441,8 +439,7 @@ impl<'c, 'a> Parser<'_, '_> {
     }
 
     fn keyword(&mut self, keyword: Keyword) -> Token {
-        self.comment();
-        if self.token.kind == TokenKind::Keyword && self.token.keyword == Some(keyword) {
+        if self.is(TokenKind::Keyword) && self.token.keyword == Some(keyword) {
             let result = self.token;
             self.next_token();
             return result;
@@ -733,7 +730,7 @@ impl<'c, 'a> Parser<'_, '_> {
     fn stmt_block(&mut self) -> StmtList {
         self.token(TokenKind::LBrace);
         let mut list = SmallVec::new();
-        while !self.is_eof() && self.try_token(TokenKind::RBrace).is_none() {
+        while !self.is(TokenKind::Eof) && self.try_token(TokenKind::RBrace).is_none() {
             let stmt = self.stmt();
             list.push(self.ctx.ast.pop_stmt(stmt));
         }
@@ -894,7 +891,7 @@ impl<'c, 'a> Parser<'_, '_> {
 
     fn items(&mut self) -> ItemList {
         let mut items = SmallVec::new();
-        while token_matches!(self, TokenKind::Name) {
+        while self.is(TokenKind::Name) {
             let top = items.len();
             items.push(ItemData { name: self.name(), expr: TypeExpr(0) });
             while self.try_token(TokenKind::Comma).is_some() {
@@ -905,7 +902,9 @@ impl<'c, 'a> Parser<'_, '_> {
             for item in &mut items[top..] {
                 item.expr = expr;
             }
-            self.try_token(TokenKind::Comma);
+            if self.try_token(TokenKind::Comma).is_none() {
+                break;
+            }
         }
         self.ctx.ast.push_items(&items)
     }
@@ -945,7 +944,7 @@ impl<'c, 'a> Parser<'_, '_> {
 
 pub fn parse(ctx: &mut Compiler, str: &str) {
     let mut parser = Parser::new(ctx, str);
-    while !parser.is_eof() {
+    while !parser.is(TokenKind::Eof) {
         parser.decl();
     }
 }

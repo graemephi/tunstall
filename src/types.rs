@@ -296,10 +296,6 @@ impl Types {
         &self.types[(ty.id & !Type::POINTER_BIT) as usize]
     }
 
-    pub fn info_bare(&self, ty: BareType) -> &TypeInfo {
-        &self.types[(ty.id & !Type::POINTER_BIT) as usize]
-    }
-
     fn info_mut(&mut self, ty: BareType) -> &mut TypeInfo {
         &mut self.types[(ty.id & !Type::POINTER_BIT) as usize]
     }

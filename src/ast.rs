@@ -307,6 +307,7 @@ impl DeclData {
         }
     }
 
+    #[allow(dead_code)]
     pub fn expr(&self) -> TypeExpr {
         match &self {
             DeclData::Callable(decl) => decl.expr,
