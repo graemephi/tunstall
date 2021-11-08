@@ -273,7 +273,7 @@ fn is_valid_identifier_character(c: char) -> bool {
 }
 
 macro_rules! token_matches {
-    ($self: expr, $($kinds: pat)|+) => {
+    ($self: expr, $($kinds: pat_param)|+) => {
         { $self.comment(); matches!($self.token.kind, $($kinds)|+) }
     }
 }

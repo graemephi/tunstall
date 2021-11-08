@@ -1,5 +1,4 @@
 use std::collections::hash_map::HashMap;
-use std::convert::TryFrom;
 
 use crate::Compiler;
 use crate::ast;
