@@ -605,7 +605,7 @@ impl Ast {
         &self.type_exprs[expr.0 as usize]
     }
 
-    // I wonder what the codegen looks like for these
+    // TypeExpr accessors
 
     fn type_expr_index(&self, expr: TypeExpr, index: usize) -> Option<TypeExpr> {
         match self.type_expr(expr) {
@@ -648,10 +648,22 @@ impl Ast {
         }
     }
 
-    // struct, func type exprs
-    // returns nonsense if used on others
+    fn type_expr_may_have_items(&self, expr: TypeExpr) -> bool {
+        matches!(self.type_expr_keytype(expr), Some(Keytype::Struct|Keytype::Union|Keytype::Func|Keytype::Proc))
+    }
+
+    fn type_expr_may_have_return(&self, expr: TypeExpr) -> bool {
+        matches!(self.type_expr_keytype(expr), Some(Keytype::Func|Keytype::Proc))
+    }
+
+    fn type_expr_may_have_base_type_and_bound(&self, expr: TypeExpr) -> bool {
+        matches!(self.type_expr_keytype(expr), Some(Keytype::Ptr|Keytype::Arr))
+    }
 
     pub fn type_expr_items(&self, expr: TypeExpr) -> Option<ItemList> {
+        if self.type_expr_may_have_items(expr) == false {
+            return None;
+        }
         match self.type_expr(expr) {
             TypeExprData::Items(items) => Some(*items),
             TypeExprData::List(_) => {
@@ -666,6 +678,9 @@ impl Ast {
     }
 
     pub fn type_expr_returns(&self, expr: TypeExpr) -> Option<TypeExpr> {
+        if self.type_expr_may_have_return(expr) == false {
+            return None;
+        }
         let index = if self.type_expr_has_explicit_keytype(expr) { 2 } else { 1 };
         match self.type_expr(expr) {
             TypeExprData::List(_) => self.type_expr_index(expr, index),
@@ -673,10 +688,10 @@ impl Ast {
         }
     }
 
-    // arr, ptr type exprs
-    // returns nonsense if used on others
-
     pub fn type_expr_base_type(&self, expr: TypeExpr) -> Option<TypeExpr> {
+        if self.type_expr_may_have_base_type_and_bound(expr) == false {
+            return None;
+        }
         let index = if self.type_expr_has_explicit_keytype(expr) { 1 } else { 0 };
         match self.type_expr(expr) {
             TypeExprData::List(_) => self.type_expr_index(expr, index),
@@ -685,6 +700,9 @@ impl Ast {
     }
 
     pub fn type_expr_bound(&self, expr: TypeExpr) -> Option<TypeExpr> {
+        if self.type_expr_may_have_base_type_and_bound(expr) == false {
+            return None;
+        }
         let index = if self.type_expr_has_explicit_keytype(expr) { 2 } else { 1 };
         match self.type_expr(expr) {
             TypeExprData::List(_) => self.type_expr_index(expr, index),
