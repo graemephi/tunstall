@@ -625,8 +625,6 @@ impl Ast {
         }
     }
 
-    // All type exprs
-
     pub fn type_expr_keytype(&self, expr: TypeExpr) -> Option<Keytype> {
         match self.type_expr(expr) {
             TypeExprData::Name(key) => Keytype::from_intern(*key),

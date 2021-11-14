@@ -134,12 +134,12 @@ fn find_first_duplicate(ast: &Ast, items: ItemList) -> Option<Intern> {
 
 fn resolve_callable(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
     ctx.symbols.resolving(Kind::Value, name, Type::None);
-    let kind = ctx.ast.type_expr_keytype(expr);
+    let kind = ctx.ast.type_expr_keytype(expr).expect("tried to resolve callable without keytype");
     let params = ctx.ast.type_expr_items(expr);
     let returns = ctx.ast.type_expr_returns(expr);
-    let ty = ctx.types.callable(name, kind == Some(Keytype::Proc));
+    let ty = ctx.types.callable(name, kind);
     let returns_str = ctx.intern("(returns)");
-    if let Some(Keytype::Func)|Some(Keytype::Proc) = kind {
+    if let Keytype::Func|Keytype::Proc = kind {
         if let Some(params) = params {
             for param in params {
                 let item = ctx.ast.item(param);
@@ -153,7 +153,7 @@ fn resolve_callable(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol
             } else {
                 ctx.types.add_item_to_type(ty, returns_str, Type::None);
 
-                if let Some(Keytype::Func) = kind {
+                if let Keytype::Func = kind {
                     // todo: type expr pos
                     error!(ctx, 0, "func without return type");
                 }
@@ -164,7 +164,7 @@ fn resolve_callable(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol
                 error!(ctx, 0, "duplicate parameter name {} in func {}", ctx.str(dup), ctx.str(name));
             }
         } else {
-            error!(ctx, 0, "{} without parameter list", kind.unwrap())
+            error!(ctx, 0, "{} without parameter list", kind)
         }
     } else {
         panic!("non-callable type in callable decl");

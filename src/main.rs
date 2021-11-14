@@ -13,6 +13,7 @@ mod types;
 mod gen;
 mod smallvec;
 
+use parse::Keytype;
 use ast::*;
 use sym::*;
 use types::*;
@@ -239,8 +240,8 @@ impl Display for TypeStrFormatter<'_> {
         let needs_parens = self.ctx.types.base_type(base_type) != base_type;
         match info.kind {
             // Todo: string of func signature, anonymous structs, unions
-            TypeKind::Callable if have_name   => write!(f, "{} {}", if info.mutable { "proc" } else { "func" }, self.ctx.str(self.callable_name)),
-            TypeKind::Callable                => write!(f, "{}", if info.mutable { "proc" } else { "func" }),
+            TypeKind::Callable if have_name   => write!(f, "{} {}", info.keytype, self.ctx.str(self.callable_name)),
+            TypeKind::Callable                => write!(f, "{}", info.keytype),
             TypeKind::Structure if have_name  => write!(f, "{}", self.ctx.str(info.name)),
             TypeKind::Structure               => write!(f, "anonymous structure"),
             TypeKind::Array if needs_parens   => write!(f, "arr ({}) [{}]", self.ctx.type_str(base), info.num_array_elements),
@@ -558,7 +559,7 @@ assert: func (condition: bool) int {
     let main = c.intern("main");
     if let Some(&sym) = sym::lookup_value(&c, main) {
         let info = c.types.info(sym.ty);
-        if info.mutable
+        if info.keytype == Keytype::Proc
         && matches!(info.arguments(), Some(&[]))
         && matches!(info.bare_return_type(), Some(BareType::Int)) {
             gen.code.extend_from_slice(&[FatInstr::call(main), FatInstr::HALT]);

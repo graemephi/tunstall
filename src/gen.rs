@@ -2033,7 +2033,7 @@ impl FatGen {
                 let info = ctx.types.info(addr.ty);
                 if info.kind == TypeKind::Callable {
                     if info.items.len() == args.len() + 1 {
-                        let not_calling_proc_from_func = !(self.target == CodeGenTarget::Func && info.mutable);
+                        let not_calling_proc_from_func = !(self.target == CodeGenTarget::Func && info.keytype == Keytype::Proc);
                         if not_calling_proc_from_func {
                             let return_type = info.return_type().expect("tried to generate code to call a func without return type");
                             let dest_location = if return_type.is_basic() == false {

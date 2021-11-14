@@ -32,7 +32,7 @@ pub fn builtins(ctx: &mut Compiler) {
         let name = ctx.interns.put(str);
         let ty = Type { id: i as u32, bound };
         let items = Vec::new();
-        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: ty, mutable: true, num_array_elements: 0, keytype: Keytype::Builtin });
+        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: ty, num_array_elements: 0, keytype: Keytype::Builtin });
         assert!(size == 0 || size.is_power_of_two());
         sym::builtin(ctx, name, ty);
     }
@@ -215,10 +215,6 @@ pub struct TypeInfo {
     pub items: Vec<Item>,
     // Types without a base_type are their own base_type
     pub base_type: Type,
-    // Two kinds of type can be mutable
-    //  pointers: appear as immutable when passed into funcs
-    //  callables: procs are "mutable" in that they allow side-effects
-    pub mutable: bool,
     pub num_array_elements: usize,
     pub keytype: Keytype
 }
@@ -313,7 +309,6 @@ impl Types {
             alignment: 1,
             items: Vec::new(),
             base_type: result.into(),
-            mutable: true,
             num_array_elements: 0,
             keytype: Keytype::Builtin
         };
@@ -331,7 +326,8 @@ impl Types {
         self.freelist.push(ty.id & !Type::POINTER_BIT);
     }
 
-    pub fn callable(&mut self, name: Intern, mutable: bool) -> BareType {
+    pub fn callable(&mut self, name: Intern, keytype: Keytype) -> BareType {
+        assert!(matches!(keytype, Keytype::Proc|Keytype::Func));
         #[cfg(debug_assertions)] {
             let hash = hash(&(TypeKind::Callable, name));
             if let Some(types) = self.type_by_hash.get(&hash) {
@@ -345,7 +341,7 @@ impl Types {
         }
         let ty = self.make(TypeKind::Callable);
         self.info_mut(ty).name = name;
-        self.info_mut(ty).mutable = mutable;
+        self.info_mut(ty).keytype = keytype;
         ty
     }
 
@@ -396,6 +392,7 @@ impl Types {
         arr.alignment = alignment;
         arr.base_type = base_type.strip_expr_bound();
         arr.num_array_elements = num_array_elements;
+        arr.keytype = Keytype::Arr;
         let ty = Type { id: ty.id, bound: Bound::Constant(num_array_elements) };
         self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(ty);
         ty
@@ -418,7 +415,7 @@ impl Types {
         ptr.size = std::mem::size_of::<*const u8>();
         ptr.alignment = ptr.size;
         ptr.base_type = base_type.strip_expr_bound();
-        ptr.mutable = true;
+        ptr.keytype = Keytype::Ptr;
 
         let result = Type::from(ty);
         self.type_by_hash.entry(hash).or_insert_with(|| SmallVecN::new()).push(result);
