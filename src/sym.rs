@@ -180,8 +180,9 @@ fn resolve_var(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
     ctx.symbols.resolved(Kind::Value, name, ty, location)
 }
 
-fn resolve_struct(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
-    let tentative_ty = ctx.types.strukt(name);
+fn resolve_structure(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
+    let kt = ctx.ast.type_expr_keytype(expr).expect("tried to resolve structure without keytype");
+    let tentative_ty = ctx.types.structure(name, kt);
     let sym_ty = ctx.symbols.resolving(Kind::Type, name, Type::from(tentative_ty));
     if sym_ty != tentative_ty {
         ctx.types.sorry(tentative_ty);
@@ -211,9 +212,9 @@ fn resolve_struct(ctx: &mut Compiler, name: Intern, expr: TypeExpr) -> &Symbol {
     ctx.symbols.resolved(Kind::Type, name, ty, 0)
 }
 
-pub fn resolve_anonymous_struct(ctx: &mut Compiler, fields: ItemList) -> Type {
+pub fn resolve_anonymous_structure(ctx: &mut Compiler, fields: ItemList, keytype: Keytype) -> Type {
     // Anonymous structs do not have a symbol, but we still have to resolve their fields.
-    let ty = ctx.types.anonymous(TypeKind::Struct);
+    let ty = ctx.types.anonymous(TypeKind::Structure, keytype);
     if fields.is_nonempty() {
         for field in fields {
             let item = ctx.ast.item(field);
@@ -251,7 +252,7 @@ fn resolve(ctx: &mut Compiler, kind: Kind, name: Intern) -> Option<&Symbol> {
     if let Some(decl) = decl_to_resolve {
         return match *ctx.ast.decl(decl) {
             DeclData::Callable(func) => Some(resolve_callable(ctx, func.name, func.expr)),
-            DeclData::Struct(strukt) => Some(resolve_struct(ctx, strukt.name, strukt.expr)),
+            DeclData::Structure(structure) => Some(resolve_structure(ctx, structure.name, structure.expr)),
             DeclData::Var(var) =>  Some(resolve_var(ctx, var.name, var.expr)),
         };
     }
@@ -261,7 +262,7 @@ fn resolve(ctx: &mut Compiler, kind: Kind, name: Intern) -> Option<&Symbol> {
 pub fn resolve_decls(ctx: &mut Compiler) {
     for decl in ctx.ast.decl_list() {
         let (kind, &name) = match ctx.ast.decl(decl) {
-            DeclData::Struct(StructDecl { name, .. }) => (Kind::Type, name),
+            DeclData::Structure(StructureDecl { name, .. }) => (Kind::Type, name),
             DeclData::Callable(CallableDecl { name, .. }) => (Kind::Value, name),
             DeclData::Var(VarDecl { name, .. }) => (Kind::Value, name)
         };
@@ -274,8 +275,8 @@ pub fn resolve_decls(ctx: &mut Compiler) {
     }
     for decl in ctx.ast.decl_list() {
         let (kind, &name) = match ctx.ast.decl(decl) {
-            DeclData::Struct(StructDecl { name, .. }) => (Kind::Type, name),
             DeclData::Callable(CallableDecl { name, .. }) => (Kind::Value, name),
+            DeclData::Structure(StructureDecl { name, .. }) => (Kind::Type, name),
             DeclData::Var(VarDecl { name, .. }) => (Kind::Value, name)
         };
 
@@ -307,9 +308,9 @@ pub fn lookup_type_mut(ctx: &mut Compiler, name: Intern) -> Option<&mut Symbol> 
 pub fn touch_type(ctx: &mut Compiler, name: Intern) -> Type {
     lookup_type_mut(ctx, name).map(|sym| (sym.state, sym.ty)).map(|(state, ty)| {
         if state == State::Declared {
-            // We don't know what this is yet. But we don't have anything it could otherwise be (enum, union, ?).
+            // We don't know what this is yet. So just guess
             assert!(ty == Type::None);
-            let ty = ctx.types.strukt(name).into();
+            let ty = ctx.types.structure(name, Keytype::Struct).into();
             ctx.symbols.touched(name, ty);
             ty
         } else {

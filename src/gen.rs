@@ -640,7 +640,7 @@ impl Locals {
                 self.insert(item.name, Local::item(loc, item.ty, BoundContext::Mark(self.mark)));
             }
         } else {
-            assert!(info.kind == TypeKind::Struct);
+            assert!(info.kind == TypeKind::Structure);
             for item in &info.items {
                 let loc = base.offset_by(item.offset as isize);
                 self.insert(item.name, Local::item(loc, item.ty, BoundContext::Mark(self.mark)));
@@ -1292,7 +1292,7 @@ impl FatGen {
                 }
             }
             TypeExprData::Expr(_) => todo!(),
-            TypeExprData::Items(items) => result = sym::resolve_anonymous_struct(ctx, items),
+            TypeExprData::Items(items) => result = sym::resolve_anonymous_structure(ctx, items, Keytype::Struct),
             TypeExprData::List(_) => {
                 match ctx.ast.type_expr_keytype(expr) {
                     Some(Keytype::Arr) => {
@@ -1373,9 +1373,9 @@ impl FatGen {
                             error!(ctx, 0, "too many parameters for keytype ptr");
                         }
                     }
-                    Some(Keytype::Struct) => {
+                    Some(kt @ Keytype::Struct)|Some(kt @ Keytype::Union) => {
                         if let Some(items) = ctx.ast.type_expr_items(expr) {
-                            result = sym::resolve_anonymous_struct(ctx, items);
+                            result = sym::resolve_anonymous_structure(ctx, items, kt);
                         } else {
                             error!(self, 0, "struct has no fields");
                         }
@@ -1384,7 +1384,7 @@ impl FatGen {
                         }
                     }
                     Some(Keytype::Func)|Some(Keytype::Proc) => error!(self, 0, "func/proc pointers are not implemented"),
-                    None => error!(self, 0, "expected keytype (one of func, proc, struct, arr, ptr)")
+                    None|Some(_) => error!(self, 0, "expected keytype (one of func, proc, struct, arr, ptr)")
                 }
             }
         }
@@ -1768,7 +1768,7 @@ impl FatGen {
                     // Todo: check for duplicate fields. need to consider unions and fancy paths (both unimplemented)
                     let info = ctx.types.info(destination.ty);
                     let kind = info.kind;
-                    if let TypeKind::Struct|TypeKind::Array = kind {
+                    if let TypeKind::Structure|TypeKind::Array = kind {
                         let base;
                         if fields.is_empty() && destination.addr.kind != LocationKind::None {
                             base = destination.addr;
@@ -1804,7 +1804,7 @@ impl FatGen {
                                 }
                             }
                         }
-                        if let TypeKind::Struct = kind {
+                        if let TypeKind::Structure = kind {
                             let mark = self.locals.push_type(ctx, destination.ty, &base);
                             for &(item, expr) in field_exprs.iter() {
                                 let local = self.locals.get(item).expect("local scope is missing item in bound context");

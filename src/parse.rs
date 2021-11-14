@@ -205,9 +205,11 @@ impl std::fmt::Display for Keyword {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Keytype {
+    Builtin,
     Func = Keyword::Switch as isize + 1,
     Proc,
     Struct,
+    Union,
     Arr,
     Ptr,
 }
@@ -218,8 +220,9 @@ impl Keytype {
             10 => Some(Keytype::Func),
             11 => Some(Keytype::Proc),
             12 => Some(Keytype::Struct),
-            13 => Some(Keytype::Arr),
-            14 => Some(Keytype::Ptr),
+            13 => Some(Keytype::Union),
+            14 => Some(Keytype::Arr),
+            15 => Some(Keytype::Ptr),
             _  => None,
         }
     }
@@ -230,9 +233,11 @@ impl Keytype {
 
     pub const fn to_str(self) -> &'static str {
         match self {
+            Keytype::Builtin => "builtin",
             Keytype::Func => "func",
             Keytype::Proc => "proc",
             Keytype::Struct => "struct",
+            Keytype::Union => "union",
             Keytype::Arr => "arr",
             Keytype::Ptr => "ptr"
         }
@@ -915,18 +920,18 @@ impl<'c, 'a> Parser<'_, '_> {
         if self.try_token(TokenKind::Colon).is_some() {
             let expr = self.type_expr(0);
             match self.ctx.ast.type_expr_keytype(expr) {
-                Some(Keytype::Func)|Some(Keytype::Proc) => {
+                Some(Keytype::Func|Keytype::Proc) => {
                     let body = self.stmt_block();
                     self.ctx.ast.push_decl_callable(CallableDecl { pos, name, expr, body });
                 }
-                Some(Keytype::Struct) => {
+                Some(Keytype::Struct|Keytype::Union) => {
                     if self.try_token(TokenKind::Assign).is_some() {
                         let value = self.expr();
                         self.token(TokenKind::Semicolon);
                         self.ctx.ast.push_decl_var(VarDecl { pos, name, expr, value });
                     } else {
                         self.token(TokenKind::Semicolon);
-                        self.ctx.ast.push_decl_struct(StructDecl { pos, name, expr });
+                        self.ctx.ast.push_decl_structure(StructureDecl { pos, name, expr });
                     }
                 }
                 _ => {

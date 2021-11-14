@@ -268,7 +268,7 @@ pub struct CallableDecl {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct StructDecl {
+pub struct StructureDecl {
     pub pos: usize,
     pub name: Intern,
     pub expr: TypeExpr,
@@ -285,7 +285,7 @@ pub struct VarDecl {
 #[derive(Clone, Copy, Debug)]
 pub enum DeclData {
     Callable(CallableDecl),
-    Struct(StructDecl),
+    Structure(StructureDecl),
     Var(VarDecl)
 }
 
@@ -293,7 +293,7 @@ impl DeclData {
     pub fn name(&self) -> Intern {
         match &self {
             DeclData::Callable(decl) => decl.name,
-            DeclData::Struct(decl) => decl.name,
+            DeclData::Structure(decl) => decl.name,
             DeclData::Var(decl) => decl.name,
         }
     }
@@ -301,7 +301,7 @@ impl DeclData {
     pub fn pos(&self) -> usize {
         match &self {
             DeclData::Callable(decl) => decl.pos,
-            DeclData::Struct(decl) => decl.pos,
+            DeclData::Structure(decl) => decl.pos,
             DeclData::Var(decl) => decl.pos,
         }
     }
@@ -310,7 +310,7 @@ impl DeclData {
     pub fn expr(&self) -> TypeExpr {
         match &self {
             DeclData::Callable(decl) => decl.expr,
-            DeclData::Struct(decl) => decl.expr,
+            DeclData::Structure(decl) => decl.expr,
             DeclData::Var(decl) => decl.expr,
         }
     }
@@ -321,7 +321,7 @@ impl Display for DeclData {
         match *self {
             // todo: func/proc
             DeclData::Callable(_) => write!(f, "callable"),
-            DeclData::Struct(_) => write!(f, "struct"),
+            DeclData::Structure(_) => write!(f, "struct"),
             DeclData::Var(_) => write!(f, "var"),
         }
     }
@@ -560,8 +560,8 @@ impl Ast {
         self.push_decl(DeclData::Callable(decl))
     }
 
-    pub fn push_decl_struct(&mut self, decl: StructDecl) -> Decl {
-        self.push_decl(DeclData::Struct(decl))
+    pub fn push_decl_structure(&mut self, decl: StructureDecl) -> Decl {
+        self.push_decl(DeclData::Structure(decl))
     }
 
     pub fn push_decl_var(&mut self, decl: VarDecl) -> Decl {

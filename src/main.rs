@@ -238,11 +238,11 @@ impl Display for TypeStrFormatter<'_> {
         let base_type = self.ctx.types.base_type(self.ty);
         let needs_parens = self.ctx.types.base_type(base_type) != base_type;
         match info.kind {
-            // Todo: string of func signature, anonymous structs
+            // Todo: string of func signature, anonymous structs, unions
             TypeKind::Callable if have_name   => write!(f, "{} {}", if info.mutable { "proc" } else { "func" }, self.ctx.str(self.callable_name)),
             TypeKind::Callable                => write!(f, "{}", if info.mutable { "proc" } else { "func" }),
-            TypeKind::Struct if have_name     => write!(f, "{}", self.ctx.str(info.name)),
-            TypeKind::Struct                  => write!(f, "anonymous struct"),
+            TypeKind::Structure if have_name  => write!(f, "{}", self.ctx.str(info.name)),
+            TypeKind::Structure               => write!(f, "anonymous structure"),
             TypeKind::Array if needs_parens   => write!(f, "arr ({}) [{}]", self.ctx.type_str(base), info.num_array_elements),
             TypeKind::Array                   => write!(f, "arr {} [{}]", self.ctx.type_str(base), info.num_array_elements),
             TypeKind::Pointer if needs_parens => write!(f, "ptr ({})", self.ctx.type_str(base)),

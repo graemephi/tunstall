@@ -6,6 +6,7 @@ use crate::Intern;
 use crate::hash;
 
 use crate::sym;
+use crate::parse::Keytype;
 
 use crate::smallvec::*;
 
@@ -31,7 +32,7 @@ pub fn builtins(ctx: &mut Compiler) {
         let name = ctx.interns.put(str);
         let ty = Type { id: i as u32, bound };
         let items = Vec::new();
-        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: ty, mutable: true, num_array_elements: 0 });
+        ctx.types.types.push(TypeInfo { kind, name, size: size, alignment: size.max(1), items, base_type: ty, mutable: true, num_array_elements: 0, keytype: Keytype::Builtin });
         assert!(size == 0 || size.is_power_of_two());
         sym::builtin(ctx, name, ty);
     }
@@ -182,7 +183,7 @@ pub enum TypeKind {
     F64,
     Bool,
     Callable,
-    Struct,
+    Structure,
     Array,
     Pointer,
 }
@@ -219,6 +220,7 @@ pub struct TypeInfo {
     //  callables: procs are "mutable" in that they allow side-effects
     pub mutable: bool,
     pub num_array_elements: usize,
+    pub keytype: Keytype
 }
 
 impl TypeInfo {
@@ -274,7 +276,7 @@ impl Types {
     pub fn index_info(&self, ty: Type, index: usize) -> Option<Item> {
         let info = self.info(ty);
         match info.kind {
-            TypeKind::Struct => {
+            TypeKind::Structure => {
                 info.items.iter().nth(index).copied()
             }
             TypeKind::Array => {
@@ -313,6 +315,7 @@ impl Types {
             base_type: result.into(),
             mutable: true,
             num_array_elements: 0,
+            keytype: Keytype::Builtin
         };
         if idx == self.types.len() {
             self.types.push(info)
@@ -346,24 +349,28 @@ impl Types {
         ty
     }
 
-    pub fn anonymous(&mut self, kind: TypeKind) -> BareType {
-        self.make(kind)
+    pub fn anonymous(&mut self, kind: TypeKind, keytype: Keytype) -> BareType {
+        let result = self.make(kind);
+        self.info_mut(result).keytype = keytype;
+        result
     }
 
-    pub fn strukt(&mut self, name: Intern) -> BareType {
+    pub fn structure(&mut self, name: Intern, keytype: Keytype) -> BareType {
+        assert!(matches!(keytype, Keytype::Struct|Keytype::Union));
         #[cfg(debug_assertions)] {
-            let hash = hash(&(TypeKind::Struct, name));
+            let hash = hash(&(TypeKind::Structure, name));
             if let Some(types) = self.type_by_hash.get(&hash) {
                 for &ty in types.iter() {
                     let info = self.info(ty);
-                    if info.kind == TypeKind::Struct && info.name == name {
-                        panic!("struct made twice: calling code must check for cycles");
+                    if info.kind == TypeKind::Structure && info.name == name {
+                        panic!("structure made twice: calling code must check for cycles");
                     }
                 }
             }
         }
-        let result = self.make(TypeKind::Struct);
+        let result = self.make(TypeKind::Structure);
         self.info_mut(result).name = name;
+        self.info_mut(result).keytype = keytype;
         result
     }
 
@@ -432,7 +439,7 @@ impl Types {
             let ty_info = self.info_mut(ty);
             match ty_info.kind {
                 TypeKind::Callable => (std::mem::size_of::<*const u8>(), std::mem::align_of::<*const u8>()),
-                TypeKind::Struct => {
+                TypeKind::Structure => {
                     let item_info = self.info(item);
                     (item_info.size, item_info.alignment)
                 },
@@ -440,7 +447,10 @@ impl Types {
             }
         };
         let info = self.info_mut(ty);
-        let offset = (info.size + (alignment - 1)) & !(alignment - 1);
+        let offset = match info.keytype {
+            Keytype::Union => 0,
+            _ => (info.size + (alignment - 1)) & !(alignment - 1),
+        };
         assert!(offset & !(alignment - 1) == offset);
         info.size = offset + size;
         info.alignment = info.alignment.max(alignment);
@@ -521,6 +531,13 @@ Padding2: struct (
     c: i16,
 );
 
+Union: union (
+    a: i16,
+    b: i32,
+    c: i64,
+    d: i8
+);
+
 Ptr: struct (
     a: ptr,
     b: ptr u8 [8],
@@ -538,6 +555,7 @@ Ptr: struct (
     let ptr = c.intern("Ptr");
     let padding = c.intern("Padding");
     let padding2 = c.intern("Padding2");
+    let union = c.intern("Union");
 
     let int_ptr = c.types.pointer(Type::Int);
     let ptr_ptr = c.types.pointer(sym::lookup_type(&c, ptr).map(|sym| sym.ty).unwrap());
@@ -550,6 +568,7 @@ Ptr: struct (
     let ptr = get(ptr);
     let padding = get(padding);
     let padding2 = get(padding2);
+    let union = get(union);
 
     assert_eq!(v2.size, 8);
     assert_eq!(v2.alignment, 4);
@@ -592,7 +611,7 @@ Ptr: struct (
     assert_eq!(aoi.base_type, Type::I32);
     assert_eq!(aoi.num_array_elements, 3);
 
-    assert_eq!(ptr.kind, TypeKind::Struct);
+    assert_eq!(ptr.kind, TypeKind::Structure);
     assert_eq!(ptr.size, 40);
     assert_eq!(ptr.alignment, 8);
     assert_eq!(ptr.items[0].ty, Type::VoidPtr);
@@ -617,4 +636,11 @@ Ptr: struct (
     assert_eq!(padding2.items[0].offset, 0);
     assert_eq!(padding2.items[1].offset, 8);
     assert_eq!(padding2.items[2].offset, 32);
+
+    assert_eq!(union.size, 8);
+    assert_eq!(union.alignment, 8);
+    assert_eq!(union.items[0].offset, 0);
+    assert_eq!(union.items[1].offset, 0);
+    assert_eq!(union.items[2].offset, 0);
+    assert_eq!(union.items[3].offset, 0);
 }
