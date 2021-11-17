@@ -61,6 +61,13 @@ pub enum TokenKind {
     Char,
     String,
     Comment,
+    UMod,
+    ULt,
+    UGt,
+    UDiv,
+    ULtEq,
+    UGtEq,
+    URShift,
 }
 
 impl std::fmt::Display for TokenKind {
@@ -108,7 +115,14 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Int => "integer",
             TokenKind::Keyword => "keyword",
             TokenKind::Float => "float",
-            TokenKind::Name => "name"
+            TokenKind::Name => "name",
+            TokenKind::UMod => "%'",
+            TokenKind::ULt => "<'",
+            TokenKind::UGt => ">'",
+            TokenKind::UDiv => "/'",
+            TokenKind::ULtEq => "<='",
+            TokenKind::UGtEq => ">='",
+            TokenKind::URShift => ">>'",
         })
     }
 }
@@ -305,6 +319,9 @@ impl<'c, 'a> Parser<'_, '_> {
         let p = self.p.trim_start();
         let len = match *p.as_bytes() {
             [] => 0,
+            [b'<', b'=', b'\'', ..] => { result.kind = TokenKind::ULtEq; 3 }
+            [b'>', b'=', b'\'', ..] => { result.kind = TokenKind::UGtEq; 3 }
+            [b'>', b'>', b'\'', ..] => { result.kind = TokenKind::URShift; 3 }
             [b'&', b'&', ..] => { result.kind = TokenKind::LogicAnd; 2 }
             [b'|', b'|', ..] => { result.kind = TokenKind::LogicOr; 2 }
             [b'=', b'=', ..] => { result.kind = TokenKind::Eq; 2 }
@@ -316,6 +333,10 @@ impl<'c, 'a> Parser<'_, '_> {
             [b'-', b'>', ..] => { result.kind = TokenKind::Arrow; 2 }
             [b':', b':', ..] => { result.kind = TokenKind::ColonColon; 2 }
             [b':', b'=', ..] => { result.kind = TokenKind::ColonAssign; 2 }
+            [b'%', b'\'', ..] => { result.kind = TokenKind::UMod; 2 }
+            [b'<', b'\'', ..] => { result.kind = TokenKind::ULt; 2 }
+            [b'>', b'\'', ..] => { result.kind = TokenKind::UGt; 2 }
+            [b'/', b'\'', ..] => { result.kind = TokenKind::UDiv; 2 }
             [b'/', b'/', ..] => { result.kind = TokenKind::Comment; one_after_escaped_position(p, b'\n') }
             [b'(', ..] => { result.kind = TokenKind::LParen; 1 }
             [b')', ..] => { result.kind = TokenKind::RParen; 1 }
@@ -648,7 +669,7 @@ impl<'c, 'a> Parser<'_, '_> {
     fn mul_expr(&mut self) -> Expr {
         use TokenKind::*;
         let mut result = self.unary_expr();
-        while token_matches!(self, Mul|Div|Mod|BitAnd|LShift|RShift) {
+        while token_matches!(self, Mul|Div|UDiv|Mod|UMod|BitAnd|LShift|RShift|URShift) {
             let token = self.token;
             self.next_token();
             let right = self.unary_expr();
@@ -672,7 +693,7 @@ impl<'c, 'a> Parser<'_, '_> {
     fn cmp_expr(&mut self) -> Expr {
         use TokenKind::*;
         let mut result = self.add_expr();
-        while token_matches!(self, Lt|Gt|Eq|NEq|LtEq|GtEq) {
+        while token_matches!(self, Lt|ULt|Gt|UGt|Eq|NEq|LtEq|ULtEq|GtEq|UGtEq) {
             let token = self.token;
             self.next_token();
             let right = self.add_expr();

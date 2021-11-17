@@ -40,6 +40,13 @@ pub enum Op {
     RShift,
     LogicOr,
     LogicAnd,
+    UnsignedIntDiv,
+    UnsignedIntMod,
+    UnsignedIntLt,
+    UnsignedIntGt,
+    UnsignedIntLtEq,
+    UnsignedIntGtEq,
+    UnsignedRShift,
     F32Neg,
     F32Add,
     F32Sub,
@@ -110,6 +117,83 @@ pub fn disallowed_in_constant_expression(op: Op) -> bool {
     matches!(op, Call|CallIndirect|Store8|Store16|Store32|Store64|Copy|Zero|Halt|Panic)
 }
 
+pub fn is_unary(op: Op) -> bool {
+    use Op::*;
+    matches!(op,
+            | Noop
+            | IntNeg
+            | BitNeg
+            | Not
+            | CmpZero
+            | Move
+            | MoveLower8
+            | MoveLower16
+            | MoveLower32
+            | MoveAndSignExtendLower8
+            | MoveAndSignExtendLower16
+            | MoveAndSignExtendLower32
+            | IntToFloat32
+            | IntToFloat64
+            | Float32ToInt
+            | Float32To64
+            | Float64ToInt
+            | Float64To32
+            | F32Neg
+            | F64Neg
+    )
+}
+
+pub fn is_binary(op: Op) -> bool {
+    use Op::*;
+    matches!(op,
+            | IntAdd
+            | IntSub
+            | IntMul
+            | IntDiv
+            | IntMod
+            | IntLt
+            | IntGt
+            | IntEq
+            | IntNEq
+            | IntLtEq
+            | IntGtEq
+            | BitAnd
+            | BitOr
+            | BitXor
+            | UnsignedIntDiv
+            | UnsignedIntMod
+            | UnsignedIntLt
+            | UnsignedIntGt
+            | UnsignedIntLtEq
+            | UnsignedIntGtEq
+            | UnsignedRShift
+            | LShift
+            | RShift
+            | LogicOr
+            | LogicAnd
+            | F32Add
+            | F32Sub
+            | F32Mul
+            | F32Div
+            | F32Lt
+            | F32Gt
+            | F32Eq
+            | F32NEq
+            | F32LtEq
+            | F32GtEq
+            | F64Add
+            | F64Sub
+            | F64Mul
+            | F64Div
+            | F64Lt
+            | F64Gt
+            | F64Eq
+            | F64NEq
+            | F64LtEq
+            | F64GtEq
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FatInstr {
     pub op: Op,
@@ -136,6 +220,7 @@ pub union RegValue {
     pub int: usize,
     pub sint: isize,
     pub wint: std::num::Wrapping<usize>,
+    pub swint: std::num::Wrapping<isize>,
     pub int32: (u32, u32),
     pub int16: (u16, u16, u16, u16),
     pub int8: (u8, u8, u8, u8, u8, u8, u8, u8),
@@ -201,6 +286,12 @@ impl From<usize> for RegValue {
 impl From<std::num::Wrapping<usize>> for RegValue {
     fn from(value: std::num::Wrapping<usize>) -> Self {
         RegValue { wint: value }
+    }
+}
+
+impl From<std::num::Wrapping<isize>> for RegValue {
+    fn from(value: std::num::Wrapping<isize>) -> Self {
+        RegValue { swint: value }
     }
 }
 
@@ -337,6 +428,14 @@ fn binary_op(op: TokenKind, left: Type, right: Type) -> Option<(Op, Type)> {
         (TokenKind::NEq,      BareType::Int) => Some((Op::IntNEq,  Type::Bool)),
         (TokenKind::LtEq,     BareType::Int) => Some((Op::IntLtEq, Type::Bool)),
 
+        (TokenKind::UDiv,     BareType::Int) => Some((Op::UnsignedIntDiv,  Type::Int)),
+        (TokenKind::UMod,     BareType::Int) => Some((Op::UnsignedIntMod,  Type::Int)),
+        (TokenKind::URShift,  BareType::Int) => Some((Op::UnsignedRShift,  Type::Int)),
+        (TokenKind::ULt,      BareType::Int) => Some((Op::UnsignedIntLt,   Type::Bool)),
+        (TokenKind::UGt,      BareType::Int) => Some((Op::UnsignedIntGt,   Type::Bool)),
+        (TokenKind::ULtEq,    BareType::Int) => Some((Op::UnsignedIntLtEq, Type::Bool)),
+        (TokenKind::UGtEq,    BareType::Int) => Some((Op::UnsignedIntGtEq, Type::Bool)),
+
         (TokenKind::LogicAnd, BareType::Bool) => Some((Op::LogicAnd, Type::Bool)),
         (TokenKind::LogicOr,  BareType::Bool) => Some((Op::LogicOr,  Type::Bool)),
 
@@ -456,7 +555,7 @@ fn load_op(ty: Type) -> Option<Op> {
 // need to check the type of the value isn't pointer, as the representation of
 // constant pointers is not the same as their run time values (they are stack
 // offsets until then). This sucks a little
-fn apply_unary_op(op: Op, value: RegValue) -> RegValue {
+pub fn apply_unary_op(op: Op, value: RegValue) -> RegValue {
     unsafe {
         match op {
             Op::Noop                     => value,
@@ -464,6 +563,7 @@ fn apply_unary_op(op: Op, value: RegValue) -> RegValue {
             Op::BitNeg                   => RegValue::from(!value.int),
             Op::Not                      => RegValue::from((value.int == 0) as usize),
             Op::CmpZero                  => RegValue::from((value.int != 0) as usize),
+            Op::Move                     => RegValue::from(value.int        as usize),
             Op::MoveLower8               => RegValue::from(value.int8.0     as usize),
             Op::MoveLower16              => RegValue::from(value.int16.0    as usize),
             Op::MoveLower32              => RegValue::from(value.int32.0    as usize),
@@ -483,26 +583,34 @@ fn apply_unary_op(op: Op, value: RegValue) -> RegValue {
     }
 }
 
-fn apply_binary_op(op: Op, left: RegValue, right: RegValue) -> RegValue {
+pub fn apply_binary_op(op: Op, left: RegValue, right: RegValue) -> RegValue {
     unsafe {
         match op {
-            Op::IntAdd   => RegValue::from(left.wint + right.wint),
-            Op::IntSub   => RegValue::from(left.wint - right.wint),
-            Op::IntMul   => RegValue::from(left.wint * right.wint),
-            Op::IntDiv   => RegValue::from(left.wint / right.wint),
-            Op::IntMod   => RegValue::from(left.wint % right.wint),
-            Op::IntLt    => RegValue::from(left.int < right.int),
-            Op::IntGt    => RegValue::from(left.int > right.int),
-            Op::IntEq    => RegValue::from(left.int == right.int),
-            Op::IntNEq   => RegValue::from(left.int != right.int),
-            Op::IntLtEq  => RegValue::from(left.int <= right.int),
-            Op::IntGtEq  => RegValue::from(left.int >= right.int),
-            Op::BitAnd   => RegValue::from(left.int & right.int),
-            Op::BitOr    => RegValue::from(left.int | right.int),
-            Op::BitXor   => RegValue::from(left.int ^ right.int),
+            Op::IntAdd   => RegValue::from(left.swint + right.swint),
+            Op::IntSub   => RegValue::from(left.swint - right.swint),
+            Op::IntMul   => RegValue::from(left.swint * right.swint),
+            Op::IntDiv   => RegValue::from(left.swint / right.swint),
+            Op::IntMod   => RegValue::from(left.swint % right.swint),
+            Op::IntLt    => RegValue::from(left.sint < right.sint),
+            Op::IntGt    => RegValue::from(left.sint > right.sint),
+            Op::IntEq    => RegValue::from(left.sint == right.sint),
+            Op::IntNEq   => RegValue::from(left.sint != right.sint),
+            Op::IntLtEq  => RegValue::from(left.sint <= right.sint),
+            Op::IntGtEq  => RegValue::from(left.sint >= right.sint),
+            Op::BitAnd   => RegValue::from(left.sint & right.sint),
+            Op::BitOr    => RegValue::from(left.sint | right.sint),
+            Op::BitXor   => RegValue::from(left.sint ^ right.sint),
 
-            Op::LShift   => RegValue::from(left.int << right.int),
-            Op::RShift   => RegValue::from(left.int >> right.int),
+            Op::UnsignedIntDiv  => RegValue::from(left.int / right.int),
+            Op::UnsignedIntMod  => RegValue::from(left.int % right.int),
+            Op::UnsignedIntLt   => RegValue::from(left.int < right.int),
+            Op::UnsignedIntGt   => RegValue::from(left.int > right.int),
+            Op::UnsignedIntLtEq => RegValue::from(left.int <= right.int),
+            Op::UnsignedIntGtEq => RegValue::from(left.int >= right.int),
+            Op::UnsignedRShift  => RegValue::from(left.int >> right.int),
+
+            Op::LShift   => RegValue::from(left.sint << right.sint),
+            Op::RShift   => RegValue::from(left.sint >> right.sint),
 
             Op::LogicOr  => RegValue::from((left.b8.0 || right.b8.0) as usize),
             Op::LogicAnd => RegValue::from((left.b8.0 && right.b8.0) as usize),

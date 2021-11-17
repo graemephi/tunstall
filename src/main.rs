@@ -380,78 +380,7 @@ impl Compiler {
                             unreachable!();
                         }
                     }
-                    Op::Noop       => {}
                     Op::Immediate  => { reg![dest] = RegValue::from((instr.left, instr.right)); }
-                    Op::IntNeg     => { reg![dest].sint = -reg![left].sint; }
-                    Op::IntAdd     => { reg![dest].wint = reg![left].wint + reg![right].wint; }
-                    Op::IntSub     => { reg![dest].wint = reg![left].wint - reg![right].wint; }
-                    Op::IntMul     => { reg![dest].wint = reg![left].wint * reg![right].wint; }
-                    Op::IntDiv     => { reg![dest].wint = reg![left].wint / reg![right].wint; }
-                    Op::IntMod     => { reg![dest].wint = reg![left].wint % reg![right].wint; }
-                    Op::IntLt      => { reg![dest].int = (reg![left].int < reg![right].int) as usize; }
-                    Op::IntGt      => { reg![dest].int = (reg![left].int > reg![right].int) as usize; }
-                    Op::IntEq      => { reg![dest].int = (reg![left].int == reg![right].int) as usize; }
-                    Op::IntNEq     => { reg![dest].int = (reg![left].int != reg![right].int) as usize; }
-                    Op::IntLtEq    => { reg![dest].int = (reg![left].int <= reg![right].int) as usize; }
-                    Op::IntGtEq    => { reg![dest].int = (reg![left].int >= reg![right].int) as usize; }
-                    Op::BitNeg     => { reg![dest].int = !reg![left].int }
-                    Op::BitAnd     => { reg![dest].int = reg![left].int & reg![right].int; }
-                    Op::BitOr      => { reg![dest].int = reg![left].int | reg![right].int; }
-                    Op::BitXor     => { reg![dest].int = reg![left].int ^ reg![right].int; }
-
-                    Op::LShift     => { reg![dest].int = reg![left].int << reg![right].int; }
-                    Op::RShift     => { reg![dest].int = reg![left].int >> reg![right].int; }
-
-                    Op::Not        => { reg![dest].int = (reg![left].int == 0) as usize; }
-                    Op::CmpZero    => { reg![dest].int = (reg![left].int != 0) as usize; }
-                    Op::LogicOr    => { reg![dest].int = (reg![left].b8.0 || reg![right].b8.0) as usize; }
-                    Op::LogicAnd   => { reg![dest].int = (reg![left].b8.0 && reg![right].b8.0) as usize; }
-
-                    Op::F32Neg     => { reg![dest].float32.0 = -reg![left].float32.0;
-                                        reg![dest].float32.1 = 0.0; }
-                    Op::F32Add     => { reg![dest].float32.0 = reg![left].float32.0 + reg![right].float32.0;
-                                        reg![dest].float32.1 = 0.0; }
-                    Op::F32Sub     => { reg![dest].float32.0 = reg![left].float32.0 - reg![right].float32.0;
-                                        reg![dest].float32.1 = 0.0; }
-                    Op::F32Mul     => { reg![dest].float32.0 = reg![left].float32.0 * reg![right].float32.0;
-                                        reg![dest].float32.1 = 0.0; }
-                    Op::F32Div     => { reg![dest].float32.0 = reg![left].float32.0 / reg![right].float32.0;
-                                        reg![dest].float32.1 = 0.0; }
-                    Op::F32Lt      => { reg![dest].int = (reg![left].float32.0 < reg![right].float32.0) as usize; }
-                    Op::F32Gt      => { reg![dest].int = (reg![left].float32.0 > reg![right].float32.0) as usize; }
-                    Op::F32Eq      => { reg![dest].int = (reg![left].float32.0 == reg![right].float32.0) as usize; }
-                    Op::F32NEq     => { reg![dest].int = (reg![left].float32.0 != reg![right].float32.0) as usize; }
-                    Op::F32LtEq    => { reg![dest].int = (reg![left].float32.0 <= reg![right].float32.0) as usize; }
-                    Op::F32GtEq    => { reg![dest].int = (reg![left].float32.0 >= reg![right].float32.0) as usize; }
-
-                    Op::F64Neg     => { reg![dest].float64 = -reg![left].float64; }
-                    Op::F64Add     => { reg![dest].float64 = reg![left].float64 + reg![right].float64; }
-                    Op::F64Sub     => { reg![dest].float64 = reg![left].float64 - reg![right].float64; }
-                    Op::F64Mul     => { reg![dest].float64 = reg![left].float64 * reg![right].float64; }
-                    Op::F64Div     => { reg![dest].float64 = reg![left].float64 / reg![right].float64; }
-                    Op::F64Lt      => { reg![dest].int = (reg![left].float64 < reg![right].float64) as usize; }
-                    Op::F64Gt      => { reg![dest].int = (reg![left].float64 > reg![right].float64) as usize; }
-                    Op::F64Eq      => { reg![dest].int = (reg![left].float64 == reg![right].float64) as usize; }
-                    Op::F64NEq     => { reg![dest].int = (reg![left].float64 != reg![right].float64) as usize; }
-                    Op::F64LtEq    => { reg![dest].int = (reg![left].float64 <= reg![right].float64) as usize; }
-                    Op::F64GtEq    => { reg![dest].int = (reg![left].float64 >= reg![right].float64) as usize; }
-
-                    Op::MoveLower8               => { reg![dest].int       = reg![left].int8.0    as usize; }
-                    Op::MoveLower16              => { reg![dest].int       = reg![left].int16.0   as usize; }
-                    Op::MoveLower32              => { reg![dest].int       = reg![left].int32.0   as usize; }
-                    Op::MoveAndSignExtendLower8  => { reg![dest].int       = reg![left].sint8.0   as usize; }
-                    Op::MoveAndSignExtendLower16 => { reg![dest].int       = reg![left].sint16.0  as usize; }
-                    Op::MoveAndSignExtendLower32 => { reg![dest].int       = reg![left].sint32.0  as usize; }
-                    Op::IntToFloat32             => { reg![dest].float32.0 = reg![left].sint      as f32;
-                                                      reg![dest].float32.1 = 0.0; }
-                    Op::IntToFloat64             => { reg![dest].float64   = reg![left].sint      as f64; }
-                    Op::Float32ToInt             => { reg![dest].int       = reg![left].float32.0 as usize; }
-                    Op::Float32To64              => { reg![dest].float64   = reg![left].float32.0 as f64; }
-                    Op::Float64ToInt             => { reg![dest].int       = reg![left].float64   as usize; }
-                    Op::Float64To32              => { reg![dest].float32.0 = reg![left].float64   as f32;
-                                                      reg![dest].float32.1 = 0.0; }
-
-                    Op::Move          => { reg![dest] = reg![left]; }
                     Op::Jump          => { ip = ip.wrapping_add(instr.left as usize); }
                     Op::JumpIfZero    => { if reg![dest].int == 0 { ip = ip.wrapping_add(instr.left as usize); } }
                     Op::JumpIfNotZero => { if reg![dest].int != 0 { ip = ip.wrapping_add(instr.left as usize); } }
@@ -482,6 +411,10 @@ impl Compiler {
                     Op::LoadBool => { reg![dest].b8.0 = *(reg![left].int.wrapping_add(instr.right as usize) as *const u8) != 0; },
                     Op::Copy => { std::ptr::copy(reg![left].int as *const u8, reg![dest].int as *mut u8, reg![right].int); },
                     Op::Zero => { for b in std::slice::from_raw_parts_mut(reg![dest].int as *mut u8, reg![left].int) { *b = 0 }},
+
+                    op if is_unary(op) =>  { reg![dest] = apply_unary_op(op, reg![left]) }
+                    op if is_binary(op) => { reg![dest] = apply_binary_op(op, reg![left], reg![right]) }
+                    _ => unreachable!()
                 }
             }
             ip = ip.wrapping_add(1);
@@ -633,45 +566,7 @@ fn repl() {
     }
 }
 
-fn main() {{
-    let ok = [
-(r#"
-Buf: (
-    buf: ptr u8 [len],
-    buf1: ptr u8 [buf[0]],
-    buf2: ptr u8 [*buf],
-    buf3: ptr u8 [buf[len]],
-    len: int,
-    cap: int
-);
-fn: func (buf: ptr u8 [len], len: int) -> ptr u8  {
-    assert((buf:int) == 0);
-    return buf:ptr u8;
-}
-main: proc () -> int {
-    b: Buf = {len=1};
-    p := fn(b.buf, b.len):ptr u8 [8];
-    q := &b.buf[0];
-    r := &p[0];
-    assert(p == r);
-    assert(q == p);
-    assert(b.buf == &b.buf[0]);
-    assert(b.buf == (0:ptr u8));
-    assert(b.buf == p);
-    assert(p == (0:ptr u8));
-    assert(q == r);
-    return 1;
-"#, Value::Int(1)),
-];
-    for test in ok.iter() {
-        let str = test.0;
-        let expect = test.1;
-        compile_and_run(str)
-            .and_then(|ret| if ret == expect { Ok(ret) } else { Err(format!("expected {:?}, got {:?}", expect, ret).into())})
-            .map_err(|e| { println!("input: \"{}\"", str); e })
-            .unwrap();
-    }
-}
+fn main() {
     repl();
 }
 
@@ -729,6 +624,18 @@ fn expr() {
     eval!("!!0 ?  !!1 ? 2, 3 ,  !!4 ? 5, 6",  5);
     eval!("!!1 ? (!!2 ? 3, 4), (!!5 ? 6, 7)", 3);
     eval!("!!1 ?  !!2 ? 3, 4 ,  !!5 ? 6, 7",  3);
+    eval!("0 <  -1 : int", 0);
+    eval!("0 <' -1 : int", 1);
+    eval!("0 >  -1 : int", 1);
+    eval!("0 >' -1 : int", 0);
+    eval!("0 <=  -1 : int", 0);
+    eval!("0 <=' -1 : int", 1);
+    eval!("0 >=  -1 : int", 1);
+    eval!("0 >=' -1 : int", 0);
+    eval!(-4 / 4);
+    eval!("-4 /' 4", ((-4 as isize) as usize / 4) as isize);
+    eval!(-4 % 8);
+    eval!("-4 %' 8", ((-4 as isize) as usize % 8) as isize);
 }
 
 #[test]
