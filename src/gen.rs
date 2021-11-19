@@ -913,9 +913,9 @@ struct Destination {
     bound_context: BoundContext,
     ty: Type,
     // functionally identical, but set for different reasons: for calls and
-    // compound inits, we emit bound checks after; for casts, we don't check.
-    // This means calls/compounds "speculatively load" past bounds, which seems
-    // bad, but is it actually?
+    // compound inits, we emit bound checks after (but before jumping to the
+    // callee); for casts, we don't check. This means calls/compounds
+    // "speculatively load" past bounds, which seems bad, but is it actually?
     deferred_bound_checks: bool,
     supressed_bound_checks: bool,
 }
