@@ -628,6 +628,7 @@ impl Ast {
     pub fn type_expr_keytype(&self, expr: TypeExpr) -> Option<Keytype> {
         match self.type_expr(expr) {
             TypeExprData::Name(key) => Keytype::from_intern(*key),
+            TypeExprData::Expr(_) => Some(Keytype::Ptr),
             TypeExprData::Items(_) => Some(Keytype::Struct),
             TypeExprData::List(list) => self.type_expr_index(expr, 0).and_then(|t| match self.type_expr(t) {
                 TypeExprData::Name(key) => Keytype::from_intern(*key),
@@ -693,6 +694,7 @@ impl Ast {
         let index = if self.type_expr_has_explicit_keytype(expr) { 1 } else { 0 };
         match self.type_expr(expr) {
             TypeExprData::List(_) => self.type_expr_index(expr, index),
+            TypeExprData::Expr(_) => Some(TypeExpr::Infer),
             _ => None,
         }
     }
@@ -701,9 +703,12 @@ impl Ast {
         if self.type_expr_may_have_base_type_and_bound(expr) == false {
             return None;
         }
-        let index = if self.type_expr_has_explicit_keytype(expr) { 2 } else { 1 };
         match self.type_expr(expr) {
-            TypeExprData::List(_) => self.type_expr_index(expr, index),
+            TypeExprData::List(_) => {
+                let index = if self.type_expr_has_explicit_keytype(expr) { 2 } else { 1 };
+                self.type_expr_index(expr, index)
+            }
+            TypeExprData::Expr(_) => Some(expr),
             _ => None,
         }
     }

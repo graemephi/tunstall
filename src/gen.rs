@@ -504,7 +504,7 @@ fn convert_op(from: Type, to: Type) -> Option<Op> {
         }
     } else if from.is_pointer() {
         match bare(to) {
-            BareType::U64|BareType::I64|BareType::Int => Op::Noop,
+            BareType::U64|BareType::I64|BareType::Int|BareType::None => Op::Noop,
             _ if to.is_pointer() => Op::Noop,
             _ => return None
         }
@@ -1375,21 +1375,30 @@ impl FatGen {
     }
 
     fn type_expr(&mut self, ctx: &mut Compiler, expr: TypeExpr) -> Type {
-        self.type_expr_really(ctx, expr, true, false)
+        self.type_expr_really(ctx, expr, true, false, false)
     }
 
-    fn type_expr_ptr(&mut self, ctx: &mut Compiler, expr: TypeExpr) -> Type {
-        self.type_expr_really(ctx, expr, false, true)
+    fn type_expr_ptr(&mut self, ctx: &mut Compiler, expr: TypeExpr, is_cast: bool) -> Type {
+        self.type_expr_really(ctx, expr, false, true, is_cast)
     }
 
-    fn type_expr_really(&mut self, ctx: &mut Compiler, expr: TypeExpr, outermost: bool, ptr: bool) -> Type {
+    fn type_expr_cast(&mut self, ctx: &mut Compiler, expr: TypeExpr) -> Type {
+        self.type_expr_really(ctx, expr, true, false, true)
+    }
+
+    fn type_expr_really(&mut self, ctx: &mut Compiler, expr: TypeExpr, outermost: bool, ptr: bool, is_cast: bool) -> Type {
         let stashed_target = self.target;
         if !matches!(self.target, CodeGenTarget::TypeExpr|CodeGenTarget::TypeExprIgnoreBounds) {
             self.target = CodeGenTarget::TypeExpr;
         }
         let mut result = Type::None;
         match *ctx.ast.type_expr(expr) {
-            TypeExprData::Infer => unreachable!(),
+            TypeExprData::Infer => {
+                // Currently we only support type inference within type expressions (rather than
+                // declarations, which can also infer types) when casting bounds, in form
+                // `value:[bound]`, which is shorthand for `value:ptr value::type [bound]`.
+                assert!(is_cast);
+            }
             TypeExprData::Name(name) => {
                 if name.0 == Keytype::Ptr as u32 {
                     result = Type::VoidPtr;
@@ -1399,16 +1408,16 @@ impl FatGen {
                     result = sym::resolve_type(ctx, name);
                 }
             }
-            TypeExprData::Expr(_) => todo!(),
             TypeExprData::Items(items) => result = sym::resolve_anonymous_structure(ctx, items, Keytype::Struct),
-            TypeExprData::List(_) => {
+            TypeExprData::Expr(_) if !is_cast => error!(self, 0, "untyped bounds are not allowed here; they only allowed in casts"),
+            TypeExprData::List(_)|TypeExprData::Expr(_) => {
                 match ctx.ast.type_expr_keytype(expr) {
                     Some(Keytype::Arr) => {
                         let ty_expr = ctx.ast.type_expr_base_type(expr);
                         let len_expr = ctx.ast.type_expr_bound(expr);
                         // Todo: infer if ty_expr = None?
                         if let (Some(ty_expr), Some(len_expr)) = (ty_expr, len_expr) {
-                            let ty = self.type_expr_really(ctx, ty_expr, false, ptr);
+                            let ty = self.type_expr_really(ctx, ty_expr, false, ptr, false);
                             if let TypeExprData::Expr(len_expr) = *ctx.ast.type_expr(len_expr) {
                                 let len = self.constant_expr(ctx, len_expr);
                                 if len.ty.is_integer() && len.value.is_some() {
@@ -1422,7 +1431,7 @@ impl FatGen {
                                     error!(self, 0, "arr length must be a constant integer")
                                 }
                             } else {
-                                error!(self, 0, "argument 2 of arr type must be a value expression")
+                                error!(self, 0, "argument 3 of arr type must be a value expression")
                             }
                         } else {
                             error!(self, 0, "type arr takes 2 arguments, base type and [length]")
@@ -1433,10 +1442,10 @@ impl FatGen {
                     }
                     Some(Keytype::Ptr) => {
                         if let Some(ty_expr) = ctx.ast.type_expr_base_type(expr) {
-                            let ty = self.type_expr_ptr(ctx, ty_expr);
+                            let ty = self.type_expr_ptr(ctx, ty_expr, is_cast);
                             if let Some(bound_expr) = ctx.ast.type_expr_bound(expr) {
                                 if !outermost {
-                                    error!(self, 0, "ptr bounds apply only to the outermost type");
+                                    error!(self, 0, "bounds are not permitted in this location");
                                 } else if self.target == CodeGenTarget::TypeExpr {
                                     if let TypeExprData::Expr(bound_expr) = *ctx.ast.type_expr(bound_expr) {
                                         let expr_result = self.constant_expr(ctx, bound_expr);
@@ -1449,7 +1458,7 @@ impl FatGen {
                                                         bound = Bound::Constant(v as usize)
                                                     } else {
                                                         // We could lift this restriction, but why?
-                                                        error!(ctx, 0, "constant ptr bounds must be nonnegative");
+                                                        error!(ctx, 0, "constant bounds must be nonnegative");
                                                     }
                                                 }
                                                 None => {
@@ -1459,10 +1468,10 @@ impl FatGen {
                                             result = ctx.types.bound_pointer(ty, bound)
                                         } else {
                                             // Todo: type expr location
-                                            error!(self, 0, "ptr bound must be an integer")
+                                            error!(self, 0, "bound must be an integer")
                                         }
                                     } else {
-                                        error!(self, 0, "argument 2 of ptr type must be a value expression")
+                                        error!(self, 0, "argument 3 of ptr type must be a value expression")
                                     }
                                 } else {
                                     assert!(self.target == CodeGenTarget::TypeExprIgnoreBounds);
@@ -1481,7 +1490,7 @@ impl FatGen {
                             error!(ctx, 0, "too many parameters for keytype ptr");
                         }
                     }
-                    Some(kt @ Keytype::Struct)|Some(kt @ Keytype::Union) => {
+                    Some(kt @ Keytype::Struct|kt @ Keytype::Union) => {
                         if let Some(items) = ctx.ast.type_expr_items(expr) {
                             result = sym::resolve_anonymous_structure(ctx, items, kt);
                         } else {
@@ -1491,7 +1500,7 @@ impl FatGen {
                             error!(ctx, 0, "too many parameters for keytype struct");
                         }
                     }
-                    Some(Keytype::Func)|Some(Keytype::Proc) => error!(self, 0, "func/proc pointers are not implemented"),
+                    Some(Keytype::Func|Keytype::Proc) => error!(self, 0, "func/proc pointers are not implemented"),
                     None|Some(_) => error!(self, 0, "expected keytype (one of func, proc, struct, arr, ptr)")
                 }
             }
@@ -1517,7 +1526,7 @@ impl FatGen {
                     result
                 } else {
                     // Todo: expr position
-                    error!(self, 0, "expected expression in item {} of compound initializer", path_ctx.index);
+                    error!(self, 0, "expected expression in item {} of compound initializerF", path_ctx.index);
                     None
                 }
             }
@@ -1612,8 +1621,11 @@ impl FatGen {
                 }
             }
             Bound::Expr(_) => {
-                let dest = self.bound(ctx, destination.ty.bound, &destination.bound_context);
                 let src = self.bound(ctx, expr.ty.bound, &expr.bound_context);
+                if let EvaluatedBound::Unconditional = src {
+                    return;
+                }
+                let dest = self.bound(ctx, destination.ty.bound, &destination.bound_context);
                 if let EvaluatedBound::Location(dest_ty, dest_addr) = dest {
                     if let EvaluatedBound::Location(src_ty, src_addr) = src {
                         if dest_ty == src_ty && dest_addr == src_addr {
@@ -1793,7 +1805,7 @@ impl FatGen {
 
     fn expr_with_destination_and_optional_control(&mut self, ctx: &mut Compiler, expr: Expr, destination: &Destination, control: Option<Control>) -> ExprResult {
         let mut control = control;
-        let mut result = ExprResult { addr: Location::none(), bound_context: BoundContext::None, ty: Type::None, expr, value_is_register: false, is_call_result: true, value: None };
+        let mut result = ExprResult { addr: Location::none(), bound_context: BoundContext::None, ty: Type::None, expr, value_is_register: false, is_call_result: false, value: None };
         match ctx.ast.expr(expr) {
             ExprData::Int(value) => {
                 result.value = Some(value.into());
@@ -2172,7 +2184,7 @@ impl FatGen {
                                 let item = info.items[i];
                                 let compiled_expr = self.expr_with_destination(ctx, expr, &Destination::for_item(item.ty));
                                 if compiled_expr.ty != item.ty {
-                                    error!(self, ctx.ast.expr_source_position(expr), "argument {} of {} is of type {}, found {}", i, ctx.callable_str(ident(addr.value)), ctx.type_str(item.ty), ctx.type_str(compiled_expr.ty));
+                                    error!(self, ctx.ast.expr_source_position(expr), "argument {} of {} is of type {}, found {}", i + 1, ctx.callable_str(ident(addr.value)), ctx.type_str(item.ty), ctx.type_str(compiled_expr.ty));
                                     break;
                                 }
                                 let reg = if compiled_expr.ty.is_basic() {
@@ -2233,7 +2245,7 @@ impl FatGen {
                 }
             }
             ExprData::Cast(expr, type_expr) => {
-                let to_ty = self.type_expr(ctx, type_expr);
+                let to_ty = self.type_expr_cast(ctx, type_expr);
                 let mut dest = Destination::for_type(to_ty, BoundContext::Mark(self.locals.top()));
                 if to_ty == destination.ty {
                     dest.addr = destination.addr;
@@ -2254,6 +2266,7 @@ impl FatGen {
                         Some(lv) => result.value = Some(apply_unary_op(op, lv)),
                         None => {
                             if op != Op::Noop {
+                                assert!(to_ty != Type::None);
                                 let reg = self.register(&left);
                                 result.addr = Location::register(self.put2_inc(op, reg));
                             } else {
@@ -2264,9 +2277,14 @@ impl FatGen {
                     if ctx.types.types_match_with_promotion(result.ty, to_ty) {
                         // We can send integer types back up the tree unmodified
                         // without doing the conversion here.
+                    } else if to_ty == Type::VoidPtr && to_ty.bound != Bound::Single {
+                        // Can't have a bounded void ptr, so this is only updates the bound
+                        result.ty.bound = to_ty.bound;
                     } else {
                         result.ty = to_ty;
                     }
+                    // Casting always clears the bound context
+                    result.bound_context = BoundContext::None;
                 } else if expression_transposable() {
                     // The cast-on-the-right synax doesn't work great with taking addresses.
                     //
@@ -2275,7 +2293,7 @@ impl FatGen {
                     // to
                     //      &({}:Struct) (allocates Struct on the stack and takes its address)
                     //
-                    // We only do this if the above convert_op returns None, as otherwise we as distinguish between
+                    // We only do this if the above convert_op returns None, as otherwise we cannot distinguish between
                     //      &a:int       (equivalent to (&a):int)
                     // and
                     //      &(a:int)     (never legal, but would appear if transposed)
@@ -2299,7 +2317,7 @@ impl FatGen {
         if destination.ty.is_pointer() {
             let result_info = ctx.types.info(result.ty);
             if result_info.kind == TypeKind::Array
-            && result_info.base_type == ctx.types.base_type(destination.ty) {
+            && (result_info.base_type == ctx.types.base_type(destination.ty) || destination.ty == Type::VoidPtr) {
                 result.addr = Location::register(self.location_address(&result.addr));
                 result.ty = destination.ty.with_bound_of(result.ty);
             }
@@ -2329,7 +2347,7 @@ impl FatGen {
                 }
 
                 // Changing the result type here will never change the base type of a pointer.
-                // In that case, the ptr bound may no longer accurately reflect the size of the
+                // In that case, the bound may no longer accurately reflect the size of the
                 // underyling allocation. In other words, the following must hold:
                 if result.ty != destination.ty && result.ty.is_pointer() {
                     let rb = ctx.types.info(result.ty).base_type;

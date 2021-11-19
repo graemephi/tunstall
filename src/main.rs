@@ -1728,6 +1728,13 @@ main: proc () -> int {
     }
 }
 
+#[test]
+fn todo_txt()
+{
+    let code = include_str!("../todo.txt");
+    compile_and_run(code).unwrap();
+}
+
 // cargo +nightly bench --features bench
 #[cfg(feature = "bench")]
 #[cfg(test)]

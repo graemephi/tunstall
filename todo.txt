@@ -1,29 +1,24 @@
-split registers and stack for the vm--they can just be two stacks
-constant globals and no func write acesss
-Maybe: a: arr; &a[n] -> ptr to a::ty with bound a::len - n
+// split registers and stack for the vm--they can just be two stacks
+// constant globals and no func write access
+// Maybe: a: arr; &a[n] -> ptr to a::ty with bound a::len - n
 
 V2: (x: f32, y: f32);
 
-func syntax(a: int, b: int): int
-{
+syntax: (a: int, b: int) -> int {
     c := a : f32;
-//  d := a + b: f32; // error
-//  e := a: f32 + b; // error
+    // d := a + b: f32; // error
+    // e := a: f32 + b; // error
     f := (a + b): f32;
-    g := a: f32 + b: f32;
-    h := (a : f32) + (b : f32);
+    // g := a: f32 + b: f32; // error
+    h := (a:f32) + (b:f32);
     i: int = a: f32: int;
 
-    m := a: int & b;      // a & b
-    n: ptr int = &a: int; //
-    o: int = (&a): int;   // (int)(&a);
-    p: ptr (ptr int) = &n;
-
-
-    n: int = &a:int;
-    m: ptr int = &a:ptr int;
-    o: int = (&a):int;
-    p: v2 = &{}:V2;
+    m := a & b;                 // a & b
+    n: ptr int = (&a:ptr int);  // (int *)&a;
+    o: int = (&a): int;         // (int)(&a);
+    p: int = &a: int;           // (int)(&a);
+    q: ptr (ptr int) = &n;
+    p: ptr V2 = &{}:V2;
 
     v := { x = 0.0, y = 0.0 }:V2;
     v: V2 = { x = 0.0, y = 0.0 };
@@ -33,24 +28,8 @@ func syntax(a: int, b: int): int
     anon2 := { a = 0, b = 0 }:(a: i32, b: i32);
     anon3 := { a = 0, b = 0 }:(a, b: i32);
 
-    return r;
+    return 0;
 }
-
-g := 0;
-h := 0;
-
-some_constant: constant (arr i32 [8]) = {
-
-}
-
-e: enum i32 {
-
-}
-
-f: func (a: u32, b: u32) u32 {
-
-}
-
 
 Buf: struct (
     buf: ptr u8 [cap],
@@ -58,32 +37,42 @@ Buf: struct (
     cap: int
 );
 
-proc buf_copy(buf: ptr Buf, dest: ptr u8 [buf.len]) {
+buf_copy: proc (buf: ptr Buf, dest: ptr u8 [buf.len]) {
     // checks buf.len < buf.cap
-    memcpy(dest, buf.buf, buf.len)
+    // memcpy(dest, buf.buf, buf.len)
 }
 
 // bounds are checked at call site
-proc memcpy(dest: ptr u8 [len], src: ptr u8 [len], len: int) {
+memcpy: proc (dest: ptr u8 [len], src: ptr u8 [len], len: int) {
     // dest and src shared a bound so no bounds checking
 }
 
-proc alloc(size: int): ptr u8 [size] {
+alloc: proc (size: int) -> ptr u8 [size] {
     // impl doesn't matter, but size in type needs to be transferred to callers view of arguments on return
+    return 0;
 }
 
-struct Header {
-    len: int;
+rng: proc() -> int {
+    return 0;
 }
 
-struct Packet {
-    h: ptr u8 [(h:ptr Header).len];
+blah: u8 = 0;
+ptr_from_ether: proc() -> ptr u8 {
+    return &blah;
 }
 
-proc bounds() {
+Header: struct (
+    len: int
+);
+
+Packet: struct (
+    h: ptr u8 [(h:ptr Header).len]
+);
+
+bounds: proc () {
     buf := {}:Buf;
-    // data's type is ptr u8 [anonymous register holding load of buf.len]
     data := alloc(buf.len);
+    // data's type is ptr u8 [anonymous register holding load of buf.len]
     // we can't use buf.len directly, as it could change in the call to buf_copy (no smarts) and data is its own allocation
     // type checks, bound check can be optimized out
     buf_copy(&buf, data);
@@ -99,36 +88,27 @@ proc bounds() {
     // buf_copy(&buf, data3);
     // shorthand for data:ptr u8 [buf.len]
     buf_copy(&buf, data3:[buf.len]);
-    // These are okay
-    b := data3[0];
+    // This is okay
     b := *data3;
 
     buf: arr u8 [128] = {};
-    buf_ptr := buf; // ptr u8 [128]
+    buf_ptr: ptr u8 [128] = buf; // ptr u8 [128]
     ptr_ptr := &buf_ptr; // ptr (ptr u8), bound erased
-    buf_ptr = *ptr_ptr; // fails to type check
-    buf_ptr = *ptr_ptr:[sizeof(buf)] // need to manaully rebind
+    // buf_ptr = ptr_ptr[0]; // fails to type check
+    buf_ptr = *ptr_ptr:[128]; // need to manaully rebind
 
+    buf := buf_ptr;
     // never allowed
     // buf[-1];
     // do pointer arthimetic instead
     b := (buf - 1)[0];
-    // Update bounds when both are known
+    // Update bounds when both are known. _NOT_ implemented
     ptr := buf - 1; // ptr u8 [128 - -1]
     ptr := buf + 1; // ptr u8 [128 - 1]
     ptr := &buf[1]; // ptr u8 [128 - 1]
     i := rng();
-    ptr := &buf[i]; // ptr u8, bounds checked on assignment
+    ptr := &buf[i]; // ptr u8, bounds checked
     ptr := buf + i; // ptr u8, not bounds checked
-
-    data: ptr = 0;
-    if (rng()&1 == 1) {
-        // bounded assigned to unbounded, data becomes bounded
-        data = alloc(buf.len);
-    } else {
-        data = alloc(rng());
-    }
-    // bound is not part of the type proper--so should have the correct bound here either way
 
     p := {}:Packet;
     h := p.h; // ptr u8 [(p.h:ptr Header).len]
@@ -136,7 +116,14 @@ proc bounds() {
     pp := &p;
     h := pp.h; // ptr u8 [(pp.h:ptr Header).len]
 
-    b := buf.buf     // ptr u8 [buf.len]
+    buf := {}:Buf;
+    b := buf.buf;    // ptr u8 [buf.len]
     bufp := &buf;    // ptr Buf
     bb := bufp.buf;  // ptr u8 [bufp.len]
+}
+
+main: proc() -> int {
+    syntax(0, 0);
+    bounds();
+    return 0;
 }
