@@ -39,7 +39,7 @@ Buf: struct (
 
 buf_copy: proc (buf: ptr Buf, dest: ptr u8 [buf.len]) {
     // checks buf.len < buf.cap
-    // memcpy(dest, buf.buf, buf.len)
+    memcpy(dest, buf.buf, buf.len);
 }
 
 // bounds are checked at call site
@@ -97,29 +97,17 @@ bounds: proc () {
     // buf_ptr = ptr_ptr[0]; // fails to type check
     buf_ptr = *ptr_ptr:[128]; // need to manaully rebind
 
-    buf := buf_ptr;
+    buf := buf_ptr + 1 :[127];
     // never allowed
     // buf[-1];
     // do pointer arthimetic instead
-    b := (buf - 1)[0];
+    b := *(buf - 1);
     // Update bounds when both are known. _NOT_ implemented
-    ptr := buf - 1; // ptr u8 [128 - -1]
+    ptr := buf - 1; // ptr u8 [128 - -1], this is clearly a bad idea
     ptr := buf + 1; // ptr u8 [128 - 1]
-    ptr := &buf[1]; // ptr u8 [128 - 1]
     i := rng();
     ptr := &buf[i]; // ptr u8, bounds checked
     ptr := buf + i; // ptr u8, not bounds checked
-
-    p := {}:Packet;
-    h := p.h; // ptr u8 [(p.h:ptr Header).len]
-
-    pp := &p;
-    h := pp.h; // ptr u8 [(pp.h:ptr Header).len]
-
-    buf := {}:Buf;
-    b := buf.buf;    // ptr u8 [buf.len]
-    bufp := &buf;    // ptr Buf
-    bb := bufp.buf;  // ptr u8 [bufp.len]
 }
 
 main: proc() -> int {
@@ -127,3 +115,14 @@ main: proc() -> int {
     bounds();
     return 0;
 }
+
+// Longer term
+// V: type (dim: int) -> TypeDescription {
+//
+// }
+//
+// V4: struct (V [4]);
+//
+// vadd: func { n: int } (a, b: V[n]) -> V[n] {
+//
+// }

@@ -2042,7 +2042,7 @@ impl FatGen {
                         if let Some((op, result_ty)) = unary_op(op_token, right.ty) {
                             match right.value {
                                 Some(rv) => result.value = Some(apply_unary_op(op, rv)),
-                                None if control.is_some() && op_token == Not => {
+                                None if control.is_some() &&  op_token == Not => {
                                     if let Some(c) = control {
                                         if c.true_to == c.fallthrough_to {
                                             control = Some(Control { true_to: c.false_to, false_to: c.true_to, fallthrough_to: c.true_to });
@@ -2104,7 +2104,7 @@ impl FatGen {
                     let (ptr, offset) = if left.ty.is_pointer() { assert!(right.ty.is_integer()); (&left, &right) } else { assert!(left.ty.is_integer()); (&right, &left) };
                     let where_u_at = self.compute_address(ctx, ptr, offset, &BoundContext::None);
                     result.addr = Location::register(self.location_address(&where_u_at));
-                    result.ty = ptr.ty;
+                    result.ty = ptr.ty.strip_bound();
                 } else if is_offset_computation(op_token, left.ty, right.ty) {
                     let size = ctx.types.info(ctx.types.base_type(left.ty)).size;
                     match (left.value, right.value) {

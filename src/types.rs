@@ -155,6 +155,10 @@ impl Type {
         Type { id: self.id, bound: other.bound }
     }
 
+    pub fn strip_bound(self) -> Type {
+        Type { id: self.id, bound: Bound::Single }
+    }
+
     pub fn strip_expr_bound(self) -> Type {
         if let Bound::Expr(..) = self.bound {
             return Type { id: self.id, bound: Bound::Single };
