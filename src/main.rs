@@ -110,7 +110,7 @@ impl Interns {
         let buf = unsafe { &mut (*self.bufs).buf };
         let old_len = buf.len();
         let old_cap = buf.capacity();
-        // It would be nice to do something that as realloc even in
+        // It would be nice to do something that cannot realloc even in
         // principle but miri doesn't like set_len-ing and copying into the
         // internal Vec<u8> ?_?
         buf.push_str(str);
